@@ -3,6 +3,7 @@
 #include "serve/generation_service.h"
 #include "serve/response_store.h"
 #include "serve/request_log.h"
+#include "serve/serve_metrics.h"
 #include "serve/serve_options.h"
 
 #include <httplib.h>
@@ -58,6 +59,7 @@ private:
     ServeOptions options_;
     std::string public_model_id_;
     ResponseStore response_store_;
+    ServeMetrics metrics_;
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};

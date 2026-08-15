@@ -152,6 +152,9 @@ ninfer_add_test(ninfer_openai_schema_test
 ninfer_add_test(ninfer_responses_schema_test
   SOURCES test_responses_schema.cpp
   LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_serve_metrics_test
+  SOURCES test_serve_metrics.cpp
+  LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_response_store_test
   SOURCES test_response_store.cpp
   LIBRARIES ninfer_serve)

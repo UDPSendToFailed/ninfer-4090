@@ -130,6 +130,7 @@ void HttpServer::log_request_done(const RequestLogContext& context,
                                   const GenerationOutcome& outcome) {
     log_line(format_request_done(context, outcome));
     request_jsonl_.write_request_done(context, outcome);
+    metrics_.record(outcome);
 }
 
 void HttpServer::log_request_error(const RequestLogContext& context, const std::string& message) {
@@ -256,6 +257,9 @@ void HttpServer::register_routes() {
 
     server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
+    });
+    server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
+        res.set_content(metrics_.render(), "text/plain; version=0.0.4");
     });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
