@@ -16,19 +16,23 @@ Evaluated over the standard `bench/fixtures/bench_corpus.ids` token corpus with 
 
 | Test Case | Configuration | Throughput | Draft Acceptance / Notes |
 |---|---|---:|---|
-| **Prefill (`pp4096`)** | `pp4096`, Chunk 1024, INT8 KV | **`1,918.1 ± 1.5 tok/s`** | Peak saturated prefill |
-| **Prefill (`pp2048`)** | `pp2048`, Chunk 1024, INT8 KV | **`1,724.2 ± 117.5 tok/s`** | Standard 2k context prefill |
-| **Prefill (`pp512`)** | `pp512`, Chunk 1024, INT8 KV | **`1,565.4 ± 37.4 tok/s`** | Low-latency shallow prefill |
+| **Prefill (`pp2048`)** | `pp2048`, Chunk 1024, INT8 KV | **`1,938.0 ± 2.7 tok/s`** | Standard 2k context prefill |
+| **Prefill (`pp4096`)** | `pp4096`, Chunk 1024, INT8 KV | **`1,918.3 ± 2.1 tok/s`** | Peak saturated prefill |
+| **Prefill (`pp512`)** | `pp512`, Chunk 1024, INT8 KV | **`1,695.4 ± 114.5 tok/s`** | Low-latency shallow prefill |
+| **Decode: Code & Schemas (MTP4)** | `tg128`, `--greedy`, MTP4 + Draft Head | **`110.0 – 110.4 tok/s`** | 67–75% draft acceptance |
 | **Decode: Code / Math (MTP3)** | `tg128`, `--greedy`, MTP3 + Draft Head | **`126.4 – 148.2 tok/s`** | 80–91% draft acceptance |
-| **Decode: Bench Corpus (MTP3)** | `tg128`, MTP3 + Draft Head | **`77.6 – 106.5 tok/s`** | 30–49% draft acceptance |
-| **Decode: Baseline (MTP0)** | `tg128`, no speculation, CUDA Graph | **`48.7 ± 4.3 tok/s`** | Single-token base decode |
+| **Decode: Bench Corpus (MTP3)** | `tg128`, MTP3 + Draft Head | **`77.0 – 106.5 tok/s`** | 30–49% draft acceptance |
+| **Decode: Baseline (MTP0)** | `tg128`, no speculation, CUDA Graph | **`48.8 ± 4.3 tok/s`** | Single-token base decode |
 
 ---
 
 ## Architectural Features
 
 * **Native `sm_89` Instruction Generation:** Built directly for Ada Lovelace without Ampere or Blackwell compatibility shims.
+* **Ada 72 MB Persisting L2 Cache Pinning:** Pins MTP proposal head weights directly in the hardware L2 cache partition using stream access policy windows, eliminating DRAM access latency on speculative proposals.
+* **Hierarchical N-Gram Context Speculation:** Zero-allocation $N=5 \to 4 \to 3 \to 2$ sequence pattern matcher that drafts continuation chains from prompt history and repeated tool calling schemas.
 * **Double-Buffered `cp.async.cg` DMA:** Implements a 2-stage asynchronous circular buffer for codes, scales, and activations in `w8_small_t_mma`, overlapping global memory transfers with Tensor Core computation during decode rounds.
+* **High-Priority CUDA Stream Queues:** Initializes primary compute streams with hardware-level priority to minimize Windows WDDM driver dispatch latency.
 * **Full $T=48$ Exact MMA Tile Scheduling:** Extends single-pass matrix-vector tile execution up to 48 tokens without multi-pass slicing.
 * **ReplaySSM Recurrent State Transactions:** Zero-copy linear attention state tracking for Qwen3.8 Gated DeltaNet (GDN) layers, guaranteeing numerical consistency across speculative verification and rollbacks.
 * **Paged KV with `rk8v4` Compression:** Grouped 4-bit value quantization with normalized keys, enabling up to 170k tokens of resident context in 24 GB VRAM.
