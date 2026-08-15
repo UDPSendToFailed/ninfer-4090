@@ -46,7 +46,7 @@ Evaluated over the standard `bench/fixtures/bench_corpus.ids` token corpus with 
 Serves OpenAI Chat Completions, Responses, and Anthropic Messages at `http://127.0.0.1:8080/v1`:
 
 ```powershell
-.\build-sm89\apps\Release\ninfer-serve.exe "qwen3_8_27b.ninfer" --spec mtp --draft-tokens 3 --lm-head-draft --kv-dtype rk8v4 --max-context 160000
+.\build-sm89\apps\Release\ninfer-serve.exe "qwen3_8_27b.ninfer" --spec mtp --draft-tokens 4 --lm-head-draft --kv-dtype rk8v4 --max-context 128000
 ```
 
 ### 2. Interactive CLI (`ninfer`)
@@ -54,7 +54,7 @@ Serves OpenAI Chat Completions, Responses, and Anthropic Messages at `http://127
 Direct single-request generation:
 
 ```powershell
-.\build-sm89\apps\Release\ninfer.exe "qwen3_8_27b.ninfer" --prompt "Write an optimized C++ implementation of fast matrix multiplication." --spec mtp --draft-tokens 3 --lm-head-draft --greedy
+.\build-sm89\apps\Release\ninfer.exe "qwen3_8_27b.ninfer" --prompt "Write an optimized C++ implementation of fast matrix multiplication." --spec mtp --draft-tokens 4 --lm-head-draft --greedy
 ```
 
 ### 3. Standard Benchmark (`ninfer_bench`)
@@ -62,7 +62,7 @@ Direct single-request generation:
 Executes the standard product prefill and decode throughput benchmark matrix:
 
 ```powershell
-.\build-sm89\bench\Release\ninfer_bench.exe --weights "qwen3_8_27b.ninfer" --corpus bench/fixtures/bench_corpus.ids --kv-dtype int8 --mtp-draft-tokens 3 --lm-head-draft -p 512,2048,4096 -n 128
+.\build-sm89\bench\Release\ninfer_bench.exe --weights "qwen3_8_27b.ninfer" --corpus bench/fixtures/bench_corpus.ids --kv-dtype int8 --mtp-draft-tokens 4 --lm-head-draft -p 512,2048,4096 -n 128
 ```
 
 ---
