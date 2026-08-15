@@ -65,9 +65,13 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
                                   std::int64_t created, const CompletionUsage& usage);
 std::string sse_done();
 
-// /v1/models payloads.
-std::string make_models_list(const std::string& model_id, std::int64_t created);
-std::string make_model_object(const std::string& model_id, std::int64_t created);
+// /v1/models payloads. `context_window` is the serving max-context, reported
+// so clients can size prompts without a llama.cpp /props or vLLM
+// max_model_len to read.
+std::string make_models_list(const std::string& model_id, std::int64_t created,
+                             std::uint32_t context_window);
+std::string make_model_object(const std::string& model_id, std::int64_t created,
+                              std::uint32_t context_window);
 
 // Error object body.
 std::string make_error_body(const ApiError& error);
