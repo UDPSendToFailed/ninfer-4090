@@ -1,13 +1,13 @@
 $ErrorActionPreference = 'Stop'
 
-$ReleaseTag = '0.6.0-rtx4090-early1'
+$ReleaseTag = 'v0.7.0'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $BuildRoot = Join-Path $RepoRoot 'build-sm89'
 $DistRoot = Join-Path $RepoRoot 'dist'
 $ProductName = "ninfer-rtx4090-windows-x64-$ReleaseTag"
 $ProductRoot = Join-Path $DistRoot $ProductName
 $ArchivePath = Join-Path $DistRoot "$ProductName.zip"
-$ChecksumPath = Join-Path $DistRoot 'SHA256SUMS-v0.6.0-rtx4090-early1.txt'
+$ChecksumPath = Join-Path $DistRoot "SHA256SUMS-$ReleaseTag.txt"
 
 $Products = @(
     @{ Source = 'apps\Release\ninfer.exe'; Destination = 'ninfer.exe' },
@@ -35,8 +35,8 @@ Get-ChildItem -LiteralPath (Join-Path $BuildRoot 'apps\Release') -Filter '*.dll'
 }
 $ReleaseTag | Set-Content -LiteralPath (Join-Path $ProductRoot 'VERSION') -Encoding ascii
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'LICENSE') -Destination $ProductRoot
-Copy-Item -LiteralPath (Join-Path $RepoRoot 'docs\rtx-4090-early.md') -Destination (Join-Path $ProductRoot 'README.md')
-Copy-Item -LiteralPath (Join-Path $RepoRoot 'RELEASE_NOTES_0.6.0_RTX4090_EARLY1.md') -Destination $ProductRoot
+Copy-Item -LiteralPath (Join-Path $RepoRoot 'README.md') -Destination $ProductRoot
+Copy-Item -LiteralPath (Join-Path $RepoRoot 'RELEASE_NOTES_0.7.0.md') -Destination $ProductRoot
 
 $innerHashes = Get-ChildItem -LiteralPath $ProductRoot -File | Sort-Object Name | ForEach-Object {
     $hash = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256
