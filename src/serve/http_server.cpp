@@ -185,7 +185,11 @@ void HttpServer::stop_stats_reporter() {
 
 void HttpServer::register_routes() {
     server_.set_error_handler([](const httplib::Request& req, httplib::Response& res) {
-        if (res.status != 413) { return; }
+        // httplib invokes this for EVERY status >= 400, including 413s that
+        // route handlers already answered with a specific error body (e.g.
+        // media_budget_exceeded). Only synthesize the generic payload-limit
+        // error for the bare 413 httplib itself produces on oversized bodies.
+        if (res.status != 413 || !res.body.empty()) { return; }
         ApiError error;
         error.status  = 413;
         error.type    = "invalid_request_error";
