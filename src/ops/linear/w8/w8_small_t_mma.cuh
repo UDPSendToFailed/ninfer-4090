@@ -74,17 +74,22 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
     constexpr int kNt        = kTileCols / 8;
     constexpr unsigned kMask = 0xffffffffu;
 
+    constexpr int kActivationBuffers = (kTileCols <= 8 ? 2 : 1);
+
     union SharedStorage {
         struct {
-            std::uint8_t codes[kMmaRows][kGroupK];
-            __nv_bfloat16 activations[kWarps][kTileCols * kTileK];
-            std::uint8_t scales[kMmaRows][Schedule::kScaleAccess == W8SmallTMmaScaleAccess::Shared
-                                              ? Schedule::kScaleBytesPerRow
-                                              : 1];
+            std::uint8_t codes[2][kMmaRows][kGroupK];
+            __nv_bfloat16 activations[kActivationBuffers][kWarps][kTileCols * kTileK];
+            std::uint8_t scales[2][kMmaRows][Schedule::kScaleAccess == W8SmallTMmaScaleAccess::Shared
+                                               ? Schedule::kScaleBytesPerRow
+                                               : 1];
         } staging;
 
         float partial[kWarps * kNt * 32 * 4];
     };
+
+    static_assert(sizeof(SharedStorage) <= 49152,
+                  "SharedStorage exceeds 48 KB static shared memory limit");
 
     __shared__ __align__(16) SharedStorage shared;
     auto& code_shared  = shared.staging.codes;
@@ -100,15 +105,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
 
     const int cta_row0 = static_cast<int>(blockIdx.x) * RowPolicy::kOutputRowsPerCta;
 
-    const auto stage_x = [&](int group_k0) {
+    const auto stage_x = [&](int buf, int group_k0) {
         constexpr bool kPaddedStage =
             Schedule::kActivationStage == W8SmallTMmaActivationStage::PaddedZero;
         constexpr int kStageCols     = kPaddedStage ? kTileCols : ActiveCols;
         constexpr int kItemsPerSplit = kStageCols * (kTileK / 8);
+        const int act_buf            = (kActivationBuffers == 2 ? buf : 0);
         for (int item = lane; item < kItemsPerSplit; item += 32) {
             const int col = item / (kTileK / 8);
             const int k8  = item - col * (kTileK / 8);
-            auto* dst     = &b_shared[warp][col * kTileK + w8_small_t_swizzle_64(col, k8 * 8)];
+            auto* dst     = &b_shared[act_buf][warp][col * kTileK + w8_small_t_swizzle_64(col, k8 * 8)];
             if constexpr (!kPaddedStage || ActiveCols == kTileCols) {
                 cp_async<16, Schedule::kActivationCache>(
                     dst, &x[static_cast<std::int64_t>(col) * kHidden + group_k0 + warp * kTileK +
@@ -124,7 +130,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
         }
     };
 
-    const auto stage_codes = [&](int group_k0) {
+    const auto stage_codes = [&](int buf, int group_k0) {
 #pragma unroll
         for (int row_item = 0; row_item < Schedule::kRowsPerLoaderWarp; ++row_item) {
             const int row        = warp * Schedule::kRowsPerLoaderWarp + row_item;
@@ -132,7 +138,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
             for (int chunk = lane; chunk < kGroupK / 16; chunk += 32) {
                 const int swizzled_chunk = chunk ^ (row & 7);
                 cp_async<16, Schedule::kWeightCache>(
-                    &code_shared[row][swizzled_chunk * 16],
+                    &code_shared[buf][row][swizzled_chunk * 16],
                     codes + static_cast<std::int64_t>(weight_row) * kHidden + group_k0 +
                         chunk * 16);
             }
@@ -144,7 +150,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
                 const int chunk      = item - row * kScaleChunksPerRow;
                 const int weight_row = row_policy.weight_row(cta_row0, row);
                 cp_async<16, Schedule::kWeightCache>(
-                    &scale_shared[row][chunk * 16],
+                    &scale_shared[buf][row][chunk * 16],
                     scales + (static_cast<std::int64_t>(weight_row) * Geometry::kGroupsPerRow +
                               group_k0 / 32 + chunk * 8) *
                                  2);
@@ -164,23 +170,34 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
         acc[ni][3] = 0.0f;
     }
 
-    stage_codes(0);
-    stage_x(0);
+    stage_codes(0, 0);
+    stage_x(0, 0);
     cp_commit();
     cp_wait<0>();
     __syncthreads();
+
+    int read_buf = 0;
 
     constexpr int kGroupUnroll = kHidden <= 6144 ? kGroups : 12;
 #pragma unroll kGroupUnroll
     for (int group_index = 0; group_index < kGroups; ++group_index) {
         const int group_k0 = group_index * kGroupK;
+        const int next_buf = 1 - read_buf;
+
+        if (group_index + 1 < kGroups) {
+            stage_codes(next_buf, group_k0 + kGroupK);
+            if constexpr (kActivationBuffers == 2) {
+                stage_x(next_buf, group_k0 + kGroupK);
+            }
+            cp_commit();
+        }
 
         unsigned lane_scale_pair = 0;
         if (lid < 2) {
             if constexpr (Schedule::kScaleAccess == W8SmallTMmaScaleAccess::Shared) {
                 const int scale_row = gid + lid * 8;
                 lane_scale_pair =
-                    *reinterpret_cast<const unsigned*>(&scale_shared[scale_row][warp_koff / 16]);
+                    *reinterpret_cast<const unsigned*>(&scale_shared[read_buf][scale_row][warp_koff / 16]);
             } else {
                 const int scale_row = row_policy.weight_row(cta_row0, gid + lid * 8);
                 lane_scale_pair     = *reinterpret_cast<const unsigned*>(
@@ -191,6 +208,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
         }
         const unsigned top_scale_pair = __shfl_sync(kMask, lane_scale_pair, lane & ~3);
         const unsigned bot_scale_pair = __shfl_sync(kMask, lane_scale_pair, (lane & ~3) + 1);
+
+        const int act_read_buf = (kActivationBuffers == 2 ? read_buf : 0);
 
 #pragma unroll
         for (int group = 0; group < 2; ++group) {
@@ -210,7 +229,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
                     const int chunk  = (warp_koff + col) >> 4;
                     const int offset = (chunk ^ (code_row & 7)) * 16 + (col & 15);
                     return static_cast<unsigned>(
-                        *reinterpret_cast<const unsigned short*>(&code_shared[code_row][offset]));
+                        *reinterpret_cast<const unsigned short*>(&code_shared[read_buf][code_row][offset]));
                 };
                 const unsigned af0 = w8_small_t_bf16_pair_from_s8(load_code_pair(gid, code_col));
                 const unsigned af1 =
@@ -225,8 +244,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
                     const int br = ni * 8 + b_rin;
                     ldmatrix_x2(
                         bf0, bf1,
-                        smem_addr(&b_shared[k_split][br * kTileK +
-                                                     w8_small_t_swizzle_64(br, ks * 16 + b_koff)]));
+                        smem_addr(&b_shared[act_read_buf][k_split][br * kTileK +
+                                                                   w8_small_t_swizzle_64(br, ks * 16 + b_koff)]));
                     mma_bf16(group_acc[ni][0], group_acc[ni][1], group_acc[ni][2], group_acc[ni][3],
                              af0, af1, af2, af3, bf0, bf1);
                 }
@@ -245,12 +264,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
         }
 
         if (group_index + 1 < kGroups) {
-            __syncthreads();
-            stage_codes(group_k0 + kGroupK);
-            stage_x(group_k0 + kGroupK);
-            cp_commit();
+            if constexpr (kActivationBuffers == 1) {
+                __syncthreads();
+                stage_x(0, group_k0 + kGroupK);
+                cp_commit();
+            }
             cp_wait<0>();
             __syncthreads();
+            read_buf = next_buf;
         }
     }
 

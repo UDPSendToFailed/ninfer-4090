@@ -33,7 +33,7 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& residual_
                              : ActiveCols <= 40 ? 40
                                                 : 48;
 #if defined(NINFER_SM86) || defined(NINFER_SM89)
-    constexpr int KWarps = ActiveCols <= 32 ? 8 : 4;
+    constexpr int KWarps = ActiveCols <= 24 ? 8 : 4;
 #else
     constexpr int KWarps =
         Hidden == 4096 ? (ActiveCols <= 12 ? 16 : 8) : (ActiveCols <= 32 ? 8 : 4);

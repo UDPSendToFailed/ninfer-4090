@@ -56,7 +56,7 @@ struct W8SmallTMmaSchedule {
 template <int TileTokens, int ActiveTokens>
 using W8SmallTMmaDefaultSchedule = W8SmallTMmaSchedule<
 #if defined(NINFER_SM86) || defined(NINFER_SM89)
-    (TileTokens <= 32 ? 8 : 4), TileTokens, 2,
+    (TileTokens <= 24 ? 8 : 4), TileTokens, 2,
 #else
     8, TileTokens, TileTokens == 8 ? 5 : (TileTokens == 16 ? 4 : (TileTokens == 24 ? 3 : 2)),
 #endif
@@ -98,7 +98,7 @@ struct W8LinearSmallTProductionSchedule<W8VocabularyProjectionGeometry, ActiveTo
                                        : ActiveTokens <= 24 ? 24
                                        : ActiveTokens <= 32 ? 32
                                                             : 40;
-    static constexpr int kKWarps     = ActiveTokens <= 32 ? 8 : 4;
+    static constexpr int kKWarps     = ActiveTokens <= 24 ? 8 : 4;
     static constexpr auto kScaleAccess =
         ActiveTokens > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
     using Type = W8SmallTMmaSchedule<kKWarps, kTileTokens, 2, kScaleAccess>;
@@ -150,7 +150,7 @@ struct W8LinearSmallTProductionSchedule<W8MtpAttentionOutputGeometry, ActiveToke
                                        : ActiveTokens <= 32 ? 32
                                        : ActiveTokens <= 40 ? 40
                                                             : 48;
-    static constexpr int kKWarps     = ActiveTokens <= 31 ? 8 : 4;
+    static constexpr int kKWarps     = ActiveTokens <= 24 ? 8 : 4;
     static constexpr auto kScaleAccess =
         ActiveTokens > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
     using Type = W8SmallTMmaSchedule<kKWarps, kTileTokens, 2, kScaleAccess, Cache::ca, Cache::cg,
@@ -189,7 +189,7 @@ struct W8LinearSmallTProductionSchedule<W8MtpDownProjectionGeometry, ActiveToken
                                        : ActiveTokens <= 32 ? 32
                                        : ActiveTokens <= 40 ? 40
                                                             : 48;
-    static constexpr int kKWarps     = ActiveTokens <= 30 ? 8 : 4;
+    static constexpr int kKWarps     = ActiveTokens <= 24 ? 8 : 4;
     static constexpr int kMinBlocks  = kKWarps == 8 ? 2 : 3;
     static constexpr auto kScaleAccess =
         ActiveTokens > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;

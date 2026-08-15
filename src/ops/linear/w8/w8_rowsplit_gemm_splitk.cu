@@ -34,7 +34,7 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& out, cuda
     constexpr int KWarps    = 4;
     constexpr int MinBlocks = 2;
 #elif defined(NINFER_SM89)
-    constexpr int KWarps    = ActiveCols <= 32 ? 8 : 4;
+    constexpr int KWarps    = ActiveCols <= 24 ? 8 : 4;
     constexpr int MinBlocks = 2;
 #else
     constexpr int KWarps    = ActiveCols <= 36 ? 16 : 8;
