@@ -22,6 +22,21 @@ void append_counter(std::string& out, const char* name, double value) {
 
 } // namespace
 
+void ServeMetrics::begin_request(std::uint64_t id, int prompt_tokens) {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    active_[id] = prompt_tokens > 0 ? prompt_tokens : 0;
+}
+
+void ServeMetrics::end_request(std::uint64_t id) {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    active_.erase(id);
+}
+
+std::vector<std::pair<std::uint64_t, int>> ServeMetrics::active_snapshot() const {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return {active_.begin(), active_.end()};
+}
+
 void ServeMetrics::record(const GenerationOutcome& outcome) {
     const GenerationMetrics& m = outcome.metrics;
     const std::uint64_t cached = m.prefix_cache_hit_tokens;
@@ -42,14 +57,18 @@ void ServeMetrics::record(const GenerationOutcome& outcome) {
     speculative_accepted_tokens_total_ += m.speculative_accepted_tokens;
 }
 
-std::string ServeMetrics::render() const {
+std::string ServeMetrics::render(std::uint32_t max_concurrency) const {
     const std::lock_guard<std::mutex> lock(mutex_);
+    const std::uint64_t in_flight  = active_.size();
+    const std::uint64_t processing = std::min<std::uint64_t>(in_flight, max_concurrency);
     std::string out;
-    out.reserve(640);
+    out.reserve(704);
     append_counter(out, "llamacpp:prompt_tokens_total", prompt_tokens_total_);
     append_counter(out, "llamacpp:prompt_seconds_total", prompt_seconds_total_);
     append_counter(out, "llamacpp:tokens_predicted_total", tokens_predicted_total_);
     append_counter(out, "llamacpp:tokens_predicted_seconds_total", tokens_predicted_seconds_total_);
+    append_counter(out, "llamacpp:requests_processing", processing);
+    append_counter(out, "llamacpp:requests_deferred", in_flight - processing);
     append_counter(out, "ninfer:requests_total", requests_total_);
     append_counter(out, "ninfer:prefix_cache_hit_tokens_total", prefix_cache_hit_tokens_total_);
     append_counter(out, "ninfer:draft_tokens_total", speculative_draft_tokens_total_);

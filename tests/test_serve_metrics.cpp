@@ -47,9 +47,28 @@ int main() {
     int failures = 0;
 
     ServeMetrics metrics;
-    const auto empty = parse(metrics.render());
+    const auto empty = parse(metrics.render(1));
     failures += check(empty.at("llamacpp:prompt_tokens_total") == 0.0, "starts at zero");
     failures += check(empty.at("ninfer:requests_total") == 0.0, "requests start at zero");
+    failures += check(empty.at("llamacpp:requests_processing") == 0.0, "idle processing");
+    failures += check(empty.at("llamacpp:requests_deferred") == 0.0, "idle deferred");
+
+    // Two in-flight requests against one execution lane: FIFO order says the
+    // older one processes and the newer one is deferred.
+    metrics.begin_request(7, 500);
+    metrics.begin_request(8, 900);
+    const auto busy = parse(metrics.render(1));
+    failures += check(busy.at("llamacpp:requests_processing") == 1.0, "one processing");
+    failures += check(busy.at("llamacpp:requests_deferred") == 1.0, "one deferred");
+    const auto active = metrics.active_snapshot();
+    failures += check(active.size() == 2 && active[0].first == 7 && active[0].second == 500,
+                      "snapshot FIFO order");
+    metrics.end_request(7);
+    metrics.end_request(7); // idempotent
+    metrics.end_request(8);
+    const auto drained = parse(metrics.render(1));
+    failures += check(drained.at("llamacpp:requests_processing") == 0.0, "drained processing");
+    failures += check(drained.at("llamacpp:requests_deferred") == 0.0, "drained deferred");
 
     // Cold request: whole prompt computed.
     metrics.record(outcome(1000, 0, 200, 0.5, 4.0, 300, 150));
@@ -57,7 +76,7 @@ int main() {
     // only the 300 computed tokens may count toward the prompt counter.
     metrics.record(outcome(1200, 900, 100, 0.1, 2.0, 150, 75));
 
-    const auto values = parse(metrics.render());
+    const auto values = parse(metrics.render(1));
     failures += check(values.at("llamacpp:prompt_tokens_total") == 1300.0, "computed prefill sum");
     failures += check(values.at("llamacpp:prompt_seconds_total") == 0.6, "prefill seconds sum");
     failures += check(values.at("llamacpp:tokens_predicted_total") == 300.0, "decode tokens sum");
@@ -70,7 +89,7 @@ int main() {
 
     // A cache hit reported larger than the prompt must clamp, not underflow.
     metrics.record(outcome(10, 50, 1, 0.0, 0.1, 0, 0));
-    const auto clamped = parse(metrics.render());
+    const auto clamped = parse(metrics.render(1));
     failures += check(clamped.at("llamacpp:prompt_tokens_total") == 1300.0, "underflow clamped");
 
     std::printf("%s serve metrics\n", failures == 0 ? "OK" : "FAIL");
