@@ -720,17 +720,20 @@ int test_tool_chunk_serialization() {
 
 int test_models_and_error() {
     int failures    = 0;
-    const Json list = Json::parse(make_models_list("qwen3.6-27b", 1, 65536));
+    const Json list = Json::parse(make_models_list("qwen3.6-27b", 1, 65536, true));
     failures += check(list.at("object") == "list", "models list object");
     failures += check(list.at("data").at(0).at("id") == "qwen3.6-27b", "models list id");
     failures += check(list.at("data").at(0).at("object") == "model", "models list entry object");
     failures += check(list.at("data").at(0).at("owned_by") == "ninfer", "models list owner");
     failures += check(list.at("data").at(0).at("context_window") == 65536, "models list context");
+    failures += check(list.at("data").at(0).at("modalities").at("vision") == true,
+                      "models list vision modality");
 
-    const Json one = Json::parse(make_model_object("qwen3.6-27b", 1, 65536));
+    const Json one = Json::parse(make_model_object("qwen3.6-27b", 1, 65536, false));
     failures += check(one.at("id") == "qwen3.6-27b" && one.at("object") == "model", "model object");
     failures += check(one.at("owned_by") == "ninfer", "model owner");
     failures += check(one.at("context_window") == 65536, "model object context");
+    failures += check(one.at("modalities").at("vision") == false, "model object vision modality");
 
     ApiError error;
     error.status   = 400;

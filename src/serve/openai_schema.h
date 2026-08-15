@@ -67,11 +67,13 @@ std::string sse_done();
 
 // /v1/models payloads. `context_window` is the serving max-context, reported
 // so clients can size prompts without a llama.cpp /props or vLLM
-// max_model_len to read.
+// max_model_len to read. `modalities` mirrors the llama.cpp /props shape so
+// clients can tell a vision-enabled server from a text-only one behind the
+// same model id; a server without the field is read as text-only.
 std::string make_models_list(const std::string& model_id, std::int64_t created,
-                             std::uint32_t context_window);
+                             std::uint32_t context_window, bool vision);
 std::string make_model_object(const std::string& model_id, std::int64_t created,
-                              std::uint32_t context_window);
+                              std::uint32_t context_window, bool vision);
 
 // Error object body.
 std::string make_error_body(const ApiError& error);
