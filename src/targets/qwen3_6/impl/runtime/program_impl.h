@@ -2,6 +2,7 @@
 #include "targets/qwen3_6/impl/runtime/program.h"
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
+#include "targets/qwen3_6/impl/runtime/prompt_lookup.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/scatter.h"
@@ -774,6 +775,16 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                     for (std::uint32_t step = 0; step < sequence.mtp_draft_count; ++step) {
                         sequence.mtp_drafts[step] =
                             mtp_host_egress->next_drafts[step * max_concurrency + row];
+                    }
+                    if (sequence.mtp_draft_count == 0 && sequence.ledger.size() >= 4) {
+                        const auto lookup =
+                            find_prompt_lookup_draft(sequence.ledger, draft_window, 3);
+                        if (lookup.count > 0) {
+                            sequence.mtp_draft_count = lookup.count;
+                            for (std::uint32_t step = 0; step < lookup.count; ++step) {
+                                sequence.mtp_drafts[step] = lookup.tokens[step];
+                            }
+                        }
                     }
                 }
             } else {
@@ -1841,6 +1852,16 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = sequences[lanes[row]];
             const RequestControl& request     = requests[lanes[row]];
+            if (sequence.mtp_draft_count == 0 && sequence.ledger.size() >= 4) {
+                const auto lookup =
+                    find_prompt_lookup_draft(sequence.ledger, draft_window, 3);
+                if (lookup.count > 0) {
+                    sequence.mtp_draft_count = lookup.count;
+                    for (std::uint32_t step = 0; step < lookup.count; ++step) {
+                        sequence.mtp_drafts[step] = lookup.tokens[step];
+                    }
+                }
+            }
             const std::uint32_t frontier      = sequence.execution_frontier;
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1
