@@ -260,24 +260,40 @@ public:
         const bool alpha = composite_alpha && descriptor != nullptr &&
                            (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
         const int channels = alpha ? 4 : 3;
-        std::vector<std::uint8_t> converted(static_cast<std::size_t>(width) * height * channels);
+        // sws_scale's SIMD converters write whole aligned chunks per row, so
+        // the destination stride must be padded; a width-tight buffer gets its
+        // heap metadata overwritten for unaligned widths (e.g. 300px JPEGs).
+        const int dst_stride = FFALIGN(width * channels, 64);
+        std::vector<std::uint8_t> converted(static_cast<std::size_t>(dst_stride) * height + 64);
         sws_ = sws_getCachedContext(sws_, width, height, static_cast<AVPixelFormat>(frame->format),
                                     width, height, alpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24,
                                     SWS_POINT, nullptr, nullptr, nullptr);
         if (sws_ == nullptr) { throw std::runtime_error("failed to create media color converter"); }
         std::uint8_t* dst[] = {converted.data(), nullptr, nullptr, nullptr};
-        int stride[]        = {width * channels, 0, 0, 0};
+        int stride[]        = {dst_stride, 0, 0, 0};
         const int rows      = sws_scale(sws_, frame->data, frame->linesize, 0, height, dst, stride);
         if (rows != height) { throw std::runtime_error("failed to convert media frame to RGB"); }
-        out.rgb.resize(static_cast<std::size_t>(width) * height * 3);
-        if (!alpha) {
+        if (!alpha && dst_stride == width * 3) {
+            converted.resize(static_cast<std::size_t>(width) * height * 3);
             out.rgb = std::move(converted);
+        } else if (!alpha) {
+            out.rgb.resize(static_cast<std::size_t>(width) * height * 3);
+            for (int y = 0; y < height; ++y) {
+                std::memcpy(out.rgb.data() + static_cast<std::size_t>(y) * width * 3,
+                            converted.data() + static_cast<std::size_t>(y) * dst_stride,
+                            static_cast<std::size_t>(width) * 3);
+            }
         } else {
-            for (std::size_t i = 0; i < static_cast<std::size_t>(width) * height; ++i) {
-                const int a = converted[4 * i + 3];
-                for (int c = 0; c < 3; ++c) {
-                    out.rgb[3 * i + c] = static_cast<std::uint8_t>(
-                        ((255 - a) * 255 + a * converted[4 * i + c] + 127) / 255);
+            out.rgb.resize(static_cast<std::size_t>(width) * height * 3);
+            for (int y = 0; y < height; ++y) {
+                const std::uint8_t* src = converted.data() + static_cast<std::size_t>(y) * dst_stride;
+                std::uint8_t* row       = out.rgb.data() + static_cast<std::size_t>(y) * width * 3;
+                for (int x = 0; x < width; ++x) {
+                    const int a = src[4 * x + 3];
+                    for (int c = 0; c < 3; ++c) {
+                        row[3 * x + c] = static_cast<std::uint8_t>(
+                            ((255 - a) * 255 + a * src[4 * x + c] + 127) / 255);
+                    }
                 }
             }
         }
