@@ -776,9 +776,9 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                         sequence.mtp_drafts[step] =
                             mtp_host_egress->next_drafts[step * max_concurrency + row];
                     }
-                    if (sequence.mtp_draft_count == 0 && sequence.ledger.size() >= 4) {
+                    if (sequence.mtp_draft_count == 0 && sequence.ledger.size() >= 3) {
                         const auto lookup =
-                            find_prompt_lookup_draft(sequence.ledger, draft_window, 3);
+                            find_prompt_lookup_draft(sequence.ledger, draft_window);
                         if (lookup.count > 0) {
                             sequence.mtp_draft_count = lookup.count;
                             for (std::uint32_t step = 0; step < lookup.count; ++step) {
@@ -1852,9 +1852,9 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = sequences[lanes[row]];
             const RequestControl& request     = requests[lanes[row]];
-            if (sequence.mtp_draft_count == 0 && sequence.ledger.size() >= 4) {
+            if (sequence.mtp_draft_count == 0 && sequence.ledger.size() >= 3) {
                 const auto lookup =
-                    find_prompt_lookup_draft(sequence.ledger, draft_window, 3);
+                    find_prompt_lookup_draft(sequence.ledger, draft_window);
                 if (lookup.count > 0) {
                     sequence.mtp_draft_count = lookup.count;
                     for (std::uint32_t step = 0; step < lookup.count; ++step) {

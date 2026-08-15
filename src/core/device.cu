@@ -73,12 +73,19 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
         }
     }
 
+    int lowest_priority  = 0;
+    int highest_priority = 0;
+    cudaDeviceGetStreamPriorityRange(&lowest_priority, &highest_priority);
+
     cudaStream_t compute = nullptr;
     cudaStream_t load    = nullptr;
-    err                  = cudaStreamCreateWithFlags(&compute, cudaStreamNonBlocking);
+    err = cudaStreamCreateWithPriority(&compute, cudaStreamNonBlocking, highest_priority);
     if (err != cudaSuccess) {
-        throw std::runtime_error(
-            cuda_error_message("cudaStreamCreateWithFlags(stream) failed", err));
+        err = cudaStreamCreateWithFlags(&compute, cudaStreamNonBlocking);
+        if (err != cudaSuccess) {
+            throw std::runtime_error(
+                cuda_error_message("cudaStreamCreateWithPriority(stream) failed", err));
+        }
     }
 
     err = cudaStreamCreateWithFlags(&load, cudaStreamNonBlocking);
