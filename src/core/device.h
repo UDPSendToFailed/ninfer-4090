@@ -27,6 +27,9 @@ struct DeviceContext {
     int sm() const noexcept;
     std::size_t total_vram() const noexcept;
     void synchronize() const;
+    void set_persisting_l2_window(const void* ptr, std::size_t num_bytes,
+                                  float hit_ratio = 1.0f) const;
+    void clear_persisting_l2_window() const;
 };
 
 class CudaEventTimer {

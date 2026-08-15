@@ -167,6 +167,9 @@ public:
         proposal_head_     = weight;
         proposal_head_ids_ = ids;
         proposal_head_n_   = count;
+        if (proposal_head_ != nullptr && proposal_head_->payload != nullptr && proposal_head_->payload_bytes > 0) {
+            ctx_.set_persisting_l2_window(proposal_head_->payload, proposal_head_->payload_bytes, 1.0f);
+        }
     }
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }

@@ -1,5 +1,6 @@
 #include "core/device.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -130,6 +131,49 @@ int DeviceContext::sm() const noexcept { return props.major * 10 + props.minor; 
 std::size_t DeviceContext::total_vram() const noexcept { return props.totalGlobalMem; }
 
 void DeviceContext::synchronize() const { CUDA_CHECK(cudaStreamSynchronize(stream)); }
+
+void DeviceContext::set_persisting_l2_window(const void* ptr, std::size_t num_bytes,
+                                             float hit_ratio) const {
+    if (ptr == nullptr || num_bytes == 0 || stream == nullptr) { return; }
+    if (props.persistingL2CacheMaxSize == 0) { return; }
+
+    const std::size_t max_window = (props.accessPolicyMaxWindowSize > 0)
+                                       ? static_cast<std::size_t>(props.accessPolicyMaxWindowSize)
+                                       : static_cast<std::size_t>(props.persistingL2CacheMaxSize);
+    const std::size_t window_bytes = std::min(max_window, num_bytes);
+    if (window_bytes == 0) { return; }
+
+    cudaStreamAttrValue attr{};
+    attr.accessPolicyWindow.base_ptr  = const_cast<void*>(ptr);
+    attr.accessPolicyWindow.num_bytes = window_bytes;
+    attr.accessPolicyWindow.hitRatio  = std::clamp(hit_ratio, 0.0f, 1.0f);
+    attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+    attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+
+    const cudaError_t err =
+        cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+    if (err != cudaSuccess) {
+        // If driver or device does not accept persisting window, log and continue without error
+        log_cuda_error("cudaStreamSetAttribute(AccessPolicyWindow)", err);
+    }
+}
+
+void DeviceContext::clear_persisting_l2_window() const {
+    if (stream == nullptr || props.persistingL2CacheMaxSize == 0) { return; }
+
+    cudaStreamAttrValue attr{};
+    attr.accessPolicyWindow.base_ptr  = nullptr;
+    attr.accessPolicyWindow.num_bytes = 0;
+    attr.accessPolicyWindow.hitRatio  = 0.0f;
+    attr.accessPolicyWindow.hitProp   = cudaAccessPropertyStreaming;
+    attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+
+    const cudaError_t err =
+        cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+    if (err != cudaSuccess) {
+        log_cuda_error("cudaStreamSetAttribute(AccessPolicyWindow clear)", err);
+    }
+}
 
 CudaEventTimer::CudaEventTimer(const DeviceContext& ctx) : stream_(ctx.stream) {
     cudaError_t err = cudaSetDevice(ctx.device);
