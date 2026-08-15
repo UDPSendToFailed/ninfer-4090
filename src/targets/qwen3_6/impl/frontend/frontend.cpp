@@ -853,7 +853,14 @@ PreparedPrompt Frontend::prepare(PromptInput input) const {
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     if (has_media) {
-        fi::Processor processor(*impl_->tokenizer, impl_->chat_template, impl_->processor);
+        // The processor's max_prompt_tokens default (32k) is not wired to the
+        // engine's context limit, so leaving it in place rejects any media
+        // request whose conversation is deeper than 32k tokens even when the
+        // context has room. The engine enforces the real context limit later
+        // (ContextLengthExceeded); lift the cap here like count_tokens does.
+        fi::ProcessorOptions processor_options = impl_->processor;
+        processor_options.max_prompt_tokens    = std::numeric_limits<std::size_t>::max();
+        fi::Processor processor(*impl_->tokenizer, impl_->chat_template, processor_options);
         fi::ProcessedInput processed;
         try {
             processed = processor.process(messages, render_options(options));
