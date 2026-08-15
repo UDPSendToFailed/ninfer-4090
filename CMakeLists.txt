@@ -33,6 +33,13 @@ if(MSVC)
   # the project-wide /MD runtime. Keep one CRT in the final process.
   add_link_options(/NODEFAULTLIB:LIBCMT)
 endif()
+
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "86")
+  add_compile_definitions(NINFER_SM86=1)
+elseif(CMAKE_CUDA_ARCHITECTURES STREQUAL "89")
+  add_compile_definitions(NINFER_SM89=1)
+endif()
+
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()

@@ -90,6 +90,7 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
 constexpr auto kLaunchers =
     make_launchers(std::make_index_sequence<kLastExactT - kFirstExactT + 1>{});
 
+#if !defined(NINFER_SM86) && !defined(NINFER_SM89)
 template <int TileCols, int KSplits, int NGroups, int MinBlocks>
 void launch_medium(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
                    Tensor& first_out, Tensor& second_out, cudaStream_t stream) {
@@ -106,6 +107,7 @@ void launch_medium(const Tensor& x, const Weight& first_weight, const Weight& se
         <<<(2 * kRows) / 16, KSplits * NGroups * 32, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), first_codes, first_scales, output, x.ne[1]);
 }
+#endif
 
 } // namespace
 
@@ -129,7 +131,7 @@ void w8_pair_splitk_medium_launch(W8PairScheduleId schedule, const Tensor& x,
         first_out.ne[1] != x.ne[1] || second_out.ne[0] != kRows || second_out.ne[1] != x.ne[1]) {
         throw std::invalid_argument("W8 medium pair requires [1024,2048] and T>=33");
     }
-#if defined(NINFER_SM8X_COMPAT)
+#if defined(NINFER_SM86) || defined(NINFER_SM89)
     (void)schedule;
     std::int32_t offset = 0;
     while (offset < x.ne[1]) {

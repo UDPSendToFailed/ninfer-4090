@@ -643,8 +643,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         // each reachable node-topology class. These bounds cover the largest profile installed in
         // each class and the driver/module state materialized while qualifying all definitions.
         if (impl->speculative_backend == SpeculativeBackend::None) {
+#if defined(NINFER_SM86) || defined(NINFER_SM89)
+            impl->graph_allowance_bytes = checked_mul(72ULL * kMiB, impl->max_concurrency,
+                                                      "ordinary exact-b graph allowance");
+#else
             impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
+#endif
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
             const std::size_t per_batch_allowance = graph_topology_allowance(
@@ -653,21 +658,28 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     const std::uint64_t final_visible = std::min<std::uint64_t>(
                         impl->capacity,
                         static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
-#ifdef NINFER_SM8X_COMPAT
+#if defined(NINFER_SM86) || defined(NINFER_SM89)
                     if (final_visible <= 4096) {
-                        // The reduced-startup graph set still consumes 35.8 MiB at C1/K3 and
-                        // 43.1 MiB at C1/K4 on SM86. K2 retains the smaller qualified allowance;
-                        // reserve one 64 MiB class for K3 and deeper captures.
-                        return (impl->draft_window >= 3 ? 64ULL : 16ULL) * kMiB;
+                        return (impl->draft_window >= 3 ? 88ULL : 16ULL) * kMiB;
                     }
-                    return 86ULL * kMiB;
+                    return (impl->draft_window >= 3 ? 96ULL : 32ULL) * kMiB;
 #else
                     return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
 #endif
                 },
                 "MTP graph allowance");
+#if defined(NINFER_SM86) || defined(NINFER_SM89)
+            const std::size_t base_allowance = (impl->capacity > 4096 && impl->draft_window >= 3)
+                                                   ? 300ULL * kMiB
+                                                   : 0ULL;
+            impl->graph_allowance_bytes = checked_add(
+                base_allowance,
+                checked_mul(per_batch_allowance, impl->max_concurrency, "MTP exact-b graph allowance"),
+                "MTP graph allowance");
+#else
             impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
                                                       "MTP exact-b graph allowance");
+#endif
         } else {
             const auto class_allowance = [&](std::uint32_t batch_size) {
                 const auto profiles =

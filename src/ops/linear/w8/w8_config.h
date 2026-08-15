@@ -55,8 +55,8 @@ struct W8SmallTMmaSchedule {
 
 template <int TileTokens, int ActiveTokens>
 using W8SmallTMmaDefaultSchedule = W8SmallTMmaSchedule<
-#if defined(NINFER_SM8X_COMPAT)
-    4, TileTokens, 2,
+#if defined(NINFER_SM86) || defined(NINFER_SM89)
+    (TileTokens <= 32 ? 8 : 4), TileTokens, 2,
 #else
     8, TileTokens, TileTokens == 8 ? 5 : (TileTokens == 16 ? 4 : (TileTokens == 24 ? 3 : 2)),
 #endif
@@ -207,8 +207,8 @@ struct W8LinearSmallTProductionSchedule<W835bMtpProjectionGeometry, ActiveTokens
                                        : ActiveTokens <= 32 ? 32
                                        : ActiveTokens <= 40 ? 40
                                                             : 48;
-#if defined(NINFER_SM8X_COMPAT)
-    static constexpr int kKWarps = 4;
+#if defined(NINFER_SM86) || defined(NINFER_SM89)
+    static constexpr int kKWarps = ActiveTokens <= 12 ? 8 : 4;
 #else
     static constexpr int kKWarps = ActiveTokens <= 12 ? 16 : 8;
 #endif

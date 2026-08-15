@@ -16,8 +16,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 IS_WINDOWS = platform.system() == "Windows"
-SERVER = ROOT / ("build-sm86-replayssm/apps/Release/ninfer-serve.exe" if IS_WINDOWS else "build-sm89/apps/ninfer-serve")
-MODEL = Path(os.environ.get("NINFER_MODEL", ROOT.parent / "qwen3_8_27b.ninfer"))
+SERVER = ROOT / ("build-sm89/apps/Release/ninfer-serve.exe" if IS_WINDOWS else "build-sm89/apps/ninfer-serve")
+MODEL = Path(os.environ.get("NINFER_MODEL", r"c:\Users\Henrik\Desktop\LLM\qwen3_8_27b.ninfer"))
 OUTPUT_ROOT = ROOT / "benchmark_results/qwen3_8_replayssm_sm89_cohort_k3_1024"
 COHORTS = (1, 2, 4, 8)
 PORT = 8093

@@ -16,7 +16,7 @@ namespace {
 constexpr int kRows           = 2048;
 constexpr int kRowsPerCta     = 16;
 constexpr int kFirstExactCols = 2;
-#if defined(NINFER_SM8X_COMPAT)
+#if defined(NINFER_SM86)
 constexpr int kLastExactCols = 32;
 #else
 constexpr int kLastExactCols = 48;
@@ -32,7 +32,7 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& residual_
                              : ActiveCols <= 32 ? 32
                              : ActiveCols <= 40 ? 40
                                                 : 48;
-#if defined(NINFER_SM8X_COMPAT)
+#if defined(NINFER_SM86) || defined(NINFER_SM89)
     constexpr int KWarps = ActiveCols <= 32 ? 8 : 4;
 #else
     constexpr int KWarps =
@@ -68,6 +68,7 @@ constexpr auto kK4096ProjectionLaunchers = make_projection_launchers<4096>(
 constexpr auto kK6144ProjectionLaunchers = make_projection_launchers<6144>(
     std::make_index_sequence<kLastExactCols - kFirstExactCols + 1>{});
 
+#if !defined(NINFER_SM86) && !defined(NINFER_SM89)
 template <int Hidden, int TileCols, int KSplits, int NGroups, int MinBlocks>
 void launch_medium(const Tensor& x, Tensor& residual_out, const Weight& weight,
                    cudaStream_t stream) {
@@ -89,6 +90,7 @@ void dispatch_medium_shape(const Tensor& x, const Weight& weight, Tensor& residu
         launch_medium<6144, TileCols, KSplits, NGroups, MinBlocks>(x, residual_out, weight, stream);
     }
 }
+#endif
 
 } // namespace
 
@@ -97,7 +99,7 @@ void w8_linear_add_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
     if (x.ne[1] < kFirstExactCols || x.ne[1] > 48) {
         throw std::invalid_argument("W8 linear_add split-K MMA requires exact T=2..48");
     }
-#if defined(NINFER_SM8X_COMPAT)
+#if defined(NINFER_SM86)
     if (x.ne[1] > kLastExactCols) {
         std::int32_t offset = 0;
         while (x.ne[1] - offset >= kLastExactCols) {
@@ -133,7 +135,7 @@ void w8_linear_add_medium_splitk_launch(const Tensor& x, const Weight& weight, T
     if ((weight.k != 4096 && weight.k != 6144) || t < 49 || t > 128) {
         throw std::invalid_argument("W8 linear_add medium split-K requires T=49..128");
     }
-#if defined(NINFER_SM8X_COMPAT)
+#if defined(NINFER_SM86) || defined(NINFER_SM89)
     std::int32_t offset = 0;
     while (offset < t) {
         const std::int32_t count = std::min<std::int32_t>(kLastExactCols, t - offset);
