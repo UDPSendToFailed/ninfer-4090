@@ -105,6 +105,9 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) {
     if (storage == ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) {
         return "rotated-k8-v4-group64";
     }
+    if (storage == ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueGroup64) {
+        return "rotated-k4-v4-group64";
+    }
     return "int8-group64";
 }
 

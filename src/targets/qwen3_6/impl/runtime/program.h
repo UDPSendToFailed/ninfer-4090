@@ -239,6 +239,7 @@ public:
     const bool kv_packed_v;
     const bool kv_rotate_k;
     const bool kv_rotate_v;
+    const bool kv_packed_k;
     const ProposalHead proposal_head;
     const bool vision_enabled;
     const bool use_cuda_graph;

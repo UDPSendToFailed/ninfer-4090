@@ -75,13 +75,15 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     }
 
     const DType code_dtype = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
-    if (cache.k_pages.dtype != code_dtype ||
+    if (cache.k_pages.dtype != (cache.packed_k ? DType::U8 : code_dtype) ||
         cache.v_pages.dtype != (cache.packed_v ? DType::U8 : code_dtype)) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    const std::int32_t k_dim = cache.packed_k ? kHeadDim / 2 : kHeadDim;
+    const std::int32_t v_dim = cache.packed_v ? kHeadDim / 2 : kHeadDim;
+    require_shape(cache.k_pages, k_dim, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache k pages");
-    require_shape(cache.v_pages, cache.packed_v ? kHeadDim / 2 : kHeadDim, kPagedKVPageSize,
+    require_shape(cache.v_pages, v_dim, kPagedKVPageSize,
                   kv_heads, physical_pages, op,
                   "cache v pages");
     require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
@@ -99,7 +101,7 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         return static_cast<std::uint32_t>(capacity);
     }
 
-    constexpr std::int32_t groups = kHeadDim / kQuantGroup;
+    const std::int32_t groups = kHeadDim / kQuantGroup;
     if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
     }
@@ -138,13 +140,15 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     }
 
     const DType code_dtype = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
-    if (cache.k_pages.dtype != code_dtype ||
+    if (cache.k_pages.dtype != (cache.packed_k ? DType::U8 : code_dtype) ||
         cache.v_pages.dtype != (cache.packed_v ? DType::U8 : code_dtype)) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    const std::int32_t k_dim = cache.packed_k ? kHeadDim / 2 : kHeadDim;
+    const std::int32_t v_dim = cache.packed_v ? kHeadDim / 2 : kHeadDim;
+    require_shape(cache.k_pages, k_dim, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache k pages");
-    require_shape(cache.v_pages, cache.packed_v ? kHeadDim / 2 : kHeadDim, kPagedKVPageSize,
+    require_shape(cache.v_pages, v_dim, kPagedKVPageSize,
                   kv_heads, physical_pages, op,
                   "cache v pages");
     require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
@@ -162,7 +166,7 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         return static_cast<std::uint32_t>(capacity);
     }
 
-    constexpr std::int32_t groups = kHeadDim / kQuantGroup;
+    const std::int32_t groups = kHeadDim / kQuantGroup;
     if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
     }

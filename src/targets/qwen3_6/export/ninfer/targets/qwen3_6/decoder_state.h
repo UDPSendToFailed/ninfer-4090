@@ -23,6 +23,7 @@ struct DecoderStateSpec {
     bool kv_packed_v                        = false;
     bool kv_rotate_k                        = false;
     bool kv_rotate_v                        = false;
+    bool kv_packed_k                        = false;
     bool enable_mtp                         = false;
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
@@ -41,6 +42,7 @@ struct PagedKVCacheLayout {
     bool packed_v             = false;
     bool rotate_k             = false;
     bool rotate_v             = false;
+    bool packed_k             = false;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept { return pool.payload_bytes(); }
 };
@@ -99,6 +101,7 @@ private:
     bool packed_v_             = false;
     bool rotate_k_             = false;
     bool rotate_v_             = false;
+    bool packed_k_             = false;
 };
 
 struct DecoderStateLayout {
