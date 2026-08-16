@@ -71,6 +71,7 @@ struct SequencePlanningInputs {
     bool kv_rotate_k                       = false;
     bool kv_rotate_v                       = false;
     bool kv_packed_k                       = false;
+    bool kv_e8_lattice                     = false;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
@@ -97,6 +98,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     bool kv_rotate_k                       = false;
     bool kv_rotate_v                       = false;
     bool kv_packed_k                       = false;
+    bool kv_e8_lattice                     = false;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;

@@ -34,6 +34,7 @@ struct PagedKVLayerView {
     bool rotate_k             = false;
     bool rotate_v             = false;
     bool packed_k             = false;
+    bool e8_lattice           = false;
 };
 
 /**
@@ -57,6 +58,7 @@ struct PagedKVBatchLayerView {
     bool rotate_k             = false;
     bool rotate_v             = false;
     bool packed_k             = false;
+    bool e8_lattice           = false;
 };
 
 // A pool plane is storage-only. Consumers assign K/V/layer meaning to plane indices.

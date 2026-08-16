@@ -288,6 +288,17 @@ ninfer_add_test(ninfer_qwen3_6_27b_visual_scatter_test
   LIBRARIES ninfer_engine ninfer_core)
 set_tests_properties(ninfer_qwen3_6_27b_visual_scatter_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# Isolated E8 Lattice Tensor Core KV Codec Testbed
+add_executable(ninfer_test_e8_codec
+  ${PROJECT_SOURCE_DIR}/tools/test_kv/verify_1m_retrieval.cu
+  ${PROJECT_SOURCE_DIR}/tools/test_kv/test_e8_codec.cu)
+target_include_directories(ninfer_test_e8_codec PRIVATE
+  ${PROJECT_SOURCE_DIR}/tools/test_kv
+  ${PROJECT_SOURCE_DIR}/src/ops/kernel
+  ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(ninfer_test_e8_codec PRIVATE CUDA::cudart)
+set_target_properties(ninfer_test_e8_codec PROPERTIES CUDA_ARCHITECTURES "89")
+
 # These tests deliberately compile against the exact target's internal contracts; the target does
 # not export impl/ to ordinary consumers.
 set(ninfer_qwen3_6_27b_internal_tests
@@ -298,3 +309,4 @@ foreach(test_target IN LISTS ninfer_qwen3_6_27b_internal_tests)
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 endforeach()
+

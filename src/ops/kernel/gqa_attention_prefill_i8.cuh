@@ -9,6 +9,7 @@
 #include <cuda_fp16.h>
 #include <math_constants.h>
 
+#include "ops/kernel/e8_lattice.cuh"
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
 #include "ops/kernel/gqa_attention_prefill_common.cuh"
 
@@ -79,8 +80,10 @@ __device__ __forceinline__ int4 gqa_prefill_i8_dequant_f16x8(const std::int8_t* 
 
 // Eight independent quantization units per CTA; one warp owns one
 // (token, kv_head, 64-d group), with two dimensions per lane.
+// Eight independent quantization units per CTA; one warp owns one
+// (token, kv_head, 64-d group), with two dimensions per lane.
 template <typename Geometry, bool PackedV, bool RotateK, bool RotateV, bool PackedK,
-          typename Metadata>
+          bool E8Lattice = false, typename Metadata>
 __launch_bounds__(256) __global__
     void gqa_attention_prefill_fill_i8_kernel(const __nv_bfloat16* __restrict__ k,
                                               const __nv_bfloat16* __restrict__ v,
@@ -134,15 +137,28 @@ __launch_bounds__(256) __global__
     const std::int64_t code_base =
         gqa_kv_quant_code_index<Geometry>(page, kv_head, group * kGqaKvQuantGroup, page_off);
     if constexpr (PackedK) {
-        const float k0_hi = __shfl_down_sync(FullMask, k0, 1);
-        const float k1_hi = __shfl_down_sync(FullMask, k1, 1);
+        std::int8_t c0 = 0, c1 = 0;
+        if constexpr (E8Lattice) {
+            float k0_scaled = k0 * kinv;
+            float k1_scaled = k1 * kinv;
+            e8_project_8d_warp(k0_scaled, k1_scaled, lane);
+            int q0 = static_cast<int>(rintf(k0_scaled));
+            int q1 = static_cast<int>(rintf(k1_scaled));
+            c0 = static_cast<std::int8_t>(max(-8, min(7, q0)));
+            c1 = static_cast<std::int8_t>(max(-8, min(7, q1)));
+        } else {
+            c0 = gqa_kv_quant_i4_code(k0, kinv);
+            c1 = gqa_kv_quant_i4_code(k1, kinv);
+        }
+        const std::int8_t c0_hi = static_cast<std::int8_t>(__shfl_down_sync(FullMask, static_cast<int>(c0), 1));
+        const std::int8_t c1_hi = static_cast<std::int8_t>(__shfl_down_sync(FullMask, static_cast<int>(c1), 1));
         const float v0_hi = __shfl_down_sync(FullMask, v0, 1);
         const float v1_hi = __shfl_down_sync(FullMask, v1, 1);
         if ((lane & 1) == 0) {
             reinterpret_cast<std::uint8_t*>(cache_k)[gqa_kv_i4_code_index<Geometry>(page, kv_head, d0 / 2, page_off)] =
-                gqa_kv_pack_i4(gqa_kv_quant_i4_code(k0, kinv), gqa_kv_quant_i4_code(k0_hi, kinv));
+                gqa_kv_pack_i4(c0, c0_hi);
             reinterpret_cast<std::uint8_t*>(cache_k)[gqa_kv_i4_code_index<Geometry>(page, kv_head, d1 / 2, page_off)] =
-                gqa_kv_pack_i4(gqa_kv_quant_i4_code(k1, kinv), gqa_kv_quant_i4_code(k1_hi, kinv));
+                gqa_kv_pack_i4(c1, c1_hi);
             cache_v[gqa_kv_i4_code_index<Geometry>(page, kv_head, d0 / 2, page_off)] =
                 gqa_kv_pack_i4(gqa_kv_quant_i4_code(v0, vinv), gqa_kv_quant_i4_code(v0_hi, vinv));
             cache_v[gqa_kv_i4_code_index<Geometry>(page, kv_head, d1 / 2, page_off)] =
@@ -179,7 +195,7 @@ __launch_bounds__(256) __global__
 // Large appends are scheduled in absolute eight-token tiles. Eight divides P=64, so each CTA is
 // page-local while an unknown base offset costs at most one empty tail CTA in the launch envelope.
 template <typename Geometry, bool PackedV, bool RotateK, bool RotateV, bool PackedK,
-          typename Metadata>
+          bool E8Lattice = false, typename Metadata>
 __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const std::int32_t* __restrict__ positions, Metadata metadata,
@@ -221,7 +237,7 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
     const float k_abs = warp_max(fmaxf(fabsf(k0), fabsf(k1)), FullMask);
     const float v_abs = warp_max(fmaxf(fabsf(v0), fabsf(v1)), FullMask);
     const __half ksh  = __float2half_rn(k_abs > 0.0f ? k_abs / (PackedK ? 7.0f : 127.0f) : 0.0f);
-    const __half vsh = __float2half_rn(v_abs > 0.0f ? v_abs / (PackedV ? 7.0f : 127.0f) : 0.0f);
+    const __half vsh  = __float2half_rn(v_abs > 0.0f ? v_abs / (PackedV ? 7.0f : 127.0f) : 0.0f);
     const float ks    = __half2float(ksh);
     const float vs    = __half2float(vsh);
     const float kinv  = ks > 0.0f ? 1.0f / ks : 0.0f;
@@ -235,15 +251,28 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
         paged_kv_page_head_offset<kGqaKvQuantHeadDim, Geometry::KVHeads>(physical_page, kv_head) +
         static_cast<std::int64_t>(page_off) * kGqaKvQuantHeadDim + group * kGqaKvQuantGroup;
     if constexpr (PackedK) {
-        const float k0_hi = __shfl_down_sync(FullMask, k0, 1);
-        const float k1_hi = __shfl_down_sync(FullMask, k1, 1);
+        std::int8_t c0 = 0, c1 = 0;
+        if constexpr (E8Lattice) {
+            float k0_scaled = k0 * kinv;
+            float k1_scaled = k1 * kinv;
+            e8_project_8d_warp(k0_scaled, k1_scaled, lane);
+            int q0 = static_cast<int>(rintf(k0_scaled));
+            int q1 = static_cast<int>(rintf(k1_scaled));
+            c0 = static_cast<std::int8_t>(max(-8, min(7, q0)));
+            c1 = static_cast<std::int8_t>(max(-8, min(7, q1)));
+        } else {
+            c0 = gqa_kv_quant_i4_code(k0, kinv);
+            c1 = gqa_kv_quant_i4_code(k1, kinv);
+        }
+        const std::int8_t c0_hi = static_cast<std::int8_t>(__shfl_down_sync(FullMask, static_cast<int>(c0), 1));
+        const std::int8_t c1_hi = static_cast<std::int8_t>(__shfl_down_sync(FullMask, static_cast<int>(c1), 1));
         const float v0_hi = __shfl_down_sync(FullMask, v0, 1);
         const float v1_hi = __shfl_down_sync(FullMask, v1, 1);
         if ((lane & 1) == 0) {
             reinterpret_cast<std::uint8_t*>(cache_k)[gqa_kv_i4_code_index<Geometry>(physical_page, kv_head, d0 / 2, page_off)] =
-                gqa_kv_pack_i4(gqa_kv_quant_i4_code(k0, kinv), gqa_kv_quant_i4_code(k0_hi, kinv));
+                gqa_kv_pack_i4(c0, c0_hi);
             reinterpret_cast<std::uint8_t*>(cache_k)[gqa_kv_i4_code_index<Geometry>(physical_page, kv_head, d1 / 2, page_off)] =
-                gqa_kv_pack_i4(gqa_kv_quant_i4_code(k1, kinv), gqa_kv_quant_i4_code(k1_hi, kinv));
+                gqa_kv_pack_i4(c1, c1_hi);
             cache_v[gqa_kv_i4_code_index<Geometry>(physical_page, kv_head, d0 / 2, page_off)] =
                 gqa_kv_pack_i4(gqa_kv_quant_i4_code(v0, vinv), gqa_kv_quant_i4_code(v0_hi, vinv));
             cache_v[gqa_kv_i4_code_index<Geometry>(physical_page, kv_head, d1 / 2, page_off)] =

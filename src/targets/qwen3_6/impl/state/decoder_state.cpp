@@ -15,7 +15,7 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers,
                               std::uint32_t capacity, std::int32_t kv_heads, std::int32_t head_dim,
                               DType dtype, std::int32_t quant_group, std::int32_t table_rows,
                               std::uint32_t physical_page_groups, bool packed_v, bool rotate_k,
-                              bool rotate_v, bool packed_k) {
+                              bool rotate_v, bool packed_k, bool e8_lattice) {
     if (layers == 0 || capacity == 0 || kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
         throw std::invalid_argument("Paged KV cache dimensions must be positive");
     }
@@ -24,11 +24,14 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers,
         (quantized && (quant_group != kKvQuantGroup || head_dim % quant_group != 0))) {
         throw std::invalid_argument("Paged KV cache dtype or quantization is invalid");
     }
-    if ((packed_v || rotate_k || rotate_v || packed_k) && !quantized) {
+    if ((packed_v || rotate_k || rotate_v || packed_k || e8_lattice) && !quantized) {
         throw std::invalid_argument("Packed or rotated KV requires quantized storage");
     }
     if (rotate_v && !packed_v) {
         throw std::invalid_argument("Rotated V requires packed V4 storage");
+    }
+    if (e8_lattice && !packed_k) {
+        throw std::invalid_argument("E8 lattice requires packed K storage");
     }
 
     const std::uint32_t logical_pages = page_count(capacity);
@@ -66,6 +69,7 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers,
         .rotate_k    = rotate_k,
         .rotate_v    = rotate_v,
         .packed_k    = packed_k,
+        .e8_lattice  = e8_lattice,
     };
 }
 
@@ -77,13 +81,13 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
                                 spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
                                 spec.kv_table_rows, spec.text_physical_page_groups,
                                 spec.kv_packed_v, spec.kv_rotate_k, spec.kv_rotate_v,
-                                spec.kv_packed_k);
+                                spec.kv_packed_k, spec.kv_e8_lattice);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
                                    spec.kv_table_rows, spec.mtp_physical_page_groups,
                                    spec.kv_packed_v, spec.kv_rotate_k, spec.kv_rotate_v,
-                                   spec.kv_packed_k);
+                                   spec.kv_packed_k, spec.kv_e8_lattice);
     }
     layout.linear_attention = plan_linear_attention_state_pool(builder, spec.linear_attention);
     return layout;
@@ -93,7 +97,7 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
     : pool_(backing, layout.pool), layers_(layout.layers), max_context_(layout.max_context),
       kv_heads_(layout.kv_heads), head_dim_(layout.head_dim), dtype_(layout.dtype),
       quant_group_(layout.quant_group), packed_v_(layout.packed_v), rotate_k_(layout.rotate_k),
-      rotate_v_(layout.rotate_v), packed_k_(layout.packed_k) {}
+      rotate_v_(layout.rotate_v), packed_k_(layout.packed_k), e8_lattice_(layout.e8_lattice) {}
 
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept
     : cache_(&cache), block_table_(block_table) {}
@@ -133,6 +137,7 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
         .rotate_k      = rotate_k_,
         .rotate_v      = rotate_v_,
         .packed_k      = packed_k_,
+        .e8_lattice    = e8_lattice_,
     };
 }
 
@@ -155,6 +160,7 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
         .rotate_k      = rotate_k_,
         .rotate_v      = rotate_v_,
         .packed_k      = packed_k_,
+        .e8_lattice    = e8_lattice_,
     };
 }
 

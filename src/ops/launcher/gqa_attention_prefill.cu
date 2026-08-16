@@ -82,15 +82,15 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
         Tensor& cache_k_scale    = cache.k_scale_pages;
         Tensor& cache_v_scale    = cache.v_scale_pages;
         constexpr int kFillBlock = 256;
-        const auto launch_fill = [&]<bool PackedV, bool RotateK, bool RotateV, bool PackedK>() {
-        if (tokens >= 128 && Geometry::KVHeads == 2) {
+        const auto launch_fill = [&]<bool PackedV, bool RotateK, bool RotateV, bool PackedK, bool E8Lattice>() {
+        if (tokens >= 32) {
             constexpr int kPageBlock     = 256;
             constexpr int kTokensPerTile = 8;
-            const int max_tiles          = div_up(tokens + kTokensPerTile - 1, kTokensPerTile);
+            const int max_tiles          = static_cast<int>(div_up(tokens + kTokensPerTile, kTokensPerTile));
             const dim3 fill_grid(static_cast<unsigned>(max_tiles),
                                  static_cast<unsigned>(Geometry::KVHeads),
                                  static_cast<unsigned>(kGqaKvQuantGroups));
-            gqa_attention_prefill_fill_i8_page_kernel<Geometry, PackedV, RotateK, RotateV, PackedK, Metadata>
+            gqa_attention_prefill_fill_i8_page_kernel<Geometry, PackedV, RotateK, RotateV, PackedK, E8Lattice, Metadata>
                 <<<fill_grid, kPageBlock, 0, stream>>>(
                     static_cast<const __nv_bfloat16*>(k.data),
                     static_cast<const __nv_bfloat16*>(v.data),
@@ -105,7 +105,7 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
                 static_cast<std::int64_t>(tokens) * Geometry::KVHeads * kGqaKvQuantGroups;
             const int fill_grid =
                 static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(kFillWarps)));
-            gqa_attention_prefill_fill_i8_kernel<Geometry, PackedV, RotateK, RotateV, PackedK, Metadata>
+            gqa_attention_prefill_fill_i8_kernel<Geometry, PackedV, RotateK, RotateV, PackedK, E8Lattice, Metadata>
                 <<<fill_grid, kFillBlock, 0, stream>>>(
                     static_cast<const __nv_bfloat16*>(k.data),
                     static_cast<const __nv_bfloat16*>(v.data),
@@ -116,12 +116,14 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
                     static_cast<__half*>(cache_v_scale.data), tokens);
         }
         };
-        if (cache.packed_k) {
-            launch_fill.template operator()<true, true, true, true>();
+        if (cache.e8_lattice) {
+            launch_fill.template operator()<true, true, true, true, true>();
+        } else if (cache.packed_k) {
+            launch_fill.template operator()<true, true, true, true, false>();
         } else if (cache.packed_v) {
-            launch_fill.template operator()<true, true, true, false>();
+            launch_fill.template operator()<true, true, true, false, false>();
         } else {
-            launch_fill.template operator()<false, false, false, false>();
+            launch_fill.template operator()<false, false, false, false, false>();
         }
     } else {
         constexpr int kBlock           = Geometry::KVHeads == 4 ? 128 : 96;

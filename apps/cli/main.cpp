@@ -100,6 +100,9 @@ std::string format_kv_cache(ninfer::KvCacheStorage storage) {
     if (storage == ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueGroup64) {
         return "rotated-k4-v4-group64";
     }
+    if (storage == ninfer::KvCacheStorage::E8LatticeGroup64) {
+        return "e8-lattice-group64";
+    }
     return "int8-group64";
 }
 

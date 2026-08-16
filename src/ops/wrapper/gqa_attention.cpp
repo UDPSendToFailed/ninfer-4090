@@ -65,6 +65,9 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     if (cache.rotate_v && !cache.packed_v) {
         throw std::invalid_argument(std::string(op) + ": rotated V requires packed V4");
     }
+    if (cache.e8_lattice && !cache.packed_k) {
+        throw std::invalid_argument(std::string(op) + ": E8 lattice requires packed K");
+    }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
     const std::int32_t logical_pages  = cache.block_table.ne[0];
@@ -128,6 +131,9 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     }
     if (cache.rotate_v && !cache.packed_v) {
         throw std::invalid_argument(std::string(op) + ": rotated V requires packed V4");
+    }
+    if (cache.e8_lattice && !cache.packed_k) {
+        throw std::invalid_argument(std::string(op) + ": E8 lattice requires packed K");
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];

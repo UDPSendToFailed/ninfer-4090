@@ -23,6 +23,7 @@
 #include <cuda_fp16.h>
 #include <math_constants.h>
 
+#include "ops/kernel/e8_lattice.cuh"
 #include "ops/kernel/gqa_attention_decode.cuh"
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
 
@@ -56,7 +57,7 @@ __device__ __forceinline__ void gqa_small_t_i8_store_swz(std::int8_t* tile, int 
 // next K/V tile is prefetched into the same arena while the current PV runs.
 template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm, int KeyBlock,
           bool DynamicArena, bool PackedV, bool RotateK, bool RotateV, bool PackedK,
-          bool MultiBatch, bool Masked, typename CacheInput>
+          bool E8Lattice = false, bool MultiBatch = false, bool Masked = false, typename CacheInput = void*>
 __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     void gqa_attention_decode_i8_tiled_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
@@ -239,15 +240,28 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const float v_inv       = vs > 0.0f ? 1.0f / vs : 0.0f;
             physical_page           = __shfl_sync(FullMask, physical_page, 0);
             if constexpr (PackedK) {
-                const float kv0_hi = __shfl_down_sync(FullMask, kv0, 1);
-                const float kv1_hi = __shfl_down_sync(FullMask, kv1, 1);
+                std::int8_t c0 = 0, c1 = 0;
+                if constexpr (E8Lattice) {
+                    float kv0_scaled = kv0 * k_inv;
+                    float kv1_scaled = kv1 * k_inv;
+                    e8_project_8d_warp(kv0_scaled, kv1_scaled, lane);
+                    int q0 = static_cast<int>(rintf(kv0_scaled));
+                    int q1 = static_cast<int>(rintf(kv1_scaled));
+                    c0 = static_cast<std::int8_t>(max(-8, min(7, q0)));
+                    c1 = static_cast<std::int8_t>(max(-8, min(7, q1)));
+                } else {
+                    c0 = gqa_kv_quant_i4_code(kv0, k_inv);
+                    c1 = gqa_kv_quant_i4_code(kv1, k_inv);
+                }
+                const std::int8_t c0_hi = static_cast<std::int8_t>(__shfl_down_sync(FullMask, static_cast<int>(c0), 1));
+                const std::int8_t c1_hi = static_cast<std::int8_t>(__shfl_down_sync(FullMask, static_cast<int>(c1), 1));
                 const float vv0_hi = __shfl_down_sync(FullMask, vv0, 1);
                 const float vv1_hi = __shfl_down_sync(FullMask, vv1, 1);
                 if ((lane & 1) == 0) {
                     reinterpret_cast<std::uint8_t*>(cache_k_i8)[gqa_kv_i4_code_index<Geometry>(physical_page, kv_head, d0 / 2, page_offset)] =
-                        gqa_kv_pack_i4(gqa_kv_quant_i4_code(kv0, k_inv), gqa_kv_quant_i4_code(kv0_hi, k_inv));
+                        gqa_kv_pack_i4(c0, c0_hi);
                     reinterpret_cast<std::uint8_t*>(cache_k_i8)[gqa_kv_i4_code_index<Geometry>(physical_page, kv_head, d1 / 2, page_offset)] =
-                        gqa_kv_pack_i4(gqa_kv_quant_i4_code(kv1, k_inv), gqa_kv_quant_i4_code(kv1_hi, k_inv));
+                        gqa_kv_pack_i4(c1, c1_hi);
                     cache_v_codes[gqa_kv_i4_code_index<Geometry>(physical_page, kv_head, d0 / 2, page_offset)] =
                         gqa_kv_pack_i4(gqa_kv_quant_i4_code(vv0, v_inv), gqa_kv_quant_i4_code(vv0_hi, v_inv));
                     cache_v_codes[gqa_kv_i4_code_index<Geometry>(physical_page, kv_head, d1 / 2, page_offset)] =
