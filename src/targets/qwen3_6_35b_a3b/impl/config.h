@@ -95,6 +95,6 @@ inline constexpr float kGdnScale                         = 0.08838834764831845F;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;
-inline constexpr std::uint32_t kNativeContext            = 262144;
+inline constexpr std::uint32_t kNativeContext            = 1048576;
 
 } // namespace ninfer::targets::qwen3_6_35b_a3b::detail

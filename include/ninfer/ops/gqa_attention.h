@@ -10,7 +10,7 @@
 
 namespace ninfer::ops {
 
-inline constexpr std::uint32_t kGqaAttentionMaximumVisibleKeys = 262144;
+inline constexpr std::uint32_t kGqaAttentionMaximumVisibleKeys = 1048576;
 
 struct GqaExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
