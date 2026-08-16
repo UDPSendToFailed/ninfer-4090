@@ -112,7 +112,7 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
 }
 
 template <typename Geometry, int TokenTile, bool PackedV, bool RotateK, bool RotateV,
-          bool PackedK, bool E8Lattice, bool MultiBatch, bool Masked, typename CacheInput>
+          bool PackedK, bool E8Lattice, bool E8Root, bool MultiBatch, bool Masked, typename CacheInput>
 void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                           PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
                           std::int32_t logical_capacity, std::int32_t implementation_window,
@@ -132,13 +132,13 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
                                                      MinBlocksPerSm, KeyBlock, DynamicArena,
                                                      PackedV, RotateK, RotateV, PackedK,
-                                                     E8Lattice, MultiBatch, Masked, CacheInput>,
+                                                     E8Lattice, E8Root, MultiBatch, Masked, CacheInput>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
             CUDA_CHECK(attr);
         }
         gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
                                              KeyBlock, DynamicArena, PackedV, RotateK, RotateV,
-                                             PackedK, E8Lattice, MultiBatch, Masked, CacheInput>
+                                             PackedK, E8Lattice, E8Root, MultiBatch, Masked, CacheInput>
             <<<grid, WarpsPerCta * 32, kDynamicBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data), input,
                 static_cast<const std::int32_t*>(pos.data), static_cast<std::int8_t*>(cache_k.data),
@@ -219,6 +219,7 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
         .rotate_v      = cache.rotate_v,
         .packed_k      = cache.packed_k,
         .e8_lattice    = cache.e8_lattice,
+        .e8_root       = cache.e8_root,
     };
 }
 
@@ -238,15 +239,16 @@ std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tok
     if (q_heads == Gqa35Geometry::QHeads) {
         return gqa_small_t_launch_capacity<Gqa35Geometry>(envelope, tokens, cache_dtype);
     }
-    throw std::invalid_argument("gqa_attention split capacity: unsupported head geometry");
+    throw std::invalid_argument("gqa_attention split capacity: unsupported Q-head count");
 }
 
 template <typename Geometry, typename CacheInput>
 void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const Tensor& pos,
                                       float scale, PagedKVBatchLayerView cache,
                                       const GqaSmallTInvocation& invocation,
-                                      GqaExecutionEnvelope envelope, Tensor& partial_acc,
-                                      Tensor& partial_m, Tensor& partial_l, Tensor& out,
+                                      GqaExecutionEnvelope envelope,
+                                      Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
+                                      Tensor& out,
                                       cudaStream_t stream) {
     const auto logical_capacity      = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
@@ -259,24 +261,29 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     do {                                                                                           \
         const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
             if (cache.dtype == DType::I8) {                                                        \
-                if (cache.e8_lattice) {                                                            \
-                    launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, true, true,         \
+                if (cache.e8_root) {                                                               \
+                    launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, false, false, true,  \
+                                         MultiBatch, Masked>(                                      \
+                        q, input, pos, scale, cache, invocation, logical_capacity,                 \
+                        implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
+                } else if (cache.e8_lattice) {                                                     \
+                    launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, true, true, false,  \
                                          MultiBatch, Masked>(                                      \
                         q, input, pos, scale, cache, invocation, logical_capacity,                 \
                         implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
                 } else if (cache.packed_k) {                                                       \
-                    launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, true, false,        \
+                    launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, true, false, false, \
                                          MultiBatch, Masked>(                                      \
                         q, input, pos, scale, cache, invocation, logical_capacity,                 \
                         implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
                 } else if (cache.packed_v) {                                                       \
-                    launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, false, false,       \
+                    launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, false, false, false,\
                                          MultiBatch, Masked>(                                      \
                         q, input, pos, scale, cache, invocation, logical_capacity,                 \
                         implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
                 } else {                                                                           \
                     launch_tc_partial_i8<Geometry, (TOKENS), false, false, false, false, false,    \
-                                         MultiBatch, Masked>(                                      \
+                                         false, MultiBatch, Masked>(                               \
                         q, input, pos, scale, cache, invocation, logical_capacity,                 \
                         implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
                 }                                                                                  \

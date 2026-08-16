@@ -51,16 +51,19 @@ std::uint32_t parse_u32(std::string_view text, const char* label, bool allow_zer
 KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
-    if (text == "rk8v4" || text == "int4") {
+    if (text == "rk8v4") {
         return KvCacheStorage::RotatedInt8KeyInt4ValueGroup64;
     }
-    if (text == "rk4v4" || text == "rotated-k4-v4-group64") {
+    if (text == "rk4v4") {
         return KvCacheStorage::RotatedInt4KeyInt4ValueGroup64;
     }
-    if (text == "e8" || text == "e8-lattice-group64") {
-        return KvCacheStorage::E8LatticeGroup64;
+    if (text == "rk4v4-e8") {
+        return KvCacheStorage::RK4V4E8;
     }
-    throw std::invalid_argument("--kv-dtype must be bf16, int8, rk8v4, rk4v4, or e8");
+    if (text == "rk2v4-e8") {
+        return KvCacheStorage::RK2V4E8;
+    }
+    throw std::invalid_argument("--kv-dtype must be bf16, int8, rk8v4, rk4v4, rk4v4-e8, or rk2v4-e8");
 }
 
 std::vector<int> parse_int_list(std::string_view value, const char* label) {
@@ -833,8 +836,10 @@ std::string kv_cache_name(KvCacheStorage storage) {
         return "rk8v4";
     case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
         return "rk4v4";
-    case KvCacheStorage::E8LatticeGroup64:
-        return "e8";
+    case KvCacheStorage::RK4V4E8:
+        return "rk4v4-e8";
+    case KvCacheStorage::RK2V4E8:
+        return "rk2v4-e8";
     }
     return "unknown";
 }

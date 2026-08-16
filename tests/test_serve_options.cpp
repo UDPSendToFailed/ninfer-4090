@@ -63,6 +63,18 @@ int main() {
     failures += check(defaults.kv_cache == ninfer::KvCacheStorage::BFloat16,
                       "rk8v4 unexpectedly changed the default KV storage");
 
+    const ServeOptions k4e8 =
+        parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "rk4v4-e8"});
+    failures += check(
+        k4e8.kv_cache == ninfer::KvCacheStorage::RK4V4E8,
+        "--kv-dtype rk4v4-e8 did not select RK4V4E8 storage");
+
+    const ServeOptions k2e8 =
+        parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "rk2v4-e8"});
+    failures += check(
+        k2e8.kv_cache == ninfer::KvCacheStorage::RK2V4E8,
+        "--kv-dtype rk2v4-e8 did not select RK2V4E8 storage");
+
     const ServeOptions model_alias =
         parse({"ninfer-serve", "model.ninfer", "--model-id", "deployment-alias"});
     failures +=

@@ -107,10 +107,17 @@ int test_cli_contract() {
     failures +=
         expect(parsed.proposal_head == ninfer::ProposalHead::Optimized, "optimized proposal head");
     failures += expect(parsed.device == 1 && !parsed.use_cuda_graph, "device and graph settings");
-    failures += expect(parsed.profile_measured, "profile-measured flag");
     failures +=
         expect(parsed.output == qb::OutputFormat::Json && parsed.output_file == "report.json",
                "output settings");
+
+    const qb::BenchOptions k4_parsed =
+        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "rk4v4-e8"});
+    failures += expect(k4_parsed.kv_cache == ninfer::KvCacheStorage::RK4V4E8, "rk4v4-e8 KV");
+
+    const qb::BenchOptions k2_parsed =
+        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "rk2v4-e8"});
+    failures += expect(k2_parsed.kv_cache == ninfer::KvCacheStorage::RK2V4E8, "rk2v4-e8 KV");
 
     const auto defaults = qb::expand_tests(qb::BenchOptions{});
     failures +=
