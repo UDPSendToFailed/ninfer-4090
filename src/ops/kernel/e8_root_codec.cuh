@@ -207,6 +207,158 @@ __device__ __forceinline__ void e8_encode_cylinder_8d(
     out_rad_axis = static_cast<uint8_t>((rad_idx << 4) | (axis_idx & 0x0F));
 }
 
+// Warp-Cooperative 8-Lane Subspace Quantizer (100% Lane Occupancy, Zero Loop Divergence)
+__device__ __forceinline__ void e8_encode_cylinder_8d_warp(
+    float val,
+    float ks,
+    uint8_t& out_root,
+    uint8_t& out_rad_axis,
+    int lane
+) {
+    const int sub_lane = lane & 7;
+    constexpr unsigned full_mask = 0xffffffffu;
+
+    // 1. Norm calculation across 8 lanes
+    float val_sq = val * val;
+    float norm_sq = val_sq;
+    #pragma unroll
+    for (int mask = 4; mask > 0; mask >>= 1) {
+        norm_sq += __shfl_xor_sync(full_mask, norm_sq, mask);
+    }
+    float out_norm = sqrtf(norm_sq);
+
+    // 2. Log-radius index
+    float r_rel = out_norm / (ks * 2.82842712474619f + 1e-8f);
+    uint32_t rad_idx = 0;
+    if (r_rel >= 0.08f) {
+        float log_val = 3.0f * (logf(r_rel) * 1.4426950408889634f) + 8.0f;
+        int q_rad = static_cast<int>(rintf(log_val));
+        rad_idx = static_cast<uint32_t>(q_rad < 1 ? 1 : (q_rad > 15 ? 15 : q_rad));
+    }
+
+    if (rad_idx == 0) {
+        out_root = 0;
+        out_rad_axis = 0;
+        return;
+    }
+
+    // 3. Unit vector
+    float inv_norm = 1.0f / (out_norm + 1e-8f);
+    float u = val * inv_norm;
+    float abs_u = fabsf(u);
+    int sign_u = (u >= 0.0f) ? 1 : -1;
+
+    // 4. Type A: Top-2 reduction across 8 lanes (3 butterfly shuffles)
+    float top1_val = abs_u;
+    int   top1_idx = sub_lane;
+    float top2_val = -1.0f;
+    int   top2_idx = -1;
+
+    #pragma unroll
+    for (int mask = 1; mask <= 4; mask <<= 1) {
+        float other1_val = __shfl_xor_sync(full_mask, top1_val, mask);
+        int   other1_idx = __shfl_xor_sync(full_mask, top1_idx, mask);
+        float other2_val = __shfl_xor_sync(full_mask, top2_val, mask);
+        int   other2_idx = __shfl_xor_sync(full_mask, top2_idx, mask);
+
+        if (other1_val > top1_val || (other1_val == top1_val && other1_idx < top1_idx)) {
+            top2_val = (top1_val > other2_val) ? top1_val : other2_val;
+            top2_idx = (top1_val > other2_val) ? top1_idx : other2_idx;
+            top1_val = other1_val;
+            top1_idx = other1_idx;
+        } else {
+            if (other1_val > top2_val || (other1_val == top2_val && other1_idx < top2_idx)) {
+                top2_val = other1_val;
+                top2_idx = other1_idx;
+            }
+        }
+    }
+
+    int best_i = (top1_idx < top2_idx) ? top1_idx : top2_idx;
+    int best_j = (top1_idx < top2_idx) ? top2_idx : top1_idx;
+    int best_pair_idx = (best_i * (15 - best_i)) / 2 + (best_j - best_i - 1);
+
+    int s_i_val = __shfl_sync(full_mask, sign_u, (lane & ~7) + best_i);
+    int s_j_val = __shfl_sync(full_mask, sign_u, (lane & ~7) + best_j);
+    int s_i_bit = (s_i_val > 0) ? 1 : 0;
+    int s_j_bit = (s_j_val > 0) ? 1 : 0;
+    uint8_t type_a_code = static_cast<uint8_t>(best_pair_idx * 4 + (s_i_bit << 1) + s_j_bit);
+    float best_type_a_score = top1_val + top2_val;
+
+    // 5. Type B: Sum & Min reduction across 8 lanes
+    float sum_abs = abs_u;
+    int minus_count = (sign_u < 0) ? 1 : 0;
+    float min_abs = abs_u;
+    int min_idx = sub_lane;
+
+    #pragma unroll
+    for (int mask = 4; mask > 0; mask >>= 1) {
+        sum_abs += __shfl_xor_sync(full_mask, sum_abs, mask);
+        minus_count += __shfl_xor_sync(full_mask, minus_count, mask);
+        float other_min = __shfl_xor_sync(full_mask, min_abs, mask);
+        int other_idx   = __shfl_xor_sync(full_mask, min_idx, mask);
+        if (other_min < min_abs || (other_min == min_abs && other_idx < min_idx)) {
+            min_abs = other_min;
+            min_idx = other_idx;
+        }
+    }
+
+    float best_type_b_score = 0.5f * sum_abs;
+    if ((minus_count & 1) != 0) {
+        best_type_b_score -= min_abs;
+    }
+
+    int b_sign = (sub_lane == min_idx && ((minus_count & 1) != 0)) ? -sign_u : sign_u;
+    uint32_t b_bit = (sub_lane < 7 && b_sign > 0) ? (1u << sub_lane) : 0u;
+    #pragma unroll
+    for (int mask = 4; mask > 0; mask >>= 1) {
+        b_bit += __shfl_xor_sync(full_mask, b_bit, mask);
+    }
+    uint8_t type_b_code = static_cast<uint8_t>(b_bit);
+
+    // 6. Select Type A vs Type B
+    float v1_coord = 0.0f;
+    if (best_type_a_score >= best_type_b_score) {
+        out_root = type_a_code;
+        if (sub_lane == best_i) v1_coord = (s_i_bit ? 1.0f : -1.0f);
+        else if (sub_lane == best_j) v1_coord = (s_j_bit ? 1.0f : -1.0f);
+        else v1_coord = 0.0f;
+    } else {
+        out_root = static_cast<uint8_t>(112 + type_b_code);
+        v1_coord = (b_sign > 0) ? 0.5f : -0.5f;
+    }
+
+    // 7. Residual Axis across 8 lanes
+    constexpr float kInvSqrt2 = 0.7071067811865475f;
+    float dot_u_v1_lane = u * (v1_coord * kInvSqrt2);
+    float dot_u_v1 = dot_u_v1_lane;
+    #pragma unroll
+    for (int mask = 4; mask > 0; mask >>= 1) {
+        dot_u_v1 += __shfl_xor_sync(full_mask, dot_u_v1, mask);
+    }
+
+    float res = u - dot_u_v1 * (v1_coord * kInvSqrt2);
+    float abs_res = fabsf(res);
+    float max_abs_res = abs_res;
+    int best_dim = sub_lane;
+
+    #pragma unroll
+    for (int mask = 4; mask > 0; mask >>= 1) {
+        float other_res = __shfl_xor_sync(full_mask, max_abs_res, mask);
+        int other_dim   = __shfl_xor_sync(full_mask, best_dim, mask);
+        if (other_res > max_abs_res || (other_res == max_abs_res && other_dim < best_dim)) {
+            max_abs_res = other_res;
+            best_dim = other_dim;
+        }
+    }
+
+    float best_res_sign_val = __shfl_sync(full_mask, res, (lane & ~7) + best_dim);
+    uint32_t sign_bit = (best_res_sign_val >= 0.0f) ? 0 : 1;
+    uint32_t axis_idx = (static_cast<uint32_t>(best_dim) << 1) | sign_bit;
+
+    out_rad_axis = static_cast<uint8_t>((rad_idx << 4) | (axis_idx & 0x0F));
+}
+
 __device__ __forceinline__ void e8_encode_root_2stage_8d(
     const float rot[8],
     uint8_t& out_code1,
@@ -255,8 +407,8 @@ __constant__ const float c_radius_scale[16] = {
     2.5198f  // idx 15: 0.5 * 2^(7/3)
 };
 
-// Precomputed 2-Stage E8 Root Constant Cache Tables (4 KiB total)
-__constant__ const std::uint64_t c_e8_stage1_i8x8[256] = {
+// Precomputed 2-Stage E8 Root Tables (2 KiB in __device__ memory, routed through non-blocking L1 cache via __ldg)
+__device__ const std::uint64_t c_e8_stage1_i8x8[256] = {
     0x000000000000fcfcULL, // code 0
     0x00000000000004fcULL, // code 1
     0x000000000000fc04ULL, // code 2
@@ -525,7 +677,7 @@ __device__ __forceinline__ void e8_root_decode_8d_fast(uint8_t root_code, uint8_
         return;
     }
 
-    const uint64_t w_root = c_e8_stage1_i8x8[root_code];
+    const uint64_t w_root = __ldg(&c_e8_stage1_i8x8[root_code]);
     const uint64_t w_axis = c_axis_i8x8[axis_idx];
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700

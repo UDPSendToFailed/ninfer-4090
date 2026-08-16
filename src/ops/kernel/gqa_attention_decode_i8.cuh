@@ -233,16 +233,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const float v_inv       = vs > 0.0f ? 1.0f / vs : 0.0f;
             physical_page           = __shfl_sync(FullMask, physical_page, 0);
             if constexpr (E8Root) {
-                float r0[8], r1[8];
-                #pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    r0[i] = __shfl_sync(FullMask, kv0, (lane & ~7) + i);
-                    r1[i] = __shfl_sync(FullMask, kv1, (lane & ~7) + i);
-                }
+                uint8_t c1_0, c2_0, c1_1, c2_1;
+                e8_encode_cylinder_8d_warp(kv0, ks, c1_0, c2_0, lane);
+                e8_encode_cylinder_8d_warp(kv1, ks, c1_1, c2_1, lane);
                 if ((lane & 7) == 0) {
-                    uint8_t c1_0, c2_0, c1_1, c2_1;
-                    e8_encode_cylinder_8d(r0, ks, c1_0, c2_0);
-                    e8_encode_cylinder_8d(r1, ks, c1_1, c2_1);
                     int s0 = (lane / 8);
                     int s1 = 4 + (lane / 8);
                     const std::int64_t k_base = paged_kv_page_head_offset<64, Geometry::KVHeads>(physical_page, kv_head) +
@@ -414,10 +408,14 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 if constexpr (E8Root) {
                     const std::int64_t koff = paged_kv_page_head_offset<64, Geometry::KVHeads>(
                         physical_page, kv_head) + static_cast<std::int64_t>(key & kPagedKVPageMask) * 64 + (d / 4);
-                    const uint8_t* src_k = &reinterpret_cast<const std::uint8_t*>(cache_k_i8)[koff];
+                    const uint32_t src4 = *reinterpret_cast<const uint32_t*>(&reinterpret_cast<const std::uint8_t*>(cache_k_i8)[koff]);
+                    const uint8_t c1_0 = static_cast<uint8_t>(src4 & 0xFF);
+                    const uint8_t c2_0 = static_cast<uint8_t>((src4 >> 8) & 0xFF);
+                    const uint8_t c1_1 = static_cast<uint8_t>((src4 >> 16) & 0xFF);
+                    const uint8_t c2_1 = static_cast<uint8_t>((src4 >> 24) & 0xFF);
                     int8_t dec8_0[8], dec8_1[8];
-                    e8_root_decode_8d_int8(src_k[0], src_k[1], dec8_0);
-                    e8_root_decode_8d_int8(src_k[2], src_k[3], dec8_1);
+                    e8_root_decode_8d_int8(c1_0, c2_0, dec8_0);
+                    e8_root_decode_8d_int8(c1_1, c2_1, dec8_1);
                     std::int8_t* dst = &k_i8[key_l * D + gqa_small_t_tc_swz(key_l, dc * 8) * 2];
                     *reinterpret_cast<uint64_t*>(&dst[0]) = *reinterpret_cast<const uint64_t*>(dec8_0);
                     *reinterpret_cast<uint64_t*>(&dst[8]) = *reinterpret_cast<const uint64_t*>(dec8_1);
