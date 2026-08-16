@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 
-$ReleaseTag = 'v0.8.0'
+$ReleaseTag = 'v0.9.0'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $BuildRoot = Join-Path $RepoRoot 'build-sm89'
 $DistRoot = Join-Path $RepoRoot 'dist'
@@ -36,7 +36,7 @@ Get-ChildItem -LiteralPath (Join-Path $BuildRoot 'apps\Release') -Filter '*.dll'
 $ReleaseTag | Set-Content -LiteralPath (Join-Path $ProductRoot 'VERSION') -Encoding ascii
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'LICENSE') -Destination $ProductRoot
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'README.md') -Destination $ProductRoot
-Copy-Item -LiteralPath (Join-Path $RepoRoot 'RELEASE_NOTES_0.8.0.md') -Destination $ProductRoot
+Copy-Item -LiteralPath (Join-Path $RepoRoot 'RELEASE_NOTES_0.9.0.md') -Destination $ProductRoot
 
 $innerHashes = Get-ChildItem -LiteralPath $ProductRoot -File | Sort-Object Name | ForEach-Object {
     $hash = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256

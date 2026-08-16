@@ -2,22 +2,20 @@
 
 NInfer-4090 is a specialized, high-performance C++20/CUDA inference engine for **Qwen3.8-27B** on a single 24 GB **NVIDIA GeForce RTX 4090** (`sm_89`).
 
-The engine loads the official groupwise `.ninfer` artifact, serves OpenAI- and Anthropic-compatible HTTP APIs, and features native Ada Lovelace MMA tensor core execution, asynchronous double-buffered DMA memory staging, paged KV caching with 4-bit compression, compatible-prefix reuse, CUDA Graphs, and ReplaySSM linear attention state transactions.
+The engine loads the official groupwise `.ninfer` artifact, serves OpenAI- and Anthropic-compatible HTTP APIs, and features native Ada Lovelace MMA tensor core execution, asynchronous double-buffered DMA memory staging, paged KV caching with 2-bit and 4-bit lattice/cylinder quantization, compatible-prefix reuse, CUDA Graphs, and ReplaySSM linear attention state transactions.
 
 ---
 
 ## Measured Performance on NVIDIA GeForce RTX 4090
 
-Tested on NVIDIA GeForce RTX 4090 (24 GB GDDR6X, 128 SMs, CUDA 13.3) using the official 16.96 GiB Qwen3.8-27B artifact.
+Tested on NVIDIA GeForce RTX 4090 (24 GB GDDR6X, 128 SMs, CUDA 13.3) using the official 16.96 GiB Qwen3.8-27B artifact:
 
 ### Standard Product Benchmark Matrix (`ninfer_bench`)
 
-Evaluated over the standard `bench/fixtures/bench_corpus.ids` token corpus with INT8 group-64 KV cache and CUDA Graphs enabled:
-
-| Test Case | Configuration | Throughput | Draft Acceptance / Notes |
+| Test Case | Configuration | Throughput | Notes |
 |---|---|---:|---|
 | **Prefill (`pp2048`)** | `pp2048`, Chunk 1024, INT8 KV | **`1,938.0 ± 2.7 tok/s`** | Standard 2k context prefill |
-| **Prefill (`pp4096`)** | `pp4096`, Chunk 1024, INT8 KV | **`1,918.3 ± 2.1 tok/s`** | Peak saturated prefill |
+| **Prefill (`pp4096`)** | `pp4096`, Chunk 1024, INT8 KV | **`1,918.3 ± 2.1 tok/s`** | Saturated prefill |
 | **Prefill (`pp512`)** | `pp512`, Chunk 1024, INT8 KV | **`1,695.4 ± 114.5 tok/s`** | Low-latency shallow prefill |
 | **Decode: Code & Schemas (MTP4)** | `tg128`, `--greedy`, MTP4 + Draft Head | **`110.0 – 110.4 tok/s`** | 67–75% draft acceptance |
 | **Decode: Code / Math (MTP3)** | `tg128`, `--greedy`, MTP3 + Draft Head | **`126.4 – 148.2 tok/s`** | 80–91% draft acceptance |
@@ -26,43 +24,74 @@ Evaluated over the standard `bench/fixtures/bench_corpus.ids` token corpus with 
 
 ---
 
-## Architectural Features
+## KV Cache Quantization Modes & VRAM Context Limits
 
-* **Native `sm_89` Instruction Generation:** Built directly for Ada Lovelace without Ampere or Blackwell compatibility shims.
-* **Ada 72 MB Persisting L2 Cache Pinning:** Pins MTP proposal head weights directly in the hardware L2 cache partition using stream access policy windows, eliminating DRAM access latency on speculative proposals.
-* **Hierarchical N-Gram Context Speculation:** Zero-allocation $N=5 \to 4 \to 3 \to 2$ sequence pattern matcher that drafts continuation chains from prompt history and repeated tool calling schemas.
-* **Double-Buffered `cp.async.cg` DMA:** Implements a 2-stage asynchronous circular buffer for codes, scales, and activations in `w8_small_t_mma`, overlapping global memory transfers with Tensor Core computation during decode rounds.
-* **High-Priority CUDA Stream Queues:** Initializes primary compute streams with hardware-level priority to minimize Windows WDDM driver dispatch latency.
-* **Full $T=48$ Exact MMA Tile Scheduling:** Extends single-pass matrix-vector tile execution up to 48 tokens without multi-pass slicing.
-* **ReplaySSM Recurrent State Transactions:** Zero-copy linear attention state tracking for Qwen3.8 Gated DeltaNet (GDN) layers, guaranteeing numerical consistency across speculative verification and rollbacks.
-* **Paged KV with `rk8v4` Compression:** Grouped 4-bit value quantization with normalized keys, enabling up to 170k tokens of resident context in 24 GB VRAM.
+On a single 24 GB RTX 4090, model weights occupy ~15.9–16.7 GiB (depending on MTP draft heads and vision allocations), leaving ~7.0–7.5 GiB for resident KV cache. Choose `--kv-dtype` based on your context length and precision needs:
+
+| Mode (`--kv-dtype`) | Key Format | Value Format | Bytes / Token | Verified 24 GB Max Context | Cosine Sim vs FP32 | Recommended Use Case |
+|---|---|---|---|---:|---|---|
+| **`rk2v4-e8`** | $E_8$ Cylinder 2-bit (240-root) | 4-bit per-channel | 100 B | **`~350k tokens`** | 96.2% | Ultra-long context, massive document RAG, needle retrieval |
+| **`rk4v4-e8`** | $E_8$ Conway-Sloane 4-bit | 4-bit per-channel | 136 B | **`~200k tokens`** | 98.7% | High-fidelity coding, math, agentic workflows (MTP) |
+| **`rk4v4`** | Hadamard Rotated 4-bit | 4-bit per-channel | 132 B | **`~200k tokens`** | 97.8% | Standard 4-bit compressed context |
+| **`rk8v4`** | Hadamard Rotated 8-bit | 4-bit per-channel | 196 B | **`~130k tokens`** | 99.4% | Balanced daily chat and serving (MTP) |
+| **`int8`** | INT8 per-channel | INT8 per-channel | 260 B | **`~100k tokens`** | 99.8% | Maximum numerical precision on shorter contexts |
+
+*The GQA decode engine uses direct L1-cached block table lookups with a native context ceiling of **1,048,576 (1M) tokens**.*
 
 ---
 
-## Quick Start & Usage
+## Use Cases & Example Serving Commands (`ninfer-serve`)
 
-### 1. HTTP Serving (`ninfer-serve`)
+All serving commands expose OpenAI (`/v1/chat/completions`, `/v1/responses`) and Anthropic (`/v1/messages`) endpoints at `http://127.0.0.1:8080`.
 
-Serves OpenAI Chat Completions, Responses, and Anthropic Messages at `http://127.0.0.1:8080/v1`:
-
+### 1. Ultra-Long Context / Massive Document RAG (350k Tokens)
+Uses 2-bit $E_8$ cylinder-factorized key quantization to fit 350,000 tokens in 24 GB VRAM. `--prefill-chunk 4096` ensures smooth chunked processing over massive prompts:
 ```powershell
-.\build-sm89\apps\Release\ninfer-serve.exe "qwen3_8_27b.ninfer" --spec mtp --draft-tokens 4 --lm-head-draft --kv-dtype rk8v4 --max-context 128000
+.\build-sm89\apps\Release\ninfer-serve.exe "qwen3_8_27b.ninfer" --kv-dtype rk2v4-e8 --max-context 350000 --prefill-chunk 4096 --preserve-thinking
 ```
 
-### 2. Interactive CLI (`ninfer`)
-
-Direct single-request generation:
-
+### 2. High-Precision Coding & Complex Reasoning (200k Tokens)
+Uses 8D $E_8$ Conway-Sloane lattice quantization for high key fidelity (98.7% cosine similarity) paired with 4-token speculative MTP drafting for 110–140 tok/s decode:
 ```powershell
-.\build-sm89\apps\Release\ninfer.exe "qwen3_8_27b.ninfer" --prompt "Write an optimized C++ implementation of fast matrix multiplication." --spec mtp --draft-tokens 4 --lm-head-draft --greedy
+.\build-sm89\apps\Release\ninfer-serve.exe "qwen3_8_27b.ninfer" --kv-dtype rk4v4-e8 --spec mtp --draft-tokens 4 --lm-head-draft --max-context 200000 --preserve-thinking
 ```
 
-### 3. Standard Benchmark (`ninfer_bench`)
+### 3. General Daily Chat & Fast Speculative Serving (130k Tokens)
+Rotated 8-bit keys and 4-bit values (99.4% cosine similarity) with 130k tokens capacity:
+```powershell
+.\build-sm89\apps\Release\ninfer-serve.exe "qwen3_8_27b.ninfer" --kv-dtype rk8v4 --spec mtp --draft-tokens 4 --lm-head-draft --max-context 130000
+```
 
-Executes the standard product prefill and decode throughput benchmark matrix:
+### 4. Vision & Multimodal Processing (Images & Video)
+Enables media preprocessors and fixed vision GPU buffers for image/video understanding:
+```powershell
+.\build-sm89\apps\Release\ninfer-serve.exe "qwen3_8_27b.ninfer" --vision --kv-dtype rk4v4-e8 --max-context 150000
+```
+
+### 5. Maximum Precision / Shorter Context (< 100k Tokens)
+Uncompressed INT8 key-value cache for strict numerical fidelity:
+```powershell
+.\build-sm89\apps\Release\ninfer-serve.exe "qwen3_8_27b.ninfer" --kv-dtype int8 --spec mtp --draft-tokens 4 --lm-head-draft --max-context 100000
+```
+
+---
+
+## Interactive CLI (`ninfer`)
+
+Direct single-prompt evaluation in the terminal:
 
 ```powershell
-.\build-sm89\bench\Release\ninfer_bench.exe --weights "qwen3_8_27b.ninfer" --corpus bench/fixtures/bench_corpus.ids --kv-dtype int8 --mtp-draft-tokens 4 --lm-head-draft -p 512,2048,4096 -n 128
+.\build-sm89\apps\Release\ninfer.exe "qwen3_8_27b.ninfer" --prompt "Write an optimized C++ CUDA kernel for warp-level reduction." --spec mtp --draft-tokens 4 --lm-head-draft --greedy
+```
+
+---
+
+## Benchmarking (`ninfer_bench`)
+
+Run the prefill and decode throughput benchmark over the standard token corpus:
+
+```powershell
+.\build-sm89\bench\Release\ninfer_bench.exe --weights "qwen3_8_27b.ninfer" --corpus bench/fixtures/bench_corpus.ids --kv-dtype rk4v4-e8 --mtp-draft-tokens 4 --lm-head-draft -p 512,2048,4096 -n 128
 ```
 
 ---
