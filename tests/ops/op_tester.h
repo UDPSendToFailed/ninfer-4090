@@ -63,6 +63,14 @@ inline bool cuda_unavailable() {
     throw std::runtime_error(std::string("cudaGetDeviceCount: ") + cudaGetErrorString(e));
 }
 
+inline bool nvfp4_a4_unavailable() {
+#if defined(NINFER_SM86) || defined(NINFER_SM89)
+    return true;
+#else
+    return false;
+#endif
+}
+
 // --- bf16 <-> f32 (round-to-nearest-even) -----------------------------------
 inline float bf16_to_f32(std::uint16_t h) {
     std::uint32_t u = std::uint32_t(h) << 16;

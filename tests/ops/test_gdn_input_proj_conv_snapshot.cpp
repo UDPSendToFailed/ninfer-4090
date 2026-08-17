@@ -784,38 +784,40 @@ int run_nvfp4() {
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only, 2);
     failures += run_nvfp4_case(parent, 3, ops::LinearPolicy::AllowA4, 4);
-    failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::AllowA4, 5);
-    failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4, 0);
-    failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4, 1025);
-    constexpr std::int32_t kValueRows = 6144;
-    constexpr std::int32_t kZRows     = 6144;
-    constexpr std::int32_t kChannels  = 10240;
-    constexpr std::int32_t kWidth     = 6;
-    constexpr std::int32_t kBatch     = 3;
-    const std::vector<std::int32_t> valid_columns{6, 3, 1};
-    const std::vector<float> conv_weight = make_conv_weight(kChannels, 829U);
-    const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        QType::NVFP4, kRows, kHidden, ops::LinearPolicy::AllowA4, kBatch, kWidth, kWidth);
-    failures += run_batched_case(
-        "NVFP4 A4 B=3 W=6 masked", kHidden, kValueRows, kZRows, kWidth, kBatch, valid_columns,
-        conv_weight, workspace_bytes, kGdnInputProjConvSnapshotA4Tolerance,
-        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
-            return quantized_weight::dot_fp64(
-                parent.host, row,
-                activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
-        },
-        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
-            return quantized_weight::dot_fp64(
-                parent.host, kChannels + row,
-                activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
-        },
-        [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
-            const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
-            Tensor& z, WorkspaceArena& workspace) {
-            ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
-                                              snapshot_base, q, k, v, z, ops::LinearPolicy::AllowA4,
-                                              workspace, nullptr);
-        });
+    if (!nvfp4_a4_unavailable()) {
+        failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::AllowA4, 5);
+        failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4, 0);
+        failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4, 1025);
+        constexpr std::int32_t kValueRows = 6144;
+        constexpr std::int32_t kZRows     = 6144;
+        constexpr std::int32_t kChannels  = 10240;
+        constexpr std::int32_t kWidth     = 6;
+        constexpr std::int32_t kBatch     = 3;
+        const std::vector<std::int32_t> valid_columns{6, 3, 1};
+        const std::vector<float> conv_weight = make_conv_weight(kChannels, 829U);
+        const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+            QType::NVFP4, kRows, kHidden, ops::LinearPolicy::AllowA4, kBatch, kWidth, kWidth);
+        failures += run_batched_case(
+            "NVFP4 A4 B=3 W=6 masked", kHidden, kValueRows, kZRows, kWidth, kBatch, valid_columns,
+            conv_weight, workspace_bytes, kGdnInputProjConvSnapshotA4Tolerance,
+            [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+                return quantized_weight::dot_fp64(
+                    parent.host, row,
+                    activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+            },
+            [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+                return quantized_weight::dot_fp64(
+                    parent.host, kChannels + row,
+                    activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+            },
+            [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
+                const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
+                Tensor& z, WorkspaceArena& workspace) {
+                ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
+                                                  snapshot_base, q, k, v, z, ops::LinearPolicy::AllowA4,
+                                                  workspace, nullptr);
+            });
+    }
     failures += parent.verify_preserved("batched NVFP4 parent weight");
     return failures;
 }

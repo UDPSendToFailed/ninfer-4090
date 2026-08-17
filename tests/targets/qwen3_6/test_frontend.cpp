@@ -805,21 +805,26 @@ int test_disabled_vision() {
 } // namespace
 
 int main() {
-    const FrontendResources owned = resources();
-    const Frontend frontend       = FrontendFactory::create_component(owned);
-    int failures                  = 0;
-    failures += test_official_tokenizer_merge();
-    failures += test_official_chat_template();
-    failures += test_reasoning_effort_chat_template();
-    failures += test_turn_rewrite_trace();
-    failures += test_official_resource_guards();
-    failures += test_text_and_image_prepare(frontend);
-    failures += test_video_prepare(frontend);
-    failures += test_cross_round_stop(frontend);
-    failures += test_same_token_stop_priority(frontend);
-    failures += test_terminal_flush(frontend);
-    failures += test_reasoning_split(frontend);
-    failures += test_utf8_and_hidden_eos(frontend);
-    failures += test_disabled_vision();
-    return failures == 0 ? 0 : 1;
+    try {
+        const FrontendResources owned = resources();
+        const Frontend frontend       = FrontendFactory::create_component(owned);
+        int failures                  = 0;
+        failures += test_official_tokenizer_merge();
+        failures += test_official_chat_template();
+        failures += test_reasoning_effort_chat_template();
+        failures += test_turn_rewrite_trace();
+        failures += test_official_resource_guards();
+        failures += test_text_and_image_prepare(frontend);
+        failures += test_video_prepare(frontend);
+        failures += test_cross_round_stop(frontend);
+        failures += test_same_token_stop_priority(frontend);
+        failures += test_terminal_flush(frontend);
+        failures += test_reasoning_split(frontend);
+        failures += test_utf8_and_hidden_eos(frontend);
+        failures += test_disabled_vision();
+        return failures == 0 ? 0 : 1;
+    } catch (const std::exception& e) {
+        std::cerr << "test_frontend exception: " << e.what() << '\n';
+        return 1;
+    }
 }

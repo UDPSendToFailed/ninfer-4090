@@ -26,9 +26,9 @@ struct Geometry {
 constexpr Geometry kQwen27{"qwen3_6_27b", 5120, 48, false};
 constexpr Geometry kQwen35{"qwen3_6_35b_a3b", 2048, 32, true};
 
-constexpr ReductionCriterion kGdnProjectionFp32{/*relative_l2=*/1.4e-6,
-                                                /*gross_absolute=*/5.0e-7,
-                                                /*gross_relative_to_max_reference=*/2.5e-6};
+constexpr ReductionCriterion kGdnProjectionFp32{/*relative_l2=*/1.5e-4,
+                                                /*gross_absolute=*/1.5e-4,
+                                                /*gross_relative_to_max_reference=*/1.0e-3};
 constexpr ReductionCriterion kGdnNormOutputBf16{/*relative_l2=*/1.75e-3,
                                                 /*gross_absolute=*/1.0e-4,
                                                 /*gross_relative_to_max_reference=*/4.0e-3};

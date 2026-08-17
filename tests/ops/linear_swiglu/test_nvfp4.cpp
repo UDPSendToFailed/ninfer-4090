@@ -1,4 +1,5 @@
 #include "ops/linear_swiglu/linear_swiglu_test_common.h"
+#include "ops/op_tester.h"
 
 #include <array>
 #include <exception>
@@ -8,6 +9,11 @@ int main() {
     using namespace ninfer;
     using namespace ninfer::test::linear_swiglu;
 
+    if (ninfer::test::cuda_unavailable()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
+
     try {
         constexpr std::array<std::int32_t, 4> kA16Cases{1, 4, 8, 16};
         constexpr std::array<std::int32_t, 5> kA4Cases{5, 48, 49, 128, 1024};
@@ -15,9 +21,11 @@ int main() {
         failures += run_profile("LinearSwiGLU NVFP4_A16",
                                 {QType::NVFP4, 34816, 5120, 17408, 1801U, ActivationCompute::A16},
                                 kA16Cases);
-        failures +=
-            run_profile("LinearSwiGLU NVFP4_A4",
-                        {QType::NVFP4, 34816, 5120, 17408, 1803U, ActivationCompute::A4}, kA4Cases);
+        if (!ninfer::test::nvfp4_a4_unavailable()) {
+            failures +=
+                run_profile("LinearSwiGLU NVFP4_A4",
+                            {QType::NVFP4, 34816, 5120, 17408, 1803U, ActivationCompute::A4}, kA4Cases);
+        }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU NVFP4 correctness\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
