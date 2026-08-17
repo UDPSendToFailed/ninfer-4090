@@ -14,8 +14,9 @@ void gdn_gating_launch(const Tensor& a, const Tensor& b, const Tensor& A_log, co
                        Tensor& g, Tensor& beta, cudaStream_t stream) {
     const std::int64_t n = g.numel();
     constexpr int kBlock = 256;
+    const std::int64_t n_vec = div_up(n, static_cast<std::int64_t>(4));
     const int grid =
-        static_cast<int>(std::max<std::int64_t>(1, div_up(n, static_cast<std::int64_t>(kBlock))));
+        static_cast<int>(std::max<std::int64_t>(1, div_up(n_vec, static_cast<std::int64_t>(kBlock))));
 
     gdn_gating_kernel<<<grid, kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(a.data), static_cast<const __nv_bfloat16*>(b.data),

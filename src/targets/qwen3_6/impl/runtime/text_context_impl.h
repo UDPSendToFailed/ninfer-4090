@@ -267,6 +267,11 @@ void TextContext::bind() {
     embed_      = &weights_.token_embedding;
     final_norm_ = &weights_.final_norm;
     lm_head_    = &weights_.output_head;
+    if (state_.layer_count() > 0 && !state_.recurrent.empty() && state_.recurrent[0].data != nullptr) {
+        const void* base = state_.recurrent[0].data;
+        const std::size_t total_recurrent_bytes = state_.recurrent.size() * state_.recurrent[0].bytes();
+        ctx_.set_persisting_l2_window(base, total_recurrent_bytes, 1.0f);
+    }
     if (weights_.optimized_proposal) {
         const auto& proposal = *weights_.optimized_proposal;
         set_proposal_head(&proposal.head, static_cast<const std::int32_t*>(proposal.token_ids.data),

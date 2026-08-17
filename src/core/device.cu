@@ -62,9 +62,9 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
         throw std::runtime_error(cuda_error_message("cudaGetDeviceProperties failed", err));
     }
 
-    // On Ada Lovelace SM89 devices with 72 MB L2 cache, reserve an L2 persistence window
+    // Reserve an L2 persistence window on GPUs supporting persisting L2 cache
     // (CUDA C++ Programming Guide Section 6.2.3).
-    if (props.major == 8 && props.minor == 9 && props.persistingL2CacheMaxSize > 0) {
+    if (props.persistingL2CacheMaxSize > 0) {
         const std::size_t persisting_size =
             std::min<std::size_t>(static_cast<std::size_t>(props.l2CacheSize * 0.6),
                                   static_cast<std::size_t>(props.persistingL2CacheMaxSize));

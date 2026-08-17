@@ -217,17 +217,36 @@ template <int DIAG_BLOCK>
 __device__ __forceinline__ void solve_diag_block(int lane, SmemTile<BT> M_view) {
     constexpr int diag_off = DIAG_BLOCK * BC;
     const int wcol         = lane & 15;
+
+    // Load column `wcol` of the 16x16 block into registers
+    float col_val[BC];
+#pragma unroll
+    for (int r = 0; r < BC; ++r) {
+        col_val[r] = (lane < 16) ? M_view.at(diag_off + r, diag_off + wcol) : 0.0f;
+    }
+
+    // Solve strictly lower triangular forward substitution in registers (zero __syncwarp barriers)
+#pragma unroll
     for (int i = 1; i < BC; ++i) {
-        const int row_i = diag_off + i;
-        const int col   = diag_off + wcol;
-        float sum       = 0.0f;
+        float sum = 0.0f;
 #pragma unroll
         for (int j = 0; j < BC - 1; ++j) {
-            if (j < i) { sum += M_view.at(row_i, diag_off + j) * M_view.at(diag_off + j, col); }
+            if (j < i) {
+                const float M_ij = __shfl_sync(0xffffU, col_val[i], j);
+                sum += M_ij * col_val[j];
+            }
         }
-        __syncwarp();
-        if (lane < 16 && wcol < i) { M_view.at(row_i, col) += sum; }
-        __syncwarp();
+        if (lane < 16 && wcol < i) {
+            col_val[i] += sum;
+        }
+    }
+
+    // Write back solved lower-triangular values to shared memory
+#pragma unroll
+    for (int r = 1; r < BC; ++r) {
+        if (lane < 16 && wcol < r) {
+            M_view.at(diag_off + r, diag_off + wcol) = col_val[r];
+        }
     }
 }
 
