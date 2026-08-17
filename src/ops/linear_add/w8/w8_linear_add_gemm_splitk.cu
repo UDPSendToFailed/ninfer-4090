@@ -112,7 +112,11 @@ void w8_linear_add_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
         if (tail == 1) {
             const Tensor x_slice = x.slice(1, offset, 1);
             Tensor residual_slice = residual_out.slice(1, offset, 1);
-            w8_linear_add_decode_r16_launch(x_slice, weight, residual_slice, stream);
+            if (weight.k == 6144) {
+                w8_linear_add_decode_r16_launch(x_slice, weight, residual_slice, stream);
+            } else {
+                w8_linear_add_simt_r8_c4_launch(false, x_slice, weight, residual_slice, stream);
+            }
         } else if (tail >= kFirstExactCols) {
             const Tensor x_slice = x.slice(1, offset, tail);
             Tensor residual_slice = residual_out.slice(1, offset, tail);
@@ -142,7 +146,11 @@ void w8_linear_add_medium_splitk_launch(const Tensor& x, const Weight& weight, T
         const Tensor x_slice = x.slice(1, offset, count);
         Tensor residual_slice = residual_out.slice(1, offset, count);
         if (count == 1) {
-            w8_linear_add_decode_r16_launch(x_slice, weight, residual_slice, stream);
+            if (weight.k == 6144) {
+                w8_linear_add_decode_r16_launch(x_slice, weight, residual_slice, stream);
+            } else {
+                w8_linear_add_simt_r8_c4_launch(false, x_slice, weight, residual_slice, stream);
+            }
         } else {
             w8_linear_add_splitk_mma_launch(x_slice, weight, residual_slice, stream);
         }
