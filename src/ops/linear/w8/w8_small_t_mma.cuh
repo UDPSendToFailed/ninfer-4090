@@ -277,28 +277,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
 
     __syncthreads();
     auto* partial = shared.partial;
-    if ((k_split & 1) != 0) {
+    if (k_split > 0) {
 #pragma unroll
         for (int ni = 0; ni < kNt; ++ni) {
             store_vec(partial + ((warp * kNt + ni) * 32 + lane) * 4,
                       make_float4(acc[ni][0], acc[ni][1], acc[ni][2], acc[ni][3]));
-        }
-    }
-    __syncthreads();
-
-    if ((k_split & 1) == 0) {
-#pragma unroll
-        for (int ni = 0; ni < kNt; ++ni) {
-            const float4 partner =
-                load_vec<float4>(partial + (((warp + 1) * kNt + ni) * 32 + lane) * 4);
-            acc[ni][0] += partner.x;
-            acc[ni][1] += partner.y;
-            acc[ni][2] += partner.z;
-            acc[ni][3] += partner.w;
-            if (k_split != 0) {
-                store_vec(partial + ((warp * kNt + ni) * 32 + lane) * 4,
-                          make_float4(acc[ni][0], acc[ni][1], acc[ni][2], acc[ni][3]));
-            }
         }
     }
     __syncthreads();
@@ -310,7 +293,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
         for (int ni = 0; ni < kNt; ++ni) {
             float4 sum = make_float4(acc[ni][0], acc[ni][1], acc[ni][2], acc[ni][3]);
 #pragma unroll
-            for (int split = 2; split < kWarps; split += 2) {
+            for (int split = 1; split < kWarps; ++split) {
                 const float4 value =
                     load_vec<float4>(partial + ((split * kNt + ni) * 32 + lane) * 4);
                 sum.x += value.x;

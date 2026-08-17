@@ -44,22 +44,22 @@ __global__ void gdn_gating_kernel(const __nv_bfloat16* a, const __nv_bfloat16* b
 
         // Lane 0
         const float av0 = __low2float(a_pair0), bv0 = __low2float(b_pair0);
-        g_out.x = -__expf(A_log[h0]) * softplus(av0 + dt_bias[h0]);
+        g_out.x = -expf(A_log[h0]) * softplus(av0 + dt_bias[h0]);
         beta_out.x = sigmoid(bv0);
 
         // Lane 1
         const float av1 = __high2float(a_pair0), bv1 = __high2float(b_pair0);
-        g_out.y = -__expf(A_log[h1]) * softplus(av1 + dt_bias[h1]);
+        g_out.y = -expf(A_log[h1]) * softplus(av1 + dt_bias[h1]);
         beta_out.y = sigmoid(bv1);
 
         // Lane 2
         const float av2 = __low2float(a_pair1), bv2 = __low2float(b_pair1);
-        g_out.z = -__expf(A_log[h2]) * softplus(av2 + dt_bias[h2]);
+        g_out.z = -expf(A_log[h2]) * softplus(av2 + dt_bias[h2]);
         beta_out.z = sigmoid(bv2);
 
         // Lane 3
         const float av3 = __high2float(a_pair1), bv3 = __high2float(b_pair1);
-        g_out.w = -__expf(A_log[h3]) * softplus(av3 + dt_bias[h3]);
+        g_out.w = -expf(A_log[h3]) * softplus(av3 + dt_bias[h3]);
         beta_out.w = sigmoid(bv3);
 
         // Vectorized 128-bit stores
@@ -73,7 +73,7 @@ __global__ void gdn_gating_kernel(const __nv_bfloat16* a, const __nv_bfloat16* b
         const float av = __bfloat162float(a[i]);
         const float bv = __bfloat162float(b[i]);
         const float sp = softplus(av + dt_bias[h]);
-        g[i]           = -__expf(A_log[h]) * sp;
+        g[i]           = -expf(A_log[h]) * sp;
         beta[i]        = sigmoid(bv);
     }
 }
