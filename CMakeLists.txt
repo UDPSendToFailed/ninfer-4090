@@ -28,7 +28,9 @@ if(MSVC)
   add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
   add_compile_options(
     $<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+    $<$<COMPILE_LANGUAGE:C,CXX>:/EHsc>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc>)
   # CUDA's static runtime requests LIBCMT even when the application and vcpkg dependencies use
   # the project-wide /MD runtime. Keep one CRT in the final process.
   add_link_options(/NODEFAULTLIB:LIBCMT)

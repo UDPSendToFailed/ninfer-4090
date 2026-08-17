@@ -21,9 +21,11 @@ function(ninfer_add_test name)
     target_link_libraries(${name} PRIVATE ninfer_core)
   endif()
   if(arg_NEEDS_SOURCE_DIR)
+    file(TO_CMAKE_PATH "${PROJECT_SOURCE_DIR}" NINFER_NORMALIZED_SOURCE_DIR)
+    file(TO_CMAKE_PATH "${Python3_EXECUTABLE}" NINFER_NORMALIZED_PYTHON)
     target_compile_definitions(${name} PRIVATE
-      NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
-      NINFER_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}")
+      NINFER_SOURCE_DIR="${NINFER_NORMALIZED_SOURCE_DIR}"
+      NINFER_PYTHON_EXECUTABLE="${NINFER_NORMALIZED_PYTHON}")
   endif()
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
