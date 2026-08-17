@@ -460,6 +460,31 @@ int test_parse_tool_history_messages() {
     failures += check(to_request_options(req, default_server()).output.preserve_special_tokens,
                       "tool history preserves special tokens in Engine output");
 
+    Json parts_body                      = body;
+    parts_body["messages"][2]["content"] = Json::array(
+        {Json{{"type", "text"}, {"text", R"({"temp":20})"}}, Json{{"type", "text"}, {"text", "ok"}}});
+    const GenerationRequest parts_req = parse_chat_completion_request(parts_body, default_limits());
+    failures += check(parts_req.messages[2].content.size() == 2, "tool content parts parsed");
+    failures += check(parts_req.messages[2].content.at(0).text == R"({"temp":20})",
+                      "tool content part 0 parsed");
+    failures += check(parts_req.messages[2].content.at(1).text == "ok", "tool content part 1 parsed");
+    failures += check(parts_req.messages[2].tool_call_id == "call_1",
+                      "tool_call_id parsed with content parts");
+
+    Json empty_parts_body                      = body;
+    empty_parts_body["messages"][2]["content"] = Json::array();
+    const GenerationRequest empty_parts_req =
+        parse_chat_completion_request(empty_parts_body, default_limits());
+    failures += check(empty_parts_req.messages[2].content.size() == 1 &&
+                          empty_parts_req.messages[2].content.at(0).text.empty(),
+                      "empty tool content parts accepted");
+
+    Json null_content_body                      = body;
+    null_content_body["messages"][2]["content"] = nullptr;
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(null_content_body, default_limits()); }),
+        "null tool content rejected");
+
     Json bad_args                                                     = body;
     bad_args["messages"][1]["tool_calls"][0]["function"]["arguments"] = R"(["Paris"])";
     failures +=
