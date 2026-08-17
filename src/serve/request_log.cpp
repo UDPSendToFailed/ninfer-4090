@@ -114,7 +114,7 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) {
     if (storage == ninfer::KvCacheStorage::RK2V4E8) {
         return "rk2v4-e8";
     }
-    return "int8";
+    return "int8-group64";
 }
 
 const char* kv_capacity_mode_name(ninfer::KvCapacityMode mode) {
