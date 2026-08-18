@@ -73,6 +73,12 @@ struct Q5MmaDecodeAtom {
                                                                  int lane) {
         const float scale =
             __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scale_ptr)));
+        return decode_pair_with_scale(staged_codes, staged_high, scale, staged_group_index, lane);
+    }
+
+    static __device__ __forceinline__ __nv_bfloat162
+    decode_pair_with_scale(const std::uint8_t* staged_codes, const std::uint8_t* staged_high,
+                           float scale, std::int64_t staged_group_index, int lane) {
         const std::uint8_t packed =
             staged_codes[staged_group_index * Q5RowSplitStorage::kCodeBytesPerGroup + lane];
         const std::uint8_t high_byte =

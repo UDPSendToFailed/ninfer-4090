@@ -48,6 +48,12 @@ struct Q4MmaDecodeAtom {
                                                                  int lane) {
         const float scale =
             __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scale_ptr)));
+        return decode_pair_with_scale(codes, scale, group_index, lane);
+    }
+
+    static __device__ __forceinline__ __nv_bfloat162
+    decode_pair_with_scale(const std::uint8_t* codes, float scale, std::int64_t group_index,
+                           int lane) {
         const std::uint8_t packed =
             codes[group_index * Q4RowSplitStorage::kCodeBytesPerGroup + lane];
         const int q0 = (static_cast<int>(packed & 0x0fu) ^ 0x08) - 0x08;

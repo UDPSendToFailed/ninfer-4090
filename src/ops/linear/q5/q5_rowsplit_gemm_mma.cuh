@@ -212,13 +212,13 @@ void q5_rowsplit_gemm_mma_kernel(
             auto* dst = &Cr[stage][row_group * Q5RowSplitStorage::kCodeBytesPerGroup + half * 16];
             if constexpr (kFull) {
                 const std::int64_t group_index =
-                    static_cast<std::int64_t>(row) * groups_per_row + group0 + group;
+                    (static_cast<std::int64_t>(row) * groups_per_row + group0) + group;
                 cp_async<16, Schedule::kQuantCache>(
                     dst, &codes[group_index * Q5RowSplitStorage::kCodeBytesPerGroup + half * 16]);
             } else {
                 if (row < rows) {
                     const std::int64_t group_index =
-                        static_cast<std::int64_t>(row) * groups_per_row + group0 + group;
+                        (static_cast<std::int64_t>(row) * groups_per_row + group0) + group;
                     cp_async<16, Schedule::kQuantCache>(
                         dst,
                         &codes[group_index * Q5RowSplitStorage::kCodeBytesPerGroup + half * 16]);
@@ -236,12 +236,12 @@ void q5_rowsplit_gemm_mma_kernel(
             auto* dst           = &Hr[stage][row_group * Q5RowSplitStorage::kHighBytesPerGroup];
             if constexpr (kFull) {
                 const std::int64_t group_index =
-                    static_cast<std::int64_t>(row) * groups_per_row + group0 + group;
+                    (static_cast<std::int64_t>(row) * groups_per_row + group0) + group;
                 cp_async<8>(dst, &high[group_index * Q5RowSplitStorage::kHighBytesPerGroup]);
             } else {
                 if (row < rows) {
                     const std::int64_t group_index =
-                        static_cast<std::int64_t>(row) * groups_per_row + group0 + group;
+                        (static_cast<std::int64_t>(row) * groups_per_row + group0) + group;
                     cp_async<8>(dst, &high[group_index * Q5RowSplitStorage::kHighBytesPerGroup]);
                 } else {
                     store_vec(dst, static_cast<std::uint64_t>(0));
@@ -257,12 +257,11 @@ void q5_rowsplit_gemm_mma_kernel(
             const int scale_group = group0 + group;
             auto* dst             = &Sr[stage][row_group * SB];
             if constexpr (kFull) {
-                const std::int64_t group_index =
-                    static_cast<std::int64_t>(row) * groups_per_row + scale_group;
+                const std::int64_t row_group_base = static_cast<std::int64_t>(row) * groups_per_row;
+                const std::int64_t group_index    = row_group_base + scale_group;
                 if constexpr (Schedule::kScaleLoadMode == Q5ScaleLoad::Pair32) {
-                    const int aligned_group = scale_group & ~1;
-                    const std::int64_t aligned_index =
-                        static_cast<std::int64_t>(row) * groups_per_row + aligned_group;
+                    const int aligned_group          = scale_group & ~1;
+                    const std::int64_t aligned_index = row_group_base + aligned_group;
                     if (aligned_group + 1 < groups_per_row) {
                         cp_async<4>(
                             dst, &scales[aligned_index * Q5RowSplitStorage::kScaleBytesPerGroup]);
@@ -279,12 +278,11 @@ void q5_rowsplit_gemm_mma_kernel(
                 }
             } else {
                 if (row < rows) {
-                    const std::int64_t group_index =
-                        static_cast<std::int64_t>(row) * groups_per_row + scale_group;
+                    const std::int64_t row_group_base = static_cast<std::int64_t>(row) * groups_per_row;
+                    const std::int64_t group_index    = row_group_base + scale_group;
                     if constexpr (Schedule::kScaleLoadMode == Q5ScaleLoad::Pair32) {
-                        const int aligned_group = scale_group & ~1;
-                        const std::int64_t aligned_index =
-                            static_cast<std::int64_t>(row) * groups_per_row + aligned_group;
+                        const int aligned_group          = scale_group & ~1;
+                        const std::int64_t aligned_index = row_group_base + aligned_group;
                         if (aligned_group + 1 < groups_per_row) {
                             cp_async<4>(
                                 dst,
@@ -329,8 +327,10 @@ void q5_rowsplit_gemm_mma_kernel(
                                                         ? ((scale_group + group) & 1) *
                                                               Q5RowSplitStorage::kScaleBytesPerGroup
                                                         : 0)];
-                const __nv_bfloat162 weights = Q5MmaDecodeAtom::decode_pair(
-                    Cr[stage], Hr[stage], scale_ptr, staged_group, lane);
+                const float scale = __half2float(
+                    __ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scale_ptr)));
+                const __nv_bfloat162 weights = Q5MmaDecodeAtom::decode_pair_with_scale(
+                    Cr[stage], Hr[stage], scale, staged_group, lane);
                 const int shared_col =
                     q5_mma_swizzle_k64(local_row, group * Q5RowSplitStorage::kGroupK + 2 * lane);
                 store_vec(&dst[shared_col], weights);
