@@ -34,6 +34,10 @@ __device__ __forceinline__ float2 bf16x2_to_float2(__nv_bfloat162 value) {
     return __bfloat1622float2(value);
 }
 
+__device__ __forceinline__ __nv_bfloat162 float2_to_bf16x2(float2 value) {
+    return __float22bfloat162_rn(value);
+}
+
 __device__ __forceinline__ float2 bf16x2_bits_to_float2(std::uint32_t bits) {
     return bf16x2_to_float2(load_vec<__nv_bfloat162>(&bits));
 }

@@ -139,9 +139,9 @@ struct RawQkLane {
     float value[kQkPerLane];
 };
 
-struct RawValueLane {
-    __nv_bfloat16 bits;
-    float value;
+struct RawValuePack {
+    Bf16x4Pack bits;
+    float value[kDvPerWarp];
 };
 
 struct RawGatePair {
@@ -177,28 +177,23 @@ __device__ __forceinline__ void normalize_qk_lane(float (&value)[kQkPerLane], in
     }
 }
 
-__device__ __forceinline__ RawValueLane load_value_lane(const __nv_bfloat16* base, int lane,
+__device__ __forceinline__ RawValuePack load_value_pack(const __nv_bfloat16* base, int lane,
                                                         std::uint32_t dv_base) {
-    RawValueLane out{__float2bfloat16(0.0f), 0.0f};
+    RawValuePack out;
     Bf16x4Pack pack;
     if (lane == 0) {
         pack = load_vec<Bf16x4Pack>(base + dv_base);
     }
     const __nv_bfloat162 p0 = __shfl_sync(kFullWarpMask, pack.pair[0], 0);
     const __nv_bfloat162 p1 = __shfl_sync(kFullWarpMask, pack.pair[1], 0);
-    if (lane == 0) {
-        out.bits  = p0.x;
-        out.value = __bfloat162float(p0.x);
-    } else if (lane == 1) {
-        out.bits  = p0.y;
-        out.value = __bfloat162float(p0.y);
-    } else if (lane == 2) {
-        out.bits  = p1.x;
-        out.value = __bfloat162float(p1.x);
-    } else if (lane == 3) {
-        out.bits  = p1.y;
-        out.value = __bfloat162float(p1.y);
-    }
+    out.bits.pair[0]        = p0;
+    out.bits.pair[1]        = p1;
+    const float2 lo         = bf16x2_to_float2(p0);
+    const float2 hi         = bf16x2_to_float2(p1);
+    out.value[0]            = lo.x;
+    out.value[1]            = lo.y;
+    out.value[2]            = hi.x;
+    out.value[3]            = hi.y;
     return out;
 }
 
@@ -215,8 +210,9 @@ __device__ __forceinline__ RawGatePair load_record_gate(const uint2* gate, std::
 }
 
 __device__ __forceinline__ void apply_gdn_transition(float (&state)[kDvPerWarp][kQkPerLane],
-                                                     const float (&key)[kQkPerLane], float v_local,
-                                                     float g, float beta) {
+                                                     const float (&key)[kQkPerLane],
+                                                     const float (&v)[kDvPerWarp], float g,
+                                                     float beta) {
     const float alpha = expf(g);
 
     float partial[kDvPerWarp];
@@ -227,22 +223,22 @@ __device__ __forceinline__ void apply_gdn_transition(float (&state)[kDvPerWarp][
         for (int c = 0; c < kQkPerLane; ++c) { partial[r] += state[r][c] * key[c]; }
     }
 
-    // Parallel batched warp reduction across all kDvPerWarp (4) rows simultaneously
+    // Parallel batched warp all-reduce across all kDvPerWarp (4) rows simultaneously via XOR butterfly
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
 #pragma unroll
         for (int r = 0; r < kDvPerWarp; ++r) {
-            partial[r] += __shfl_down_sync(0xffffffff, partial[r], mask, kWarpSize);
+            partial[r] += __shfl_xor_sync(0xffffffff, partial[r], mask, kWarpSize);
         }
     }
 
 #pragma unroll
     for (int r = 0; r < kDvPerWarp; ++r) {
-        const float reduced_sum = __shfl_sync(0xffffffff, partial[r], 0, kWarpSize);
-        const float v_r         = __shfl_sync(0xffffffff, v_local, r, kWarpSize);
-        const float delta       = beta * (v_r - alpha * reduced_sum);
+        const float delta = beta * (v[r] - alpha * partial[r]);
 #pragma unroll
-        for (int c = 0; c < kQkPerLane; ++c) { state[r][c] = alpha * state[r][c] + delta * key[c]; }
+        for (int c = 0; c < kQkPerLane; ++c) {
+            state[r][c] = fmaf(delta, key[c], alpha * state[r][c]);
+        }
     }
 }
 
@@ -269,13 +265,14 @@ __device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQk
         }
     }
 
-    float attn_val = 0.0f;
-#pragma unroll
-    for (int r = 0; r < kDvPerWarp; ++r) {
-        const float r_val = __shfl_sync(0xffffffff, partial[r], 0, kWarpSize);
-        if (lane == r) { attn_val = r_val; }
+    if (lane == 0) {
+        const float2 s0 = make_float2(partial[0] * scale, partial[1] * scale);
+        const float2 s1 = make_float2(partial[2] * scale, partial[3] * scale);
+        Bf16x4Pack pack;
+        pack.pair[0] = float2_to_bf16x2(s0);
+        pack.pair[1] = float2_to_bf16x2(s1);
+        store_vec(output + dv_base, pack);
     }
-    if (lane < kDvPerWarp) { output[dv_base + lane] = __float2bfloat16(attn_val * scale); }
 }
 
 template <bool Normalize>
@@ -318,7 +315,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     RawQkLane key = load_raw_qk_lane(k + static_cast<std::int64_t>(h_qk) * kStateDim, dqk_base);
     normalize_qk_lane<NormalizeQK>(key.value, lane);
     RawGatePair gate   = load_source_gate(g, beta, h_v);
-    RawValueLane value = load_value_lane(v + static_cast<std::int64_t>(h_v) * kStateDim, lane, dv_base);
+    RawValuePack value = load_value_pack(v + static_cast<std::int64_t>(h_v) * kStateDim, lane, dv_base);
     RawQkLane query    = load_raw_qk_lane(q + static_cast<std::int64_t>(h_qk) * kStateDim, dqk_base);
 
     for (std::int32_t token = 0; token < width; ++token) {
@@ -326,12 +323,12 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
 
         RawQkLane next_key;
         RawGatePair next_gate;
-        RawValueLane next_value;
+        RawValuePack next_value;
         RawQkLane next_query;
         if (token + 1 < width) {
             next_key   = load_raw_qk_lane(k + ((column + 1) * heads.H_qk + h_qk) * kStateDim, dqk_base);
             next_gate  = load_source_gate(g, beta, (column + 1) * heads.H_v + h_v);
-            next_value = load_value_lane(v + ((column + 1) * heads.H_v + h_v) * kStateDim, lane, dv_base);
+            next_value = load_value_pack(v + ((column + 1) * heads.H_v + h_v) * kStateDim, lane, dv_base);
             next_query = load_raw_qk_lane(q + ((column + 1) * heads.H_qk + h_qk) * kStateDim, dqk_base);
         }
 
@@ -548,11 +545,11 @@ struct RecordAccess {
     }
 
     __device__ __forceinline__ void store_value(const RecurrentCoordinates& coord,
-                                                std::int32_t token, const RawValueLane& raw) const {
-        if (coord.lane < kDvPerWarp) {
+                                                std::int32_t token, const RawValuePack& raw) const {
+        if (coord.lane == 0) {
             __nv_bfloat16* destination =
                 value_record + (column(coord, token) * heads.H_v + coord.value_head) * kStateDim;
-            destination[coord.dv_base + coord.lane] = raw.bits;
+            store_vec(destination + coord.dv_base, raw.bits);
         }
     }
 
@@ -731,7 +728,7 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
         normalize_qk_lane<NormalizeInputs>(key.value, coord.lane);
 
         RawGatePair gate   = access.load_gate(coord, 0);
-        RawValueLane value = load_value_lane(access.value_ptr(coord, 0), coord.lane, coord.dv_base);
+        RawValuePack value = load_value_pack(access.value_ptr(coord, 0), coord.lane, coord.dv_base);
         if constexpr (Mode == RecurrentMode::Record) {
             access.store_value(coord, 0, value);
             access.store_gate(coord, 0, gate);
@@ -742,12 +739,12 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
         for (std::int32_t token = 0; token < valid; ++token) {
             RawQkLane next_key;
             RawGatePair next_gate;
-            RawValueLane next_value;
+            RawValuePack next_value;
             RawQkLane next_query;
             if (token + 1 < valid) {
                 next_key   = load_raw_qk_lane(access.key_ptr(coord, token + 1), coord.dqk_base);
                 next_gate  = access.load_gate(coord, token + 1);
-                next_value = load_value_lane(access.value_ptr(coord, token + 1), coord.lane, coord.dv_base);
+                next_value = load_value_pack(access.value_ptr(coord, token + 1), coord.lane, coord.dv_base);
                 next_query = load_raw_qk_lane(access.query_ptr(coord, token + 1), coord.dqk_base);
             }
 
@@ -809,17 +806,17 @@ __device__ __forceinline__ void recurrent_fold_body(const Access& access,
     normalize_qk_lane<true>(key.value, coord.lane);
 
     RawGatePair gate   = load_record_gate(curr_gate_ptr, 0);
-    RawValueLane value = load_value_lane(curr_val_ptr, coord.lane, coord.dv_base);
+    RawValuePack value = load_value_pack(curr_val_ptr, coord.lane, coord.dv_base);
 
 #pragma unroll 4
     for (std::int32_t token = 0; token < valid; ++token) {
         RawQkLane next_key;
         RawGatePair next_gate;
-        RawValueLane next_value;
+        RawValuePack next_value;
         if (token + 1 < valid) {
             next_key   = load_raw_qk_lane(curr_key_ptr + key_token_stride, coord.dqk_base);
             next_gate  = load_record_gate(curr_gate_ptr + gate_token_stride, 0);
-            next_value = load_value_lane(curr_val_ptr + val_token_stride, coord.lane, coord.dv_base);
+            next_value = load_value_pack(curr_val_ptr + val_token_stride, coord.lane, coord.dv_base);
         }
 
         apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
