@@ -180,9 +180,24 @@ __device__ __forceinline__ void normalize_qk_lane(float (&value)[kQkPerLane], in
 __device__ __forceinline__ RawValueLane load_value_lane(const __nv_bfloat16* base, int lane,
                                                         std::uint32_t dv_base) {
     RawValueLane out{__float2bfloat16(0.0f), 0.0f};
-    if (lane < kDvPerWarp) {
-        out.bits  = base[dv_base + lane];
-        out.value = __bfloat162float(out.bits);
+    Bf16x4Pack pack;
+    if (lane == 0) {
+        pack = load_vec<Bf16x4Pack>(base + dv_base);
+    }
+    const __nv_bfloat162 p0 = __shfl_sync(kFullWarpMask, pack.pair[0], 0);
+    const __nv_bfloat162 p1 = __shfl_sync(kFullWarpMask, pack.pair[1], 0);
+    if (lane == 0) {
+        out.bits  = p0.x;
+        out.value = __bfloat162float(p0.x);
+    } else if (lane == 1) {
+        out.bits  = p0.y;
+        out.value = __bfloat162float(p0.y);
+    } else if (lane == 2) {
+        out.bits  = p1.x;
+        out.value = __bfloat162float(p1.x);
+    } else if (lane == 3) {
+        out.bits  = p1.y;
+        out.value = __bfloat162float(p1.y);
     }
     return out;
 }
@@ -346,7 +361,6 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
 enum class RecurrentMode {
     Snapshot,
     Record,
-    Fold,
 };
 
 struct RecurrentCoordinates {
@@ -688,10 +702,6 @@ template <RecurrentMode Mode, bool NormalizeInputs, class Access>
 __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
                                                     const RecurrentCoordinates& coord,
                                                     std::int32_t width, std::int32_t valid) {
-    if constexpr (Mode == RecurrentMode::Fold) {
-        if (valid == 0) { return; }
-    }
-
     const float* initial = access.state_read_base(coord);
     __align__(16) float state[kDvPerWarp][kQkPerLane];
 #pragma unroll
@@ -712,10 +722,7 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
             access.store_gate(coord, 0, gate);
         }
 
-        RawQkLane query;
-        if constexpr (Mode != RecurrentMode::Fold) {
-            query = load_raw_qk_lane(access.query_ptr(coord, 0), coord.dqk_base);
-        }
+        RawQkLane query = load_raw_qk_lane(access.query_ptr(coord, 0), coord.dqk_base);
 
         for (std::int32_t token = 0; token < valid; ++token) {
             RawQkLane next_key;
@@ -726,18 +733,14 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
                 next_key   = load_raw_qk_lane(access.key_ptr(coord, token + 1), coord.dqk_base);
                 next_gate  = access.load_gate(coord, token + 1);
                 next_value = load_value_lane(access.value_ptr(coord, token + 1), coord.lane, coord.dv_base);
-                if constexpr (Mode != RecurrentMode::Fold) {
-                    next_query = load_raw_qk_lane(access.query_ptr(coord, token + 1), coord.dqk_base);
-                }
+                next_query = load_raw_qk_lane(access.query_ptr(coord, token + 1), coord.dqk_base);
             }
 
             apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
 
-            if constexpr (Mode != RecurrentMode::Fold) {
-                readout_and_store<NormalizeInputs>(state, query,
-                                                   access.output_ptr(coord, token),
-                                                   coord.dv_base, coord.lane, access.scale);
-            }
+            readout_and_store<NormalizeInputs>(state, query,
+                                               access.output_ptr(coord, token),
+                                               coord.dv_base, coord.lane, access.scale);
             if constexpr (Mode == RecurrentMode::Snapshot) {
                 access.store_snapshot(coord, token, state);
             }
@@ -752,24 +755,62 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
                 key   = next_key;
                 gate  = next_gate;
                 value = next_value;
-                if constexpr (Mode != RecurrentMode::Fold) {
-                    query = next_query;
-                }
+                query = next_query;
             }
         }
     }
 
-    if constexpr (Mode == RecurrentMode::Fold) {
-        access.store_final_state(coord, state);
-        access.publish_final_conv_history(coord, valid);
-    } else {
-        if (coord.lane < kDvPerWarp) {
-            for (std::int32_t token = valid; token < width; ++token) {
-                access.output_ptr(coord, token)[coord.dv_base + coord.lane] =
-                    __float2bfloat16(0.0f);
-            }
+    if (coord.lane < kDvPerWarp) {
+        for (std::int32_t token = valid; token < width; ++token) {
+            access.output_ptr(coord, token)[coord.dv_base + coord.lane] =
+                __float2bfloat16(0.0f);
         }
     }
+}
+
+template <class Access>
+__device__ __forceinline__ void recurrent_fold_body(const Access& access,
+                                                    const RecurrentCoordinates& coord,
+                                                    std::int32_t valid) {
+    if (valid <= 0) { return; }
+
+    const float* initial = access.state_read_base(coord);
+    __align__(16) float state[kDvPerWarp][kQkPerLane];
+#pragma unroll
+    for (int r = 0; r < kDvPerWarp; ++r) {
+        load_qk_lane(state[r], initial + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
+                     coord.dqk_base);
+    }
+
+    RawQkLane key = load_raw_qk_lane(access.key_ptr(coord, 0), coord.dqk_base);
+    normalize_qk_lane<true>(key.value, coord.lane);
+
+    RawGatePair gate   = access.load_gate(coord, 0);
+    RawValueLane value = load_value_lane(access.value_ptr(coord, 0), coord.lane, coord.dv_base);
+
+#pragma unroll 4
+    for (std::int32_t token = 0; token < valid; ++token) {
+        RawQkLane next_key;
+        RawGatePair next_gate;
+        RawValueLane next_value;
+        if (token + 1 < valid) {
+            next_key   = load_raw_qk_lane(access.key_ptr(coord, token + 1), coord.dqk_base);
+            next_gate  = access.load_gate(coord, token + 1);
+            next_value = load_value_lane(access.value_ptr(coord, token + 1), coord.lane, coord.dv_base);
+        }
+
+        apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
+
+        if (token + 1 < valid) {
+            normalize_qk_lane<true>(next_key.value, coord.lane);
+            key   = next_key;
+            gate  = next_gate;
+            value = next_value;
+        }
+    }
+
+    access.store_final_state(coord, state);
+    access.publish_final_conv_history(coord, valid);
 }
 
 template <bool NormalizeInputs, bool Batched, bool Masked>
@@ -793,8 +834,7 @@ template <class Geometry>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_fold_kernel(const __grid_constant__ FoldAccess<Geometry> access) {
     const RecurrentCoordinates coord = access.coordinates();
-    recurrent_bf16_body<RecurrentMode::Fold, true>(access, coord, access.width,
-                                                   access.active_columns(coord));
+    recurrent_fold_body(access, coord, access.active_columns(coord));
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net
