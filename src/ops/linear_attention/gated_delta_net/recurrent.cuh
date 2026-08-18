@@ -577,8 +577,9 @@ struct FoldGeometry {
 using FoldGeometry48x48 = FoldGeometry<48, 16, 48, 10240>;
 using FoldGeometry30x32 = FoldGeometry<30, 16, 32, 8192>;
 
-template <class Geometry>
+template <class Geometry_>
 struct FoldAccess {
+    using Geometry = Geometry_;
     const __nv_bfloat16* key_record;
     const __nv_bfloat16* value_record;
     const uint2* gate_record;
@@ -636,9 +637,19 @@ struct FoldAccess {
         return key_record + (column * Geometry::kQkHeads + coord.qk_head) * kStateDim;
     }
 
+    __device__ __forceinline__ const __nv_bfloat16* key_base_ptr(const RecurrentCoordinates& coord) const {
+        const std::int64_t column = record_outer(coord) * width;
+        return key_record + (column * Geometry::kQkHeads + coord.qk_head) * kStateDim;
+    }
+
     __device__ __forceinline__ const __nv_bfloat16* value_ptr(const RecurrentCoordinates& coord,
                                                               std::int32_t token) const {
         const std::int64_t column = record_outer(coord) * width + token;
+        return value_record + (column * Geometry::kValueHeads + coord.value_head) * kStateDim;
+    }
+
+    __device__ __forceinline__ const __nv_bfloat16* value_base_ptr(const RecurrentCoordinates& coord) const {
+        const std::int64_t column = record_outer(coord) * width;
         return value_record + (column * Geometry::kValueHeads + coord.value_head) * kStateDim;
     }
 
@@ -646,6 +657,11 @@ struct FoldAccess {
                                                      std::int32_t token) const {
         const std::int64_t column = record_outer(coord) * width + token;
         return load_record_gate(gate_record, column * Geometry::kValueHeads + coord.value_head);
+    }
+
+    __device__ __forceinline__ const uint2* gate_base_ptr(const RecurrentCoordinates& coord) const {
+        const std::int64_t column = record_outer(coord) * width;
+        return gate_record + (column * Geometry::kValueHeads + coord.value_head);
     }
 
     __device__ __forceinline__ void
@@ -781,11 +797,19 @@ __device__ __forceinline__ void recurrent_fold_body(const Access& access,
                      coord.dqk_base);
     }
 
-    RawQkLane key = load_raw_qk_lane(access.key_ptr(coord, 0), coord.dqk_base);
+    const __nv_bfloat16* curr_key_ptr = access.key_base_ptr(coord);
+    const __nv_bfloat16* curr_val_ptr = access.value_base_ptr(coord);
+    const uint2* curr_gate_ptr        = access.gate_base_ptr(coord);
+
+    constexpr std::int64_t key_token_stride  = static_cast<std::int64_t>(Access::Geometry::kQkHeads) * kStateDim;
+    constexpr std::int64_t val_token_stride  = static_cast<std::int64_t>(Access::Geometry::kValueHeads) * kStateDim;
+    constexpr std::int64_t gate_token_stride = static_cast<std::int64_t>(Access::Geometry::kValueHeads);
+
+    RawQkLane key = load_raw_qk_lane(curr_key_ptr, coord.dqk_base);
     normalize_qk_lane<true>(key.value, coord.lane);
 
-    RawGatePair gate   = access.load_gate(coord, 0);
-    RawValueLane value = load_value_lane(access.value_ptr(coord, 0), coord.lane, coord.dv_base);
+    RawGatePair gate   = load_record_gate(curr_gate_ptr, 0);
+    RawValueLane value = load_value_lane(curr_val_ptr, coord.lane, coord.dv_base);
 
 #pragma unroll 4
     for (std::int32_t token = 0; token < valid; ++token) {
@@ -793,9 +817,9 @@ __device__ __forceinline__ void recurrent_fold_body(const Access& access,
         RawGatePair next_gate;
         RawValueLane next_value;
         if (token + 1 < valid) {
-            next_key   = load_raw_qk_lane(access.key_ptr(coord, token + 1), coord.dqk_base);
-            next_gate  = access.load_gate(coord, token + 1);
-            next_value = load_value_lane(access.value_ptr(coord, token + 1), coord.lane, coord.dv_base);
+            next_key   = load_raw_qk_lane(curr_key_ptr + key_token_stride, coord.dqk_base);
+            next_gate  = load_record_gate(curr_gate_ptr + gate_token_stride, 0);
+            next_value = load_value_lane(curr_val_ptr + val_token_stride, coord.lane, coord.dv_base);
         }
 
         apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
@@ -805,6 +829,9 @@ __device__ __forceinline__ void recurrent_fold_body(const Access& access,
             key   = next_key;
             gate  = next_gate;
             value = next_value;
+            curr_key_ptr += key_token_stride;
+            curr_val_ptr += val_token_stride;
+            curr_gate_ptr += gate_token_stride;
         }
     }
 
