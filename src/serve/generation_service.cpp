@@ -260,6 +260,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.prefill_chunk        = options_.prefill_chunk;
     engine_options.kv_cache             = options_.kv_cache;
     engine_options.enable_vision        = options_.enable_vision;
+    engine_options.vision_max_tokens    = options_.vision_max_tokens;
     engine_options.use_cuda_graph       = options_.use_cuda_graph;
     engine_options.speculative          = options_.speculative;
     engine_options.load_progress        = std::move(load_progress);

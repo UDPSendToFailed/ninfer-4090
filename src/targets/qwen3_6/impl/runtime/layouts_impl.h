@@ -529,9 +529,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     }
 
     if (plan.features.vision) {
-        constexpr std::uint32_t kFrontendMergedLimit  = 32768;
+        const std::uint32_t frontend_limit =
+            plan.features.vision_max_tokens > 0 ? plan.features.vision_max_tokens : 8192;
         constexpr std::uint32_t kFrontendSegmentLimit = 768 / 2;
-        const std::uint32_t merged = std::min(plan.capacity, kFrontendMergedLimit);
+        const std::uint32_t merged = std::min(plan.capacity, frontend_limit);
         out.vision_encode          = schedule::VisionContext::workspace_capacity_bytes(
             merged, std::min(merged, kFrontendSegmentLimit));
     }
@@ -639,8 +640,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->features.vision) {
-        constexpr std::uint32_t kFrontendMergedLimit = 32768;
-        const std::uint32_t merged = std::min(impl->capacity, kFrontendMergedLimit);
+        const std::uint32_t frontend_limit =
+            impl->features.vision_max_tokens > 0 ? impl->features.vision_max_tokens : 8192;
+        const std::uint32_t merged = std::min(impl->capacity, frontend_limit);
         impl->request_transient_capacity_bytes =
             schedule::VisionContext::output_transient_bytes(merged);
     }
