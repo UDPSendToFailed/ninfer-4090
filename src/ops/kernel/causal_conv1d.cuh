@@ -123,6 +123,40 @@ __global__ void causal_conv1d_prefill_state_kernel(const __nv_bfloat16* x,
     }
 }
 
+__global__ void causal_conv1d_prefill_state_pairs_kernel(const __nv_bfloat16* x,
+                                                         const __nv_bfloat16* conv_state_in,
+                                                         __nv_bfloat16* conv_state_out,
+                                                         std::int32_t C, std::int32_t T) {
+    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    const std::int64_t C2     = static_cast<std::int64_t>(C / 2);
+
+    const auto* x2        = reinterpret_cast<const __nv_bfloat162*>(x);
+    const auto* state_in2 = reinterpret_cast<const __nv_bfloat162*>(conv_state_in);
+    auto* state_out2      = reinterpret_cast<__nv_bfloat162*>(conv_state_out);
+
+    for (std::int64_t p = start; p < C2; p += stride) {
+        const __nv_bfloat162 old0 = state_in2[p];
+        const __nv_bfloat162 old1 = state_in2[C2 + p];
+        const __nv_bfloat162 old2 = state_in2[2 * C2 + p];
+
+        for (std::int32_t s = 0; s < 3; ++s) {
+            const std::int32_t seq_pos = T + s;
+            __nv_bfloat162 v;
+            if (seq_pos == 0) {
+                v = old0;
+            } else if (seq_pos == 1) {
+                v = old1;
+            } else if (seq_pos == 2) {
+                v = old2;
+            } else {
+                v = x2[static_cast<std::int64_t>(seq_pos - 3) * C2 + p];
+            }
+            state_out2[static_cast<std::int64_t>(s) * C2 + p] = v;
+        }
+    }
+}
+
 // Small-T ordinary form. One thread owns a channel for the complete sequence, so the initial
 // state and four weights are loaded once and the final state is published in the same launch.
 // conv_state_in and conv_state_out may be identical or disjoint.
@@ -161,6 +195,52 @@ __global__ void causal_conv1d_sequence_kernel(const __nv_bfloat16* x, const __nv
     conv_state_out[c64]           = s0;
     conv_state_out[C64 + c64]     = s1;
     conv_state_out[2 * C64 + c64] = s2;
+}
+
+__global__ void causal_conv1d_sequence_pairs_kernel(const __nv_bfloat16* x,
+                                                    const __nv_bfloat16* weight,
+                                                    const __nv_bfloat16* conv_state_in,
+                                                    __nv_bfloat16* conv_state_out,
+                                                    __nv_bfloat16* out, std::int32_t C,
+                                                    std::int32_t T) {
+    const std::int64_t p  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t C2 = static_cast<std::int64_t>(C / 2);
+    if (p >= C2) { return; }
+
+    const auto* x2        = reinterpret_cast<const __nv_bfloat162*>(x);
+    const auto* weight2   = reinterpret_cast<const __nv_bfloat162*>(weight);
+    const auto* state_in2 = reinterpret_cast<const __nv_bfloat162*>(conv_state_in);
+    auto* state_out2      = reinterpret_cast<__nv_bfloat162*>(conv_state_out);
+    auto* out2            = reinterpret_cast<__nv_bfloat162*>(out);
+
+    __nv_bfloat162 s0       = state_in2[p];
+    __nv_bfloat162 s1       = state_in2[C2 + p];
+    __nv_bfloat162 s2       = state_in2[2 * C2 + p];
+    const __nv_bfloat162 w0 = weight2[p];
+    const __nv_bfloat162 w1 = weight2[C2 + p];
+    const __nv_bfloat162 w2 = weight2[2 * C2 + p];
+    const __nv_bfloat162 w3 = weight2[3 * C2 + p];
+
+    for (std::int32_t t = 0; t < T; ++t) {
+        const std::int64_t out_idx = static_cast<std::int64_t>(t) * C2 + p;
+        const __nv_bfloat162 x0    = x2[out_idx];
+
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        causal_conv1d_acc_pair(w0, s0, acc0, acc1);
+        causal_conv1d_acc_pair(w1, s1, acc0, acc1);
+        causal_conv1d_acc_pair(w2, s2, acc0, acc1);
+        causal_conv1d_acc_pair(w3, x0, acc0, acc1);
+
+        out2[out_idx] = __floats2bfloat162_rn(silu(acc0), silu(acc1));
+        s0            = s1;
+        s1            = s2;
+        s2            = x0;
+    }
+
+    state_out2[p]          = s0;
+    state_out2[C2 + p]     = s1;
+    state_out2[2 * C2 + p] = s2;
 }
 
 // Small-T ordinary form parallelized across both channels and tokens. Each CTA owns one channel
@@ -247,6 +327,39 @@ __global__ void causal_conv1d_decode_kernel(const __nv_bfloat16* x, const __nv_b
     }
 }
 
+__global__ void causal_conv1d_decode_pairs_kernel(const __nv_bfloat16* x,
+                                                  const __nv_bfloat16* weight,
+                                                  __nv_bfloat16* conv_state, __nv_bfloat16* out,
+                                                  std::int32_t C) {
+    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    const std::int64_t C2     = static_cast<std::int64_t>(C / 2);
+
+    const auto* x2      = reinterpret_cast<const __nv_bfloat162*>(x);
+    const auto* weight2 = reinterpret_cast<const __nv_bfloat162*>(weight);
+    auto* state2        = reinterpret_cast<__nv_bfloat162*>(conv_state);
+    auto* out2          = reinterpret_cast<__nv_bfloat162*>(out);
+
+    for (std::int64_t p = start; p < C2; p += stride) {
+        const __nv_bfloat162 s0 = state2[p];
+        const __nv_bfloat162 s1 = state2[C2 + p];
+        const __nv_bfloat162 s2 = state2[2 * C2 + p];
+        const __nv_bfloat162 x0 = x2[p];
+
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        causal_conv1d_acc_pair(weight2[p], s0, acc0, acc1);
+        causal_conv1d_acc_pair(weight2[C2 + p], s1, acc0, acc1);
+        causal_conv1d_acc_pair(weight2[2 * C2 + p], s2, acc0, acc1);
+        causal_conv1d_acc_pair(weight2[3 * C2 + p], x0, acc0, acc1);
+
+        out2[p]            = __floats2bfloat162_rn(silu(acc0), silu(acc1));
+        state2[p]          = s1;
+        state2[C2 + p]     = s2;
+        state2[2 * C2 + p] = x0;
+    }
+}
+
 __global__ void causal_conv1d_decode_distinct_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
     const __nv_bfloat16* __restrict__ conv_state_in, __nv_bfloat16* __restrict__ conv_state_out,
@@ -272,6 +385,40 @@ __global__ void causal_conv1d_decode_distinct_kernel(
         conv_state_out[c]           = s1;
         conv_state_out[C64 + c]     = s2;
         conv_state_out[2 * C64 + c] = x0;
+    }
+}
+
+__global__ void causal_conv1d_decode_distinct_pairs_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ conv_state_in, __nv_bfloat16* __restrict__ conv_state_out,
+    __nv_bfloat16* __restrict__ out, std::int32_t C) {
+    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    const std::int64_t C2     = static_cast<std::int64_t>(C / 2);
+
+    const auto* x2        = reinterpret_cast<const __nv_bfloat162*>(x);
+    const auto* weight2   = reinterpret_cast<const __nv_bfloat162*>(weight);
+    const auto* state_in2 = reinterpret_cast<const __nv_bfloat162*>(conv_state_in);
+    auto* state_out2      = reinterpret_cast<__nv_bfloat162*>(conv_state_out);
+    auto* out2            = reinterpret_cast<__nv_bfloat162*>(out);
+
+    for (std::int64_t p = start; p < C2; p += stride) {
+        const __nv_bfloat162 s0 = state_in2[p];
+        const __nv_bfloat162 s1 = state_in2[C2 + p];
+        const __nv_bfloat162 s2 = state_in2[2 * C2 + p];
+        const __nv_bfloat162 x0 = x2[p];
+
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        causal_conv1d_acc_pair(weight2[p], s0, acc0, acc1);
+        causal_conv1d_acc_pair(weight2[C2 + p], s1, acc0, acc1);
+        causal_conv1d_acc_pair(weight2[2 * C2 + p], s2, acc0, acc1);
+        causal_conv1d_acc_pair(weight2[3 * C2 + p], x0, acc0, acc1);
+
+        out2[p]                  = __floats2bfloat162_rn(silu(acc0), silu(acc1));
+        state_out2[p]            = s1;
+        state_out2[C2 + p]       = s2;
+        state_out2[2 * C2 + p]   = x0;
     }
 }
 
@@ -305,6 +452,45 @@ __global__ void causal_conv1d_snapshot_decode_kernel(
         snapshot[c]           = s1;
         snapshot[C64 + c]     = s2;
         snapshot[2 * C64 + c] = x0;
+    }
+}
+
+__global__ void causal_conv1d_snapshot_decode_pairs_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ conv_states, const std::int32_t* __restrict__ initial_slot,
+    const std::int32_t* __restrict__ snapshot_base_slot, __nv_bfloat16* __restrict__ out,
+    std::int32_t C, std::int64_t slot_stride) {
+    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    const std::int64_t C2     = static_cast<std::int64_t>(C / 2);
+    const __nv_bfloat16* init =
+        conv_states + static_cast<std::int64_t>(*initial_slot) * slot_stride;
+
+    const auto* x2      = reinterpret_cast<const __nv_bfloat162*>(x);
+    const auto* weight2 = reinterpret_cast<const __nv_bfloat162*>(weight);
+    const auto* init2   = reinterpret_cast<const __nv_bfloat162*>(init);
+    auto* out2          = reinterpret_cast<__nv_bfloat162*>(out);
+
+    for (std::int64_t p = start; p < C2; p += stride) {
+        const __nv_bfloat162 s0 = init2[p];
+        const __nv_bfloat162 s1 = init2[C2 + p];
+        const __nv_bfloat162 s2 = init2[2 * C2 + p];
+        const __nv_bfloat162 x0 = x2[p];
+
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        causal_conv1d_acc_pair(weight2[p], s0, acc0, acc1);
+        causal_conv1d_acc_pair(weight2[C2 + p], s1, acc0, acc1);
+        causal_conv1d_acc_pair(weight2[2 * C2 + p], s2, acc0, acc1);
+        causal_conv1d_acc_pair(weight2[3 * C2 + p], x0, acc0, acc1);
+
+        out2[p] = __floats2bfloat162_rn(silu(acc0), silu(acc1));
+        __nv_bfloat16* snapshot =
+            conv_states + static_cast<std::int64_t>(*snapshot_base_slot) * slot_stride;
+        auto* snapshot2       = reinterpret_cast<__nv_bfloat162*>(snapshot);
+        snapshot2[p]          = s1;
+        snapshot2[C2 + p]     = s2;
+        snapshot2[2 * C2 + p] = x0;
     }
 }
 
@@ -347,6 +533,54 @@ causal_conv1d_sequence_snapshot_kernel(const __nv_bfloat16* x, const __nv_bfloat
         snapshot[c64]           = s0;
         snapshot[C64 + c64]     = s1;
         snapshot[2 * C64 + c64] = s2;
+    }
+}
+
+__global__ void causal_conv1d_sequence_snapshot_pairs_kernel(
+    const __nv_bfloat16* x, const __nv_bfloat16* weight, __nv_bfloat16* conv_states,
+    const std::int32_t* initial_slot, const std::int32_t* snapshot_base_slot, __nv_bfloat16* out,
+    std::int32_t C, std::int32_t T, std::int64_t slot_stride) {
+    const std::int64_t p  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t C2 = static_cast<std::int64_t>(C / 2);
+    if (p >= C2) { return; }
+
+    const std::int32_t slot   = *initial_slot;
+    const __nv_bfloat16* init = conv_states + static_cast<std::int64_t>(slot) * slot_stride;
+    const auto* init2         = reinterpret_cast<const __nv_bfloat162*>(init);
+    const auto* x2            = reinterpret_cast<const __nv_bfloat162*>(x);
+    const auto* weight2       = reinterpret_cast<const __nv_bfloat162*>(weight);
+    auto* out2                = reinterpret_cast<__nv_bfloat162*>(out);
+
+    __nv_bfloat162 s0       = init2[p];
+    __nv_bfloat162 s1       = init2[C2 + p];
+    __nv_bfloat162 s2       = init2[2 * C2 + p];
+    const __nv_bfloat162 w0 = weight2[p];
+    const __nv_bfloat162 w1 = weight2[C2 + p];
+    const __nv_bfloat162 w2 = weight2[2 * C2 + p];
+    const __nv_bfloat162 w3 = weight2[3 * C2 + p];
+
+    for (std::int32_t t = 0; t < T; ++t) {
+        const std::int64_t out_idx = static_cast<std::int64_t>(t) * C2 + p;
+        const __nv_bfloat162 x0    = x2[out_idx];
+
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        causal_conv1d_acc_pair(w0, s0, acc0, acc1);
+        causal_conv1d_acc_pair(w1, s1, acc0, acc1);
+        causal_conv1d_acc_pair(w2, s2, acc0, acc1);
+        causal_conv1d_acc_pair(w3, x0, acc0, acc1);
+
+        out2[out_idx] = __floats2bfloat162_rn(silu(acc0), silu(acc1));
+        s0            = s1;
+        s1            = s2;
+        s2            = x0;
+
+        __nv_bfloat16* snapshot =
+            conv_states + static_cast<std::int64_t>(*snapshot_base_slot + t) * slot_stride;
+        auto* snapshot2       = reinterpret_cast<__nv_bfloat162*>(snapshot);
+        snapshot2[p]          = s0;
+        snapshot2[C2 + p]     = s1;
+        snapshot2[2 * C2 + p] = s2;
     }
 }
 
@@ -400,6 +634,63 @@ __global__ void causal_conv1d_batched_sequence_snapshot_kernel(
         snapshot[c64]           = s0;
         snapshot[C64 + c64]     = s1;
         snapshot[2 * C64 + c64] = s2;
+    }
+}
+
+template <bool Masked>
+__global__ void causal_conv1d_batched_sequence_snapshot_pairs_kernel(
+    const __nv_bfloat16* x, const __nv_bfloat16* weight, __nv_bfloat16* conv_states,
+    const std::int32_t* valid_columns, const std::int32_t* initial_state_slots,
+    const std::int32_t* snapshot_base_slots, __nv_bfloat16* out, std::int32_t C, std::int32_t width,
+    std::int64_t slot_stride) {
+    const std::int32_t batch = static_cast<std::int32_t>(blockIdx.y);
+    const std::int64_t p     = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t C2    = static_cast<std::int64_t>(C / 2);
+    if (p >= C2) { return; }
+
+    const std::int32_t valid = Masked ? valid_columns[batch] : width;
+    const __nv_bfloat16* init =
+        conv_states + static_cast<std::int64_t>(initial_state_slots[batch]) * slot_stride;
+    const auto* init2         = reinterpret_cast<const __nv_bfloat162*>(init);
+    const auto* x2            = reinterpret_cast<const __nv_bfloat162*>(x);
+    const auto* weight2       = reinterpret_cast<const __nv_bfloat162*>(weight);
+    auto* out2                = reinterpret_cast<__nv_bfloat162*>(out);
+
+    __nv_bfloat162 s0       = init2[p];
+    __nv_bfloat162 s1       = init2[C2 + p];
+    __nv_bfloat162 s2       = init2[2 * C2 + p];
+    const __nv_bfloat162 w0 = weight2[p];
+    const __nv_bfloat162 w1 = weight2[C2 + p];
+    const __nv_bfloat162 w2 = weight2[2 * C2 + p];
+    const __nv_bfloat162 w3 = weight2[3 * C2 + p];
+    const std::int64_t row_base = static_cast<std::int64_t>(batch) * width * C2;
+
+    for (std::int32_t column = 0; column < width; ++column) {
+        const std::int64_t out_idx = row_base + static_cast<std::int64_t>(column) * C2 + p;
+        if (column >= valid) {
+            out2[out_idx] = __floats2bfloat162_rn(0.0f, 0.0f);
+            continue;
+        }
+
+        const __nv_bfloat162 x0 = x2[out_idx];
+        float acc0              = 0.0f;
+        float acc1              = 0.0f;
+        causal_conv1d_acc_pair(w0, s0, acc0, acc1);
+        causal_conv1d_acc_pair(w1, s1, acc0, acc1);
+        causal_conv1d_acc_pair(w2, s2, acc0, acc1);
+        causal_conv1d_acc_pair(w3, x0, acc0, acc1);
+        out2[out_idx] = __floats2bfloat162_rn(silu(acc0), silu(acc1));
+        s0            = s1;
+        s1            = s2;
+        s2            = x0;
+
+        __nv_bfloat16* snapshot =
+            conv_states +
+            static_cast<std::int64_t>(snapshot_base_slots[batch] + column) * slot_stride;
+        auto* snapshot2       = reinterpret_cast<__nv_bfloat162*>(snapshot);
+        snapshot2[p]          = s0;
+        snapshot2[C2 + p]     = s1;
+        snapshot2[2 * C2 + p] = s2;
     }
 }
 
