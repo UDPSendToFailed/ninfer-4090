@@ -649,24 +649,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         // each reachable node-topology class. These bounds cover the largest profile installed in
         // each class and the driver/module state materialized while qualifying all definitions.
         if (impl->speculative_backend == SpeculativeBackend::None) {
-#if defined(NINFER_SM86) || defined(NINFER_SM89)
-            impl->graph_allowance_bytes = checked_mul(1024ULL * kMiB, impl->max_concurrency,
+            impl->graph_allowance_bytes = checked_mul(64ULL * kMiB, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
-#else
-            impl->graph_allowance_bytes = checked_mul(256ULL * kMiB, impl->max_concurrency,
-                                                      "ordinary exact-b graph allowance");
-#endif
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-#if defined(NINFER_SM86) || defined(NINFER_SM89)
-            impl->graph_allowance_bytes = checked_mul(1024ULL * kMiB, impl->max_concurrency,
-                                                      "MTP exact-b graph allowance");
-#else
             const std::size_t per_batch_allowance =
-                (impl->draft_window <= 4 ? 416ULL : (impl->draft_window == 5 ? 448ULL : 512ULL)) *
-                kMiB;
+                (impl->draft_window <= 4 ? 256ULL : 320ULL) * kMiB;
             impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
                                                       "MTP exact-b graph allowance");
-#endif
         } else {
             const auto class_allowance = [&](std::uint32_t batch_size) {
                 const auto profiles =
