@@ -50,16 +50,16 @@ struct Q6MmaDecodeAtom {
     static __device__ __forceinline__ __nv_bfloat162
     decode_pair_with_scale(const std::uint8_t* staged_codes, const std::uint8_t* staged_high,
                            float scale, std::int64_t staged_group_index, int lane) {
-        const std::uint8_t packed =
-            staged_codes[staged_group_index * Q6RowSplitStorage::kCodeBytesPerGroup + lane];
-        const std::uint8_t high_byte =
-            staged_high[staged_group_index * Q6RowSplitStorage::kHighBytesPerGroup + (lane >> 1)];
+        const std::uint32_t packed = static_cast<std::uint32_t>(
+            staged_codes[staged_group_index * Q6RowSplitStorage::kCodeBytesPerGroup + lane]);
+        const std::uint32_t high_byte = static_cast<std::uint32_t>(
+            staged_high[staged_group_index * Q6RowSplitStorage::kHighBytesPerGroup + (lane >> 1)]);
         const int shift = (lane & 1) * 4;
-        const int q0 =
-            ((static_cast<int>(packed & 0x0fu) | (((high_byte >> shift) & 3) << 4)) ^ 0x20) - 0x20;
-        const int q1 =
-            ((static_cast<int>(packed >> 4) | (((high_byte >> (shift + 2)) & 3) << 4)) ^ 0x20) -
-            0x20;
+        const std::uint32_t raw0 = (packed & 0x0fu) | (((high_byte >> shift) & 3u) << 4);
+        const std::uint32_t raw1 = (packed >> 4) | (((high_byte >> (shift + 2)) & 3u) << 4);
+        int q0, q1;
+        asm("bfe.s32 %0, %1, 0, 6;" : "=r"(q0) : "r"(raw0));
+        asm("bfe.s32 %0, %1, 0, 6;" : "=r"(q1) : "r"(raw1));
         return __floats2bfloat162_rn(static_cast<float>(q0) * scale,
                                      static_cast<float>(q1) * scale);
     }

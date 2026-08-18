@@ -54,10 +54,11 @@ struct Q4MmaDecodeAtom {
     static __device__ __forceinline__ __nv_bfloat162
     decode_pair_with_scale(const std::uint8_t* codes, float scale, std::int64_t group_index,
                            int lane) {
-        const std::uint8_t packed =
-            codes[group_index * Q4RowSplitStorage::kCodeBytesPerGroup + lane];
-        const int q0 = (static_cast<int>(packed & 0x0fu) ^ 0x08) - 0x08;
-        const int q1 = (static_cast<int>(packed >> 4) ^ 0x08) - 0x08;
+        const std::uint32_t packed =
+            static_cast<std::uint32_t>(codes[group_index * Q4RowSplitStorage::kCodeBytesPerGroup + lane]);
+        int q0, q1;
+        asm("bfe.s32 %0, %1, 0, 4;" : "=r"(q0) : "r"(packed));
+        asm("bfe.s32 %0, %1, 4, 4;" : "=r"(q1) : "r"(packed));
         return __floats2bfloat162_rn(static_cast<float>(q0) * scale,
                                      static_cast<float>(q1) * scale);
     }
