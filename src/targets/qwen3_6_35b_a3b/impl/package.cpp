@@ -90,7 +90,8 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
 Package::Frontend Package::make_frontend(const LoadedModel& model) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     return qwen3_6::make_frontend(model.impl_->data.frontend,
-                                  model.impl_->data.runtime.features.vision);
+                                  model.impl_->data.runtime.features.vision,
+                                  model.impl_->data.runtime.features.vision_max_tokens);
 }
 
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
