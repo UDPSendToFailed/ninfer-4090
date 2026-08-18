@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 
-$ReleaseTag = 'v0.9.0'
+$ReleaseTag = 'v1.0.0'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $BuildRoot = Join-Path $RepoRoot 'build-ninja'
 $DistRoot = Join-Path $RepoRoot 'dist'
