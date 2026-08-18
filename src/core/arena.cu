@@ -2,11 +2,26 @@
 
 #include <cuda_runtime.h>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <d3d12.h>
+#include <dxgi1_6.h>
+#include <wrl/client.h>
+#endif
+
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace ninfer {
 namespace {
@@ -50,6 +65,121 @@ void free_pinned(void*& ptr) noexcept {
         ptr = nullptr;
     }
 }
+
+#if defined(_WIN32)
+struct D3D12AllocationLifetime {
+    Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+    Microsoft::WRL::ComPtr<ID3D12Device3> device;
+    Microsoft::WRL::ComPtr<ID3D12Heap> heap;
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    cudaExternalMemory_t ext_mem = nullptr;
+};
+
+// Keep lifetime references alive so WDDM residency priority is never dismantled
+static std::vector<D3D12AllocationLifetime> g_d3d12_allocations;
+
+bool try_allocate_d3d12_residency_locked(std::size_t capacity_bytes, void*& out_ptr) {
+    D3D12AllocationLifetime res;
+
+    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&res.factory)))) { return false; }
+
+    // Match DXGI Adapter with current CUDA Device LUID
+    int device_id = 0;
+    if (cudaGetDevice(&device_id) != cudaSuccess) { return false; }
+    cudaDeviceProp props{};
+    if (cudaGetDeviceProperties(&props, device_id) != cudaSuccess) { return false; }
+
+    LUID cuda_luid{};
+    std::memcpy(&cuda_luid, props.luid, sizeof(LUID));
+
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> cur_adapter;
+    for (UINT i = 0; res.factory->EnumAdapters1(i, &cur_adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC1 desc{};
+        cur_adapter->GetDesc1(&desc);
+        if (desc.AdapterLuid.LowPart == cuda_luid.LowPart &&
+            desc.AdapterLuid.HighPart == cuda_luid.HighPart) {
+            res.adapter = cur_adapter;
+            break;
+        }
+    }
+    if (!res.adapter) { return false; }
+
+    Microsoft::WRL::ComPtr<ID3D12Device> base_device;
+    if (FAILED(D3D12CreateDevice(res.adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&base_device)))) {
+        return false;
+    }
+    if (FAILED(base_device.As(&res.device))) { return false; }
+
+    constexpr std::size_t kD3D12Alignment = 64 * 1024;
+    const std::size_t aligned_size =
+        ((capacity_bytes + kD3D12Alignment - 1) / kD3D12Alignment) * kD3D12Alignment;
+
+    D3D12_HEAP_DESC desc = {};
+    desc.SizeInBytes = aligned_size;
+    desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    desc.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    desc.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    desc.Flags = D3D12_HEAP_FLAG_SHARED;
+
+    if (FAILED(res.device->CreateHeap(&desc, IID_PPV_ARGS(&res.heap)))) { return false; }
+
+    // 1. Set priority to MAXIMUM/CRITICAL (places NInfer above normal desktop apps)
+    ID3D12Pageable* pageable = res.heap.Get();
+    const D3D12_RESIDENCY_PRIORITY priority =
+        static_cast<D3D12_RESIDENCY_PRIORITY>(0xc8000000); // D3D12_RESIDENCY_PRIORITY_MAXIMUM
+    res.device->SetResidencyPriority(1, &pageable, &priority);
+
+    // 2. Deny overbudget paging (forbid WDDM from paging this heap to GART / System RAM)
+    if (FAILED(res.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&res.fence)))) { return false; }
+    if (FAILED(res.device->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET, 1, &pageable, res.fence.Get(), 1))) {
+        return false;
+    }
+
+    // 3. Create shared handle for CUDA import
+    HANDLE shared_handle = nullptr;
+    if (FAILED(res.device->CreateSharedHandle(res.heap.Get(), nullptr, GENERIC_ALL, nullptr, &shared_handle))) {
+        return false;
+    }
+
+    // 4. Import into CUDA
+    cudaExternalMemoryHandleDesc ext_desc = {};
+    ext_desc.type = cudaExternalMemoryHandleTypeD3D12Heap;
+    ext_desc.handle.win32.handle = shared_handle;
+    ext_desc.size = aligned_size;
+    ext_desc.flags = cudaExternalMemoryDedicated;
+
+    cudaExternalMemory_t ext_mem = nullptr;
+    const cudaError_t import_err = cudaImportExternalMemory(&ext_mem, &ext_desc);
+    CloseHandle(shared_handle); // Safe to close immediately after import
+    if (import_err != cudaSuccess) { return false; }
+
+    res.ext_mem = ext_mem;
+
+    cudaExternalMemoryBufferDesc buf_desc = {};
+    buf_desc.offset = 0;
+    buf_desc.size = capacity_bytes;
+    buf_desc.flags = 0;
+
+    void* dev_ptr = nullptr;
+    if (cudaExternalMemoryGetMappedBuffer(&dev_ptr, ext_mem, &buf_desc) != cudaSuccess) {
+        cudaDestroyExternalMemory(ext_mem);
+        return false;
+    }
+
+    // Eagerly touch physical pages to commit them
+    if (cudaMemset(dev_ptr, 0, capacity_bytes) != cudaSuccess) {
+        cudaFree(dev_ptr);
+        cudaDestroyExternalMemory(ext_mem);
+        return false;
+    }
+
+    out_ptr = dev_ptr;
+    g_d3d12_allocations.push_back(std::move(res));
+    return true;
+}
+#endif
 
 } // namespace
 
@@ -136,10 +266,27 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
         throw std::invalid_argument("DeviceArena capacity must be nonzero");
     }
 
-    void* ptr             = nullptr;
-    const cudaError_t err = cudaMalloc(&ptr, capacity_bytes);
-    if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
+    void* ptr = nullptr;
+#if defined(_WIN32)
+    if (!try_allocate_d3d12_residency_locked(capacity_bytes, ptr)) {
+        ptr = nullptr;
+    }
+#endif
+
+    if (ptr == nullptr) {
+        const cudaError_t err = cudaMalloc(&ptr, capacity_bytes);
+        if (err != cudaSuccess) {
+            throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
+        }
+
+#if defined(_WIN32)
+        // Eagerly touch allocated pages to force WDDM to fault physical VRAM and evict background apps
+        const cudaError_t set_err = cudaMemset(ptr, 0, capacity_bytes);
+        if (set_err != cudaSuccess) {
+            free_device(ptr);
+            throw std::runtime_error(cuda_error_message("cudaMemset failed", set_err));
+        }
+#endif
     }
 
     base_ = ptr;

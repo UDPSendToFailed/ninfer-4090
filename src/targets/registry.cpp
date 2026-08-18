@@ -63,6 +63,17 @@ std::size_t runtime_bytes_after_planned_weights(std::uint64_t weight_bytes) {
     std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+#if defined(_WIN32)
+    // Allow WDDM to evict background apps down to a 512 MiB non-evictable DWM display floor
+    constexpr std::size_t kMinDwmHeadroom = 512ULL * 1024ULL * 1024ULL;
+    if (total_bytes > weight_bytes + kMinDwmHeadroom) {
+        const std::size_t evictable_capacity =
+            total_bytes - static_cast<std::size_t>(weight_bytes) - kMinDwmHeadroom;
+        const std::size_t free_after_weights =
+            free_bytes > weight_bytes ? free_bytes - static_cast<std::size_t>(weight_bytes) : 0;
+        return std::max(free_after_weights, evictable_capacity);
+    }
+#endif
     if (weight_bytes > free_bytes) {
         throw std::invalid_argument("model weights require " + std::to_string(weight_bytes) +
                                     " bytes of device memory, but only " +
@@ -72,10 +83,20 @@ std::size_t runtime_bytes_after_planned_weights(std::uint64_t weight_bytes) {
     return free_bytes - static_cast<std::size_t>(weight_bytes);
 }
 
-std::size_t current_free_device_bytes() {
+std::size_t current_free_device_bytes(std::size_t weights_bytes = 0) {
     std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+#if defined(_WIN32)
+    if (weights_bytes > 0) {
+        // Allow WDDM to evict background apps down to a 512 MiB non-evictable DWM display floor
+        constexpr std::size_t kMinDwmHeadroom = 512ULL * 1024ULL * 1024ULL;
+        if (total_bytes > weights_bytes + kMinDwmHeadroom) {
+            const std::size_t evictable_free = total_bytes - weights_bytes - kMinDwmHeadroom;
+            return std::max(free_bytes, evictable_free);
+        }
+    }
+#endif
     return free_bytes;
 }
 
@@ -102,8 +123,9 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
     auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
     device.synchronize();
-    runtime::KvCapacityResolution capacity_resolution =
-        runtime::resolve_kv_capacity(options.kv_capacity, curve, current_free_device_bytes());
+    const std::size_t weights_capacity_bytes = stats.h2d_bytes;
+    runtime::KvCapacityResolution capacity_resolution = runtime::resolve_kv_capacity(
+        options.kv_capacity, curve, current_free_device_bytes(weights_capacity_bytes));
     auto sequence_plan = std::move(sequence_planner).finalize(capacity_resolution.main_page_groups);
     if (sequence_plan.device_reservation_bytes() != capacity_resolution.runtime_reservation_bytes ||
         sequence_plan.kv_capacity() != capacity_resolution.resolved_tokens) {
