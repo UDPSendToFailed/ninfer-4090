@@ -54,10 +54,15 @@ struct GqaPrefillBatchMetadata {
 };
 
 template <typename Geometry>
+__device__ __forceinline__ std::int64_t gqa_prefill_q_row_offset(int q_head, int token) {
+    return static_cast<std::int64_t>(kGqaPrefillHeadDim) *
+           (static_cast<std::int64_t>(q_head) +
+            static_cast<std::int64_t>(Geometry::QHeads) * token);
+}
+
+template <typename Geometry>
 __device__ __forceinline__ std::int64_t gqa_prefill_q_index(int q_head, int d, int token) {
-    return static_cast<std::int64_t>(d) + static_cast<std::int64_t>(kGqaPrefillHeadDim) *
-                                              (static_cast<std::int64_t>(q_head) +
-                                               static_cast<std::int64_t>(Geometry::QHeads) * token);
+    return static_cast<std::int64_t>(d) + gqa_prefill_q_row_offset<Geometry>(q_head, token);
 }
 
 template <typename Geometry>
@@ -67,8 +72,8 @@ __device__ __forceinline__ void gqa_prefill_zero_output_rows(__nv_bfloat16* out,
     if (row_begin >= row_end) { return; }
     const int elements = (row_end - row_begin) * kGqaPrefillHeadDim;
     for (int element = tid; element < elements; element += threads) {
-        const int row = row_begin + element / kGqaPrefillHeadDim;
-        const int d   = element - (row - row_begin) * kGqaPrefillHeadDim;
+        const int row = row_begin + (element >> 8);
+        const int d   = element & 255;
         out[gqa_prefill_q_index<Geometry>(q_head, d, row)] = __float2bfloat16(0.0f);
     }
 }
