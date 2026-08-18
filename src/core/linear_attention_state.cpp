@@ -197,29 +197,129 @@ void LinearAttentionStatePool::copy_slot(std::int32_t src, std::int32_t dst, cud
     validate_layer_slot(*this, 0, src, "LinearAttentionStatePool copy_slot source");
     validate_layer_slot(*this, 0, dst, "LinearAttentionStatePool copy_slot destination");
     if (src == dst) { return; }
-    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
-        const Tensor source      = conv_slot(layer, src);
-        const Tensor destination = conv_slot(layer, dst);
-        CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, source.bytes(),
+    const std::uint32_t layers = layer_count();
+    if (layers == 0) { return; }
+
+    const std::size_t conv_bytes = conv_slot(0, src).bytes();
+    const std::size_t rec_bytes  = recurrent_slot(0, src).bytes();
+
+    if (layers == 1) {
+        CUDA_CHECK(cudaMemcpyAsync(conv_slot(0, dst).data, conv_slot(0, src).data, conv_bytes,
                                    cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(recurrent_slot(0, dst).data, recurrent_slot(0, src).data,
+                                   rec_bytes, cudaMemcpyDeviceToDevice, stream));
+        return;
     }
-    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
-        const Tensor source      = recurrent_slot(layer, src);
-        const Tensor destination = recurrent_slot(layer, dst);
-        CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, source.bytes(),
-                                   cudaMemcpyDeviceToDevice, stream));
+
+    bool uniform_conv       = true;
+    const auto conv_first   = reinterpret_cast<std::uintptr_t>(conv[0].data);
+    const auto conv_second  = reinterpret_cast<std::uintptr_t>(conv[1].data);
+    const auto conv_stride  = static_cast<std::size_t>(conv_second - conv_first);
+    for (std::size_t l = 2; l < layers; ++l) {
+        if (reinterpret_cast<std::uintptr_t>(conv[l].data) -
+                reinterpret_cast<std::uintptr_t>(conv[l - 1].data) !=
+            conv_stride) {
+            uniform_conv = false;
+            break;
+        }
+    }
+
+    if (uniform_conv) {
+        CUDA_CHECK(cudaMemcpy2DAsync(conv_slot(0, dst).data, conv_stride, conv_slot(0, src).data,
+                                     conv_stride, conv_bytes, layers, cudaMemcpyDeviceToDevice,
+                                     stream));
+    } else {
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            const Tensor source      = conv_slot(layer, src);
+            const Tensor destination = conv_slot(layer, dst);
+            CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, conv_bytes,
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+    }
+
+    bool uniform_rec       = true;
+    const auto rec_first   = reinterpret_cast<std::uintptr_t>(recurrent[0].data);
+    const auto rec_second  = reinterpret_cast<std::uintptr_t>(recurrent[1].data);
+    const auto rec_stride  = static_cast<std::size_t>(rec_second - rec_first);
+    for (std::size_t l = 2; l < layers; ++l) {
+        if (reinterpret_cast<std::uintptr_t>(recurrent[l].data) -
+                reinterpret_cast<std::uintptr_t>(recurrent[l - 1].data) !=
+            rec_stride) {
+            uniform_rec = false;
+            break;
+        }
+    }
+
+    if (uniform_rec) {
+        CUDA_CHECK(cudaMemcpy2DAsync(recurrent_slot(0, dst).data, rec_stride,
+                                     recurrent_slot(0, src).data, rec_stride, rec_bytes, layers,
+                                     cudaMemcpyDeviceToDevice, stream));
+    } else {
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            const Tensor source      = recurrent_slot(layer, src);
+            const Tensor destination = recurrent_slot(layer, dst);
+            CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, rec_bytes,
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
     }
 }
 
 void LinearAttentionStatePool::zero_slot(std::int32_t slot, cudaStream_t stream) {
     validate_layer_slot(*this, 0, slot, "LinearAttentionStatePool zero_slot");
-    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
-        const Tensor state = conv_slot(layer, slot);
-        CUDA_CHECK(cudaMemsetAsync(state.data, 0, state.bytes(), stream));
+    const std::uint32_t layers = layer_count();
+    if (layers == 0) { return; }
+
+    const std::size_t conv_bytes = conv_slot(0, slot).bytes();
+    const std::size_t rec_bytes  = recurrent_slot(0, slot).bytes();
+
+    if (layers == 1) {
+        CUDA_CHECK(cudaMemsetAsync(conv_slot(0, slot).data, 0, conv_bytes, stream));
+        CUDA_CHECK(cudaMemsetAsync(recurrent_slot(0, slot).data, 0, rec_bytes, stream));
+        return;
     }
-    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
-        const Tensor state = recurrent_slot(layer, slot);
-        CUDA_CHECK(cudaMemsetAsync(state.data, 0, state.bytes(), stream));
+
+    bool uniform_conv      = true;
+    const auto conv_first  = reinterpret_cast<std::uintptr_t>(conv[0].data);
+    const auto conv_second = reinterpret_cast<std::uintptr_t>(conv[1].data);
+    const auto conv_stride = static_cast<std::size_t>(conv_second - conv_first);
+    for (std::size_t l = 2; l < layers; ++l) {
+        if (reinterpret_cast<std::uintptr_t>(conv[l].data) -
+                reinterpret_cast<std::uintptr_t>(conv[l - 1].data) !=
+            conv_stride) {
+            uniform_conv = false;
+            break;
+        }
+    }
+
+    if (uniform_conv) {
+        CUDA_CHECK(cudaMemset2DAsync(conv_slot(0, slot).data, conv_stride, 0, conv_bytes, layers,
+                                     stream));
+    } else {
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            CUDA_CHECK(cudaMemsetAsync(conv_slot(layer, slot).data, 0, conv_bytes, stream));
+        }
+    }
+
+    bool uniform_rec      = true;
+    const auto rec_first  = reinterpret_cast<std::uintptr_t>(recurrent[0].data);
+    const auto rec_second = reinterpret_cast<std::uintptr_t>(recurrent[1].data);
+    const auto rec_stride = static_cast<std::size_t>(rec_second - rec_first);
+    for (std::size_t l = 2; l < layers; ++l) {
+        if (reinterpret_cast<std::uintptr_t>(recurrent[l].data) -
+                reinterpret_cast<std::uintptr_t>(recurrent[l - 1].data) !=
+            rec_stride) {
+            uniform_rec = false;
+            break;
+        }
+    }
+
+    if (uniform_rec) {
+        CUDA_CHECK(cudaMemset2DAsync(recurrent_slot(0, slot).data, rec_stride, 0, rec_bytes,
+                                     layers, stream));
+    } else {
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            CUDA_CHECK(cudaMemsetAsync(recurrent_slot(layer, slot).data, 0, rec_bytes, stream));
+        }
     }
 }
 

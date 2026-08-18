@@ -110,15 +110,96 @@ void CyclicKVCache::copy_lane_from(const CyclicKVCache& source, std::int32_t lan
     if (lane < 0 || lane >= lane_capacity_) {
         throw std::out_of_range("Cyclic KV lane is out of range");
     }
-    for (std::size_t layer = 0; layer < k_.size(); ++layer) {
-        Tensor destination_k = k_[layer].slice(3, lane, 1);
-        Tensor destination_v = v_[layer].slice(3, lane, 1);
-        Tensor source_k      = source.k_[layer].slice(3, lane, 1);
-        Tensor source_v      = source.v_[layer].slice(3, lane, 1);
-        CUDA_CHECK(cudaMemcpyAsync(destination_k.data, source_k.data, destination_k.bytes(),
+    const std::size_t layers = k_.size();
+    if (layers == 0) { return; }
+
+    const std::size_t lane_bytes = k_[0].slice(3, lane, 1).bytes();
+    if (layers == 1) {
+        Tensor destination_k = k_[0].slice(3, lane, 1);
+        Tensor destination_v = v_[0].slice(3, lane, 1);
+        Tensor source_k      = source.k_[0].slice(3, lane, 1);
+        Tensor source_v      = source.v_[0].slice(3, lane, 1);
+        CUDA_CHECK(cudaMemcpyAsync(destination_k.data, source_k.data, lane_bytes,
                                    cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(destination_v.data, source_v.data, destination_v.bytes(),
+        CUDA_CHECK(cudaMemcpyAsync(destination_v.data, source_v.data, lane_bytes,
                                    cudaMemcpyDeviceToDevice, stream));
+        return;
+    }
+
+    bool uniform_k          = true;
+    const auto dst_k_first  = reinterpret_cast<std::uintptr_t>(k_[0].data);
+    const auto dst_k_second = reinterpret_cast<std::uintptr_t>(k_[1].data);
+    const auto dst_k_stride = static_cast<std::size_t>(dst_k_second - dst_k_first);
+    const auto src_k_first  = reinterpret_cast<std::uintptr_t>(source.k_[0].data);
+    const auto src_k_second = reinterpret_cast<std::uintptr_t>(source.k_[1].data);
+    const auto src_k_stride = static_cast<std::size_t>(src_k_second - src_k_first);
+
+    if (dst_k_stride != src_k_stride) {
+        uniform_k = false;
+    } else {
+        for (std::size_t l = 2; l < layers; ++l) {
+            if (reinterpret_cast<std::uintptr_t>(k_[l].data) -
+                    reinterpret_cast<std::uintptr_t>(k_[l - 1].data) !=
+                dst_k_stride ||
+                reinterpret_cast<std::uintptr_t>(source.k_[l].data) -
+                    reinterpret_cast<std::uintptr_t>(source.k_[l - 1].data) !=
+                src_k_stride) {
+                uniform_k = false;
+                break;
+            }
+        }
+    }
+
+    if (uniform_k) {
+        Tensor destination_k = k_[0].slice(3, lane, 1);
+        Tensor source_k      = source.k_[0].slice(3, lane, 1);
+        CUDA_CHECK(cudaMemcpy2DAsync(destination_k.data, dst_k_stride, source_k.data, src_k_stride,
+                                     lane_bytes, layers, cudaMemcpyDeviceToDevice, stream));
+    } else {
+        for (std::size_t layer = 0; layer < layers; ++layer) {
+            Tensor destination_k = k_[layer].slice(3, lane, 1);
+            Tensor source_k      = source.k_[layer].slice(3, lane, 1);
+            CUDA_CHECK(cudaMemcpyAsync(destination_k.data, source_k.data, lane_bytes,
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+    }
+
+    bool uniform_v          = true;
+    const auto dst_v_first  = reinterpret_cast<std::uintptr_t>(v_[0].data);
+    const auto dst_v_second = reinterpret_cast<std::uintptr_t>(v_[1].data);
+    const auto dst_v_stride = static_cast<std::size_t>(dst_v_second - dst_v_first);
+    const auto src_v_first  = reinterpret_cast<std::uintptr_t>(source.v_[0].data);
+    const auto src_v_second = reinterpret_cast<std::uintptr_t>(source.v_[1].data);
+    const auto src_v_stride = static_cast<std::size_t>(src_v_second - src_v_first);
+
+    if (dst_v_stride != src_v_stride) {
+        uniform_v = false;
+    } else {
+        for (std::size_t l = 2; l < layers; ++l) {
+            if (reinterpret_cast<std::uintptr_t>(v_[l].data) -
+                    reinterpret_cast<std::uintptr_t>(v_[l - 1].data) !=
+                dst_v_stride ||
+                reinterpret_cast<std::uintptr_t>(source.v_[l].data) -
+                    reinterpret_cast<std::uintptr_t>(source.v_[l - 1].data) !=
+                src_v_stride) {
+                uniform_v = false;
+                break;
+            }
+        }
+    }
+
+    if (uniform_v) {
+        Tensor destination_v = v_[0].slice(3, lane, 1);
+        Tensor source_v      = source.v_[0].slice(3, lane, 1);
+        CUDA_CHECK(cudaMemcpy2DAsync(destination_v.data, dst_v_stride, source_v.data, src_v_stride,
+                                     lane_bytes, layers, cudaMemcpyDeviceToDevice, stream));
+    } else {
+        for (std::size_t layer = 0; layer < layers; ++layer) {
+            Tensor destination_v = v_[layer].slice(3, lane, 1);
+            Tensor source_v      = source.v_[layer].slice(3, lane, 1);
+            CUDA_CHECK(cudaMemcpyAsync(destination_v.data, source_v.data, lane_bytes,
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
     }
 }
 

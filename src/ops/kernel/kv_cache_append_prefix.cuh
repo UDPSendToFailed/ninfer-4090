@@ -18,14 +18,15 @@ __device__ __forceinline__ void kv_cache_append_prefix_copy_cyclic_unit(
     int unit_in_token, int slot, int padded_capacity) {
     constexpr int Bf16PerUnit  = 16;
     constexpr int UnitsPerHead = kKVCacheAppendPrefixHeadDim / Bf16PerUnit;
-    const int kv_head          = unit_in_token / UnitsPerHead;
-    const int d                = (unit_in_token - kv_head * UnitsPerHead) * Bf16PerUnit;
+    static_assert(UnitsPerHead == 8);
+    const int kv_head = unit_in_token >> 3;
+    const int d       = (unit_in_token & 7) << 4;
     const std::int64_t src =
-        static_cast<std::int64_t>(d) + static_cast<std::int64_t>(kKVCacheAppendPrefixHeadDim) *
-                                           (kv_head + kKVCacheAppendPrefixHeads * token);
-    const std::int64_t dst = static_cast<std::int64_t>(d) +
-                             static_cast<std::int64_t>(kKVCacheAppendPrefixHeadDim) *
-                                 (slot + static_cast<std::int64_t>(padded_capacity) * kv_head);
+        static_cast<std::int64_t>(d) +
+        (static_cast<std::int64_t>(kv_head + (token << 3)) << 7);
+    const std::int64_t dst =
+        static_cast<std::int64_t>(d) +
+        (static_cast<std::int64_t>(slot + static_cast<std::int64_t>(padded_capacity) * kv_head) << 7);
 
     const int4 k0                               = *reinterpret_cast<const int4*>(&k[src]);
     const int4 v0                               = *reinterpret_cast<const int4*>(&v[src]);
@@ -43,15 +44,16 @@ __device__ __forceinline__ void kv_cache_append_prefix_copy_paged_unit(
     int unit_in_token, int page_offset, int physical_page, int physical_pages) {
     constexpr int Bf16PerUnit  = 16;
     constexpr int UnitsPerHead = kKVCacheAppendPrefixHeadDim / Bf16PerUnit;
-    const int kv_head          = unit_in_token / UnitsPerHead;
-    const int d                = (unit_in_token - kv_head * UnitsPerHead) * Bf16PerUnit;
+    static_assert(UnitsPerHead == 8);
+    static_assert(kKVCacheAppendPrefixPage == 64);
+    const int kv_head = unit_in_token >> 3;
+    const int d       = (unit_in_token & 7) << 4;
     const std::int64_t src =
-        static_cast<std::int64_t>(d) + static_cast<std::int64_t>(kKVCacheAppendPrefixHeadDim) *
-                                           (kv_head + kKVCacheAppendPrefixHeads * token);
+        static_cast<std::int64_t>(d) +
+        (static_cast<std::int64_t>(kv_head + (token << 3)) << 7);
     const std::int64_t dst =
         static_cast<std::int64_t>(d) +
-        static_cast<std::int64_t>(kKVCacheAppendPrefixHeadDim) *
-            (page_offset + kKVCacheAppendPrefixPage * (physical_page + physical_pages * kv_head));
+        (static_cast<std::int64_t>(page_offset + ((physical_page + physical_pages * kv_head) << 6)) << 7);
 
     const int4 k0                               = *reinterpret_cast<const int4*>(&k[src]);
     const int4 v0                               = *reinterpret_cast<const int4*>(&v[src]);
