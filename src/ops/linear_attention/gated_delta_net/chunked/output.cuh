@@ -237,6 +237,17 @@ output_job(const __nv_bfloat16* __restrict__ q_in,
     for (int nt = 0; nt < N_TILES_BT; ++nt) {
         const int s0     = nt * MMA_N + 2 * lane_t;
         const int s1     = s0 + 1;
+
+        // If the entire tile column is strictly above the lower triangle for both row_g0 and row_g1,
+        // s0 > row_g1 >= row_g0 and s1 > row_g1 >= row_g0. All entries are strictly 0.0f.
+        if (nt * MMA_N > row_g1) {
+            A_strip[nt][0] = 0.0f;
+            A_strip[nt][1] = 0.0f;
+            A_strip[nt][2] = 0.0f;
+            A_strip[nt][3] = 0.0f;
+            continue;
+        }
+
         const float g_s0 = g_smem[s0];
         const float g_s1 = g_smem[s1];
 

@@ -370,8 +370,9 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
                     const int d_global = d_off + d_local;
                     __nv_bfloat16* out =
                         &h_chunk[hc_base + (int64_t)d_global * kStateDim + k_row_off + k_off];
-                    store_vec(out, __floats2bfloat162_rn(val.x, val.y));
-                    store_vec(out + 2, __floats2bfloat162_rn(val.z, val.w));
+                    const Bf16x4Pack pack{__floats2bfloat162_rn(val.x, val.y),
+                                          __floats2bfloat162_rn(val.z, val.w)};
+                    store_vec(out, pack);
                 }
             }
 
