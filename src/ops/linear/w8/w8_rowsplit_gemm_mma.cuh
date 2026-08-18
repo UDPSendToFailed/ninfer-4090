@@ -151,11 +151,11 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                 kSwiGlu ? m0 + (row % (BM / 2)) + (row >= BM / 2 ? m / 2 : 0) : m0 + row;
             auto* dst = &Cr[row * BK + chunk * 16];
             if constexpr (Full) {
-                const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
+                const std::int64_t gi = (static_cast<std::int64_t>(grow) * kg + g0);
                 cp_async<16, Cache::cg>(dst, &codes[gi * 32 + chunk * 16]);
             } else {
                 const bool valid_row  = output_tile.valid(grow, m);
-                const std::int64_t gi = static_cast<std::int64_t>(valid_row ? grow : 0) * kg + g0;
+                const std::int64_t gi = (static_cast<std::int64_t>(valid_row ? grow : 0) * kg + g0);
                 ninfer::ops::cp_async_zfill<16>(dst, &codes[gi * 32 + chunk * 16],
                                                 valid_row ? 16 : 0);
             }
@@ -166,13 +166,13 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                     kSwiGlu ? m0 + (row % (BM / 2)) + (row >= BM / 2 ? m / 2 : 0) : m0 + row;
                 auto* dst = &Sr[row * Cfg::SCALE_CACHE_BYTES];
                 if constexpr (Full) {
-                    const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
+                    const std::int64_t gi = (static_cast<std::int64_t>(grow) * kg + g0);
                     cp_async<16, Cache::cg>(dst, &scales[gi * 2]);
                 } else {
                     const bool valid_row   = output_tile.valid(grow, m);
                     const int valid_scales = valid_row && g0 < kg ? min(8, kg - g0) : 0;
                     const std::int64_t gi =
-                        static_cast<std::int64_t>(valid_row ? grow : 0) * kg + min(g0, kg - 1);
+                        (static_cast<std::int64_t>(valid_row ? grow : 0) * kg) + min(g0, kg - 1);
                     ninfer::ops::cp_async_zfill<16>(dst, &scales[gi * 2], valid_scales * 2);
                 }
             }
