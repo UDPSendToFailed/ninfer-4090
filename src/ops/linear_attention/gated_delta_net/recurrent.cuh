@@ -169,9 +169,11 @@ __device__ __forceinline__ void normalize_qk_lane(float (&value)[kQkPerLane], in
         float sum = 0.0f;
 #pragma unroll
         for (int i = 0; i < kQkPerLane; ++i) { sum += value[i] * value[i]; }
-        sum       = warp_reduce_sum(sum);
-        float inv = lane == 0 ? rsqrtf(sum + kQkL2NormEps) : 0.0f;
-        inv       = __shfl_sync(kFullWarpMask, inv, 0);
+#pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            sum += __shfl_xor_sync(0xffffffff, sum, mask, kWarpSize);
+        }
+        const float inv = rsqrtf(sum + kQkL2NormEps);
 #pragma unroll
         for (int i = 0; i < kQkPerLane; ++i) { value[i] *= inv; }
     }
@@ -180,20 +182,14 @@ __device__ __forceinline__ void normalize_qk_lane(float (&value)[kQkPerLane], in
 __device__ __forceinline__ RawValuePack load_value_pack(const __nv_bfloat16* base, int lane,
                                                         std::uint32_t dv_base) {
     RawValuePack out;
-    Bf16x4Pack pack;
-    if (lane == 0) {
-        pack = load_vec<Bf16x4Pack>(base + dv_base);
-    }
-    const __nv_bfloat162 p0 = __shfl_sync(kFullWarpMask, pack.pair[0], 0);
-    const __nv_bfloat162 p1 = __shfl_sync(kFullWarpMask, pack.pair[1], 0);
-    out.bits.pair[0]        = p0;
-    out.bits.pair[1]        = p1;
-    const float2 lo         = bf16x2_to_float2(p0);
-    const float2 hi         = bf16x2_to_float2(p1);
-    out.value[0]            = lo.x;
-    out.value[1]            = lo.y;
-    out.value[2]            = hi.x;
-    out.value[3]            = hi.y;
+    const Bf16x4Pack pack = load_vec<Bf16x4Pack>(base + dv_base);
+    out.bits              = pack;
+    const float2 lo       = bf16x2_to_float2(pack.pair[0]);
+    const float2 hi       = bf16x2_to_float2(pack.pair[1]);
+    out.value[0]          = lo.x;
+    out.value[1]          = lo.y;
+    out.value[2]          = hi.x;
+    out.value[3]          = hi.y;
     return out;
 }
 
@@ -234,7 +230,7 @@ __device__ __forceinline__ void apply_gdn_transition(float (&state)[kDvPerWarp][
 
 #pragma unroll
     for (int r = 0; r < kDvPerWarp; ++r) {
-        const float delta = beta * (v[r] - alpha * partial[r]);
+        const float delta = beta * fmaf(-alpha, partial[r], v[r]);
 #pragma unroll
         for (int c = 0; c < kQkPerLane; ++c) {
             state[r][c] = fmaf(delta, key[c], alpha * state[r][c]);
