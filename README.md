@@ -139,6 +139,12 @@ cmd /c "call ""C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC
 
 ---
 
+## Disclaimer
+
+This is a fork of NInfer I am developing for fun to push the limits of the speed and context window for Qwen 3.8 27B on the RTX 4090. Things might break or regress with updates, I offer no guarantees, use this at your own risk.
+
+Co-developed with Gemini 3.7 Flash.
+
 ## License & Credits
 
 * Apache License 2.0.
