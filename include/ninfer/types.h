@@ -398,6 +398,11 @@ struct MemorySummary {
     std::size_t cuda_graph_allowance_bytes        = 0;
     std::size_t cuda_graph_observed_bytes         = 0;
     std::size_t kv_payload_bytes                  = 0;
+    std::size_t text_kv_bytes                     = 0;
+    std::size_t mtp_kv_bytes                      = 0;
+    std::size_t gdn_state_bytes                   = 0;
+    std::size_t dflash_kv_bytes                   = 0;
+    std::size_t replay_records_bytes              = 0;
 };
 
 // Monotonic execution counters plus one boundary-consistent scheduler snapshot. Consumers derive

@@ -25,6 +25,13 @@ struct LinearAttentionStatePoolLayout {
     LinearAttentionStatePoolSpec spec;
     std::vector<LayoutRegion> conv;
     std::vector<LayoutRegion> recurrent;
+
+    [[nodiscard]] std::size_t payload_bytes() const noexcept {
+        std::size_t sum = 0;
+        for (const auto& r : conv) { sum += r.bytes; }
+        for (const auto& r : recurrent) { sum += r.bytes; }
+        return sum;
+    }
 };
 
 struct LinearAttentionStateAllLayersView {

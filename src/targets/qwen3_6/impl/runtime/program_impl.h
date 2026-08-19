@@ -190,6 +190,14 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
+      text_kv_bytes(plan.persistent.decoder.text_kv.payload_bytes()),
+      mtp_kv_bytes(plan.persistent.decoder.mtp_kv ? plan.persistent.decoder.mtp_kv->payload_bytes()
+                                                  : 0),
+      gdn_state_bytes(plan.persistent.decoder.linear_attention.payload_bytes()),
+      dflash_kv_bytes(plan.persistent.dflash ? plan.persistent.dflash->kv_payload_bytes() : 0),
+      replay_records_bytes(plan.persistent.replay_records
+                               ? plan.persistent.replay_records->payload_bytes()
+                               : 0),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}),
@@ -2208,6 +2216,11 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
     out.cuda_graph_observed_bytes    = graph_observed_bytes;
     out.kv_payload_bytes             = kv_payload_bytes;
+    out.text_kv_bytes                = text_kv_bytes;
+    out.mtp_kv_bytes                 = mtp_kv_bytes;
+    out.gdn_state_bytes              = gdn_state_bytes;
+    out.dflash_kv_bytes              = dflash_kv_bytes;
+    out.replay_records_bytes         = replay_records_bytes;
     return out;
 }
 

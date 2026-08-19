@@ -87,6 +87,24 @@ int main(int argc, char** argv) {
                  << format_bytes(memory.cuda_graph_allowance_bytes);
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, capacity.str());
 
+        std::ostringstream pools;
+        pools << "state pools: text-kv=" << format_bytes(memory.text_kv_bytes);
+        if (memory.mtp_kv_bytes > 0) {
+            pools << " mtp-kv=" << format_bytes(memory.mtp_kv_bytes);
+        }
+        if (memory.dflash_kv_bytes > 0) {
+            pools << " dflash-kv=" << format_bytes(memory.dflash_kv_bytes);
+        }
+        if (memory.gdn_state_bytes > 0) {
+            pools << " gdn-state=" << format_bytes(memory.gdn_state_bytes);
+        }
+        if (memory.replay_records_bytes > 0) {
+            pools << " replay-records=" << format_bytes(memory.replay_records_bytes);
+        }
+        pools << " persistent-arena=" << format_bytes(memory.sequence.capacity_bytes)
+              << " workspace=" << format_bytes(memory.workspace.capacity_bytes);
+        ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, pools.str());
+
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, "warming up...");
         service.warmup();
 
