@@ -283,27 +283,10 @@ void q4_rowsplit_gemm_mma_kernel(
                                                         ? ((scale_group + group) & 1) *
                                                               Q4RowSplitStorage::kScaleBytesPerGroup
                                                         : 0)];
-                const float scale = __shfl_sync(
-                    0xffffffff,
-                    (lane == 0)
-                        ? __half2float(
-                              __ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scale_ptr)))
-                        : 0.0f,
-                    0);
-
-                const auto* staged_codes32 = reinterpret_cast<const std::uint32_t*>(
-                    &Cr[stage][staged_group * Q4RowSplitStorage::kCodeBytesPerGroup]);
-
-                const std::uint32_t cr_word =
-                    __shfl_sync(0xffffffff, (lane < 8) ? staged_codes32[lane] : 0u, lane >> 2);
-                const std::uint32_t packed = (cr_word >> ((lane & 3) * 8)) & 0xffu;
-
-                int q0, q1;
-                asm("bfe.s32 %0, %1, 0, 4;" : "=r"(q0) : "r"(packed));
-                asm("bfe.s32 %0, %1, 4, 4;" : "=r"(q1) : "r"(packed));
-                const __nv_bfloat162 weights = __floats2bfloat162_rn(static_cast<float>(q0) * scale,
-                                                                     static_cast<float>(q1) * scale);
-
+                const float scale = __half2float(
+                    __ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scale_ptr)));
+                const __nv_bfloat162 weights =
+                    Q4MmaDecodeAtom::decode_pair_with_scale(Cr[stage], scale, staged_group, lane);
                 const int shared_col =
                     q4_mma_swizzle_k64(local_row, group * Q4RowSplitStorage::kGroupK + 2 * lane);
                 store_vec(&dst[shared_col], weights);
