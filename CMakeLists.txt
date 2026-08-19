@@ -24,24 +24,34 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)        # clangd / IDE tooling
+
 if(MSVC)
   add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
   add_compile_options(
+    # MSVC Host C/C++
     $<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>
     $<$<COMPILE_LANGUAGE:C,CXX>:/EHsc>
     $<$<COMPILE_LANGUAGE:C,CXX>:/O2>
-    $<$<COMPILE_LANGUAGE:C,CXX>:/Ob2>
+    $<$<COMPILE_LANGUAGE:C,CXX>:/Ob3>
     $<$<COMPILE_LANGUAGE:C,CXX>:/Oi>
     $<$<COMPILE_LANGUAGE:C,CXX>:/Ot>
+    $<$<COMPILE_LANGUAGE:C,CXX>:/arch:AVX2>
+
+    # NVCC Host Pass-through
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/O2>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Ob2>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Ob3>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Oi>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Ot>)
-  # CUDA's static runtime requests LIBCMT even when the application and vcpkg dependencies use
-  # the project-wide /MD runtime. Keep one CRT in the final process.
-  add_link_options(/NODEFAULTLIB:LIBCMT)
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Ot>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/arch:AVX2>
+
+    # NVVM & PTXAS Device Optimizations
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-O3>
+  )
+
+  # LINKER: prefix ensures CMake passes this strictly to link.exe via -Xlinker for CUDA targets
+  add_link_options("LINKER:/NODEFAULTLIB:LIBCMT")
 endif()
 
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "86")
