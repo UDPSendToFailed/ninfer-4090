@@ -11,7 +11,6 @@ namespace ninfer::ops {
 // Algebraic Conway-Sloane E8 Root Quantization (Finds closest root out of 240 minimal vectors)
 // Maps unit vector u in R^8 to index in [0, 239]
 __device__ __forceinline__ uint8_t e8_quantize_root_8d(const float u[8], float out_root[8]) {
-    constexpr float kInvSqrt2 = 0.7071067811865475f;
 
     // 1. Type A Roots: Permutations of (+-1, +-1, 0, 0, 0, 0, 0, 0) -> 112 roots
     float abs_u[8];
