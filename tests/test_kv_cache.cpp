@@ -146,6 +146,9 @@ int main() {
                                         {ninfer::DType::FP16, 1, 2},
                                         {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena paged_arena(paged_plan.bytes);
+    // Drain default-stream / WDDM background work so the non-blocking test stream
+    // sees fully committed backing memory (D3D12 residency race on Windows).
+    CUDA_CHECK(cudaDeviceSynchronize());
     ninfer::PagedKVPool paged_pool({paged_arena.base(), paged_arena.capacity()}, paged_plan.layout);
     failures += expect_size(paged_pool.plane_count(), 4, "paged plane count");
     failures += check_shape(paged_pool.plane(0), {64, 64, 2, 10}, "paged code plane");
@@ -170,6 +173,7 @@ int main() {
     auto head_major_plan = plan_paged_cache(10, 10, 1, {{ninfer::DType::BF16, 128, 8}},
                                             ninfer::PagedKVPlaneOrder::HeadMajor);
     ninfer::DeviceArena head_major_arena(head_major_plan.bytes);
+    CUDA_CHECK(cudaDeviceSynchronize());
     ninfer::PagedKVPool head_major_pool({head_major_arena.base(), head_major_arena.capacity()},
                                         head_major_plan.layout);
     failures += check_shape(head_major_pool.plane(0), {128, 64, 10, 8}, "head-major paged plane");
