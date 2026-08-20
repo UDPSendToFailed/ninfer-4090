@@ -18,6 +18,9 @@ using MmaR64C16Schedule =
 using MmaR64C24Schedule =
     Q5RowSplitMmaGemmSchedule<64, 24, 64, 16, 8, 2, 2, Q5FragmentPipeline::Serial, Cache::cg,
                               Cache::cg, Q5ScaleLoad::Pair32>;
+using MmaR64C32Schedule =
+    Q5RowSplitMmaGemmSchedule<64, 32, 64, 32, 16, 2, 4, Q5FragmentPipeline::PingPong, Cache::ca,
+                              Cache::ca, Q5ScaleLoad::Pair32>;
 using MmaR64C64Schedule =
     Q5RowSplitMmaGemmSchedule<64, 64, 64, 32, 32, 2, 3, Q5FragmentPipeline::PingPong, Cache::ca,
                               Cache::ca, Q5ScaleLoad::Scalar16>;
@@ -47,7 +50,7 @@ void launch_kernel(const Tensor& x, const Weight& w, Tensor& residual_out, cudaS
 
 template <class Schedule>
 void launch_route(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t stream) {
-    const bool full = (w.n % 64) == 0 && (x.ne[1] % Schedule::kBlockCols) == 0 &&
+    const bool full = (w.n % Schedule::kBlockRows) == 0 && (x.ne[1] % Schedule::kBlockCols) == 0 &&
                       w.k == w.padded_shape[1] && (w.k % 64) == 0;
     for_each_token_slice(x.ne[1], Schedule::kBlockCols,
                          [&](std::int32_t offset, std::int32_t count) {
@@ -71,6 +74,11 @@ void q5_linear_add_mma_r64_c16_launch(const Tensor& x, const Weight& w, Tensor& 
 void q5_linear_add_mma_r64_c24_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                       cudaStream_t stream) {
     launch_route<MmaR64C24Schedule>(x, w, residual_out, stream);
+}
+
+void q5_linear_add_mma_r64_c32_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
+                                      cudaStream_t stream) {
+    launch_route<MmaR64C32Schedule>(x, w, residual_out, stream);
 }
 
 void q5_linear_add_mma_r64_c64_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
