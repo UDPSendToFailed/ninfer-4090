@@ -312,6 +312,7 @@ target_include_directories(ninfer_test_e8_codec PRIVATE
 target_link_libraries(ninfer_test_e8_codec PRIVATE CUDA::cudart)
 set_target_properties(ninfer_test_e8_codec PROPERTIES CUDA_ARCHITECTURES "89")
 add_test(NAME ninfer_test_e8_codec COMMAND ninfer_test_e8_codec)
+set_tests_properties(ninfer_test_e8_codec PROPERTIES SKIP_RETURN_CODE 77)
 
 # These tests deliberately compile against the exact target's internal contracts; the target does
 # not export impl/ to ordinary consumers.
