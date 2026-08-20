@@ -49,6 +49,7 @@ struct RequestLimits {
 struct CompletionUsage {
     int prompt_tokens     = 0;
     int completion_tokens = 0;
+    int cached_tokens     = 0;
 };
 
 enum class ContentKind {

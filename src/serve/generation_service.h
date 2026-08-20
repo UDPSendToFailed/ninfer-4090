@@ -53,6 +53,8 @@ struct GenerationOutcome {
     GenerationMetrics metrics;
 };
 
+[[nodiscard]] CompletionUsage make_completion_usage(const GenerationOutcome& outcome);
+
 struct StreamSink {
     std::function<void(const std::string& delta_text)> on_content;
     std::function<void(const std::string& delta_text)> on_reasoning;

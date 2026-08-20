@@ -16,6 +16,11 @@
 
 namespace ninfer::serve {
 
+CompletionUsage make_completion_usage(const GenerationOutcome& outcome) {
+    return CompletionUsage{outcome.prompt_tokens, outcome.completion_tokens,
+                           static_cast<int>(outcome.metrics.prefix_cache_hit_tokens)};
+}
+
 struct RequestCapacity {
     explicit RequestCapacity(std::size_t limit) : maximum(limit) {}
 

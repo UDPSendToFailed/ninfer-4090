@@ -4,6 +4,7 @@
 // consumed by external OpenAI clients.
 
 #include "serve/openai_schema.h"
+#include "serve/generation_service.h"
 #include "serve/request.h"
 #include "serve/translate.h"
 
@@ -549,7 +550,7 @@ int test_parse_sampling_carried() {
 
 int test_response_serialization() {
     int failures = 0;
-    const CompletionUsage usage{10, 3};
+    const CompletionUsage usage{10, 3, 7};
     const Json j = Json::parse(
         make_chat_completion_response("id-1", "m", 111, "hello world", "", "stop", usage));
     failures += check(j.at("object") == "chat.completion", "response object");
@@ -566,6 +567,8 @@ int test_response_serialization() {
     failures += check(j.at("usage").at("prompt_tokens") == 10, "usage prompt_tokens");
     failures += check(j.at("usage").at("completion_tokens") == 3, "usage completion_tokens");
     failures += check(j.at("usage").at("total_tokens") == 13, "usage total_tokens");
+    failures += check(j.at("usage").at("prompt_tokens_details").at("cached_tokens") == 7,
+                      "usage cached prompt tokens");
 
     // Non-empty reasoning is attached as message.reasoning_content, content stays answer-only.
     const Json jr = Json::parse(make_chat_completion_response("id-2", "m", 111, "the answer",
@@ -578,9 +581,37 @@ int test_response_serialization() {
     return failures;
 }
 
+int test_completion_usage_mapping_and_bounds() {
+    int failures = 0;
+
+    GenerationOutcome outcome;
+    outcome.prompt_tokens                   = 10;
+    outcome.completion_tokens               = 3;
+    outcome.metrics.prefix_cache_hit_tokens = 7;
+    const CompletionUsage mapped            = make_completion_usage(outcome);
+    failures += check(mapped.prompt_tokens == 10, "mapped prompt tokens");
+    failures += check(mapped.completion_tokens == 3, "mapped completion tokens");
+    failures += check(mapped.cached_tokens == 7, "mapped cached prompt tokens");
+
+    const Json cache_miss =
+        Json::parse(make_chat_completion_response("id-cold", "m", 111, "", "", "stop", {10, 0}));
+    failures += check(cache_miss.at("usage").at("prompt_tokens_details").at("cached_tokens") == 0,
+                      "cache miss reports zero cached tokens");
+
+    const Json below_zero = parse_sse(make_chat_chunk_usage("id-low", "m", 111, {10, 0, -1}));
+    failures += check(below_zero.at("usage").at("prompt_tokens_details").at("cached_tokens") == 0,
+                      "negative cached tokens clamp to zero");
+
+    const Json above_prompt = parse_sse(make_chat_chunk_usage("id-high", "m", 111, {10, 0, 11}));
+    failures +=
+        check(above_prompt.at("usage").at("prompt_tokens_details").at("cached_tokens") == 10,
+              "cached tokens clamp to prompt tokens");
+    return failures;
+}
+
 int test_tool_response_serialization() {
     int failures = 0;
-    const CompletionUsage usage{12, 6};
+    const CompletionUsage usage{12, 6, 8};
     const std::vector<ToolCall> calls = {
         ToolCall{"call_abc", "get_weather", R"({"city":"Paris"})"}};
     const Json j = Json::parse(
@@ -600,6 +631,8 @@ int test_tool_response_serialization() {
     failures += check(call.at("function").at("arguments") == R"({"city":"Paris"})",
                       "tool function arguments");
     failures += check(j.at("usage").at("total_tokens") == 18, "tool usage total");
+    failures += check(j.at("usage").at("prompt_tokens_details").at("cached_tokens") == 8,
+                      "tool usage cached prompt tokens");
 
     const Json with_content = Json::parse(make_chat_completion_tool_response(
         "id-tool-2", "m", 223, "Calling weather.", "", calls, usage));
@@ -648,13 +681,15 @@ int test_chunk_serialization() {
     failures += check(!final_no_usage.contains("usage"), "no usage key when include_usage=false");
 
     // Dedicated usage chunk: empty choices, populated usage.
-    const CompletionUsage usage{2, 5};
+    const CompletionUsage usage{2, 5, 1};
     const Json usage_chunk = parse_sse(make_chat_chunk_usage("id", "m", 1, usage));
     failures += check(usage_chunk.at("choices").is_array() && usage_chunk.at("choices").empty(),
                       "usage chunk has empty choices");
     failures +=
         check(usage_chunk.at("usage").at("prompt_tokens") == 2, "usage chunk prompt_tokens");
     failures += check(usage_chunk.at("usage").at("total_tokens") == 7, "usage chunk total");
+    failures += check(usage_chunk.at("usage").at("prompt_tokens_details").at("cached_tokens") == 1,
+                      "usage chunk cached prompt tokens");
 
     failures += check(sse_done() == "data: [DONE]\n\n", "done sentinel");
     return failures;
@@ -736,6 +771,7 @@ int main() {
     failures += test_parse_stop_and_max_tokens();
     failures += test_parse_sampling_carried();
     failures += test_response_serialization();
+    failures += test_completion_usage_mapping_and_bounds();
     failures += test_tool_response_serialization();
     failures += test_chunk_serialization();
     failures += test_tool_chunk_serialization();
