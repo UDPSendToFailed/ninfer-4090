@@ -109,6 +109,10 @@ Streaming begins with an assistant-role chunk, sends separate reasoning and cont
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
 `choices` chunk contains completed usage.
 
+Both non-streaming responses and the final streaming usage chunk report the exact resident prompt
+prefix reused by Engine as `usage.prompt_tokens_details.cached_tokens`. `usage.prompt_tokens`
+includes those cached tokens.
+
 ### Multimodal request
 
 Start the server with `--vision` before sending media:
