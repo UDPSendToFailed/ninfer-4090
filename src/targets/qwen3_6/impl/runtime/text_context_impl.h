@@ -402,10 +402,10 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
         Tensor position_batch = positions.view({width, active_sequence_batch_});
         ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, *active_valid_columns_,
-                           *active_backend_kv_table_rows_, kAttnScale,
+                           *active_backend_kv_table_rows_, attn_scale_,
                            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s);
     } else {
-        ops::gqa_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row, kAttnScale,
+        ops::gqa_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row, attn_scale_,
                            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
     }
     ops::sigmoid_mul(gate, a, s);
@@ -534,7 +534,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         ops::rope(last_rope_position, kCfg.rotary_dim, kCfg.rope_theta, qn, s);
 
         Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
-        ops::gqa_attention_cached(qn, last_position, kAttnScale, mtp_kv_.layer_view(0), envelope,
+        ops::gqa_attention_cached(qn, last_position, attn_scale_, mtp_kv_.layer_view(0), envelope,
                                   work_, a, s);
         ops::sigmoid_mul(gate, a, s);
 
@@ -843,10 +843,10 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
-                           kAttnScale, batch_text_kv_->batch_layer_view(fidx),
+                           attn_scale_, batch_text_kv_->batch_layer_view(fidx),
                            *active_gqa_envelope_, work_, a_batch, s);
     } else {
-        ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
+        ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, attn_scale_,
                            batch_text_kv_->batch_layer_view(fidx), *active_gqa_envelope_, work_, a,
                            s);
     }

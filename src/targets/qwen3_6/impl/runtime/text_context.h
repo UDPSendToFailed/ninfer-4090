@@ -184,6 +184,9 @@ public:
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
+    void set_attn_scale(float scale) noexcept { attn_scale_ = scale; }
+    [[nodiscard]] float attn_scale() const noexcept { return attn_scale_; }
+
     void set_linear_state_slots(std::int32_t current_slot, std::int32_t turn_checkpoint_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
 
@@ -314,6 +317,7 @@ private:
     std::int64_t prefill_turn_checkpoint_frontier_        = -1;
     Tensor* turn_checkpoint_hidden_output_                = nullptr;
     std::uint32_t mtp_proposal_extent_                    = 0;
+    float attn_scale_                                     = kAttnScale;
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;

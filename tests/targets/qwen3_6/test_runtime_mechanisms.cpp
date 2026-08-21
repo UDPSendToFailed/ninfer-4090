@@ -6,6 +6,7 @@
 #include <ninfer/targets/qwen3_6/vision_control.h>
 
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
+#include "targets/qwen3_6/impl/runtime/yarn.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -282,6 +283,36 @@ void test_prefix_identity() {
            "truncated multimodal continuation identity");
 }
 
+void test_yarn_scaling() {
+    const auto native_cfg = q36::detail::compute_yarn_config(262144);
+    expect(native_cfg.scale_factor == 1.0F, "256k native YaRN scale factor must be 1.0");
+    expect(native_cfg.attn_temperature_multiplier == 1.0F, "256k native YaRN attn multiplier must be 1.0");
+    expect(native_cfg.inv_freq[0] == 1.0F, "native frequency[0] must be 1.0");
+
+    const auto short_cfg = q36::detail::compute_yarn_config(100000);
+    expect(short_cfg.scale_factor == 1.0F, "100k YaRN scale factor must be 1.0");
+    expect(short_cfg.attn_temperature_multiplier == 1.0F, "100k YaRN attn multiplier must be 1.0");
+
+    const auto context_300k = q36::detail::compute_yarn_config(300000);
+    expect(context_300k.scale_factor == 1.0F, "300k YaRN scale factor must be 1.0");
+    expect(context_300k.attn_temperature_multiplier == 1.0F, "300k YaRN attn multiplier must be 1.0");
+
+    const auto max_native_cfg = q36::detail::compute_yarn_config(1048576);
+    expect(max_native_cfg.scale_factor == 1.0F, "1M max native YaRN scale factor must be 1.0");
+    expect(max_native_cfg.attn_temperature_multiplier == 1.0F, "1M max native YaRN attn multiplier must be 1.0");
+
+    const auto ext_cfg = q36::detail::compute_yarn_config(2097152);
+    expect(ext_cfg.scale_factor == 2.0F, "2M YaRN scale factor must be 2.0");
+    const float expected_m = 0.1F * std::log(2.0F) + 1.0F;
+    expect(std::abs(ext_cfg.attn_temperature_multiplier - expected_m) < 1e-6F,
+           "2M YaRN attn multiplier must match formula");
+    expect(ext_cfg.inv_freq[0] == 1.0F, "high frequency dimensions must remain unscaled");
+    const float expected_low = std::pow(1.0e7F, -62.0F / 64.0F) / 2.0F;
+    expect(std::abs(ext_cfg.inv_freq[31] - expected_low) < 1e-12F,
+           "low frequency dimension must scale by 1/F");
+}
+
+
 } // namespace
 
 int main() {
@@ -291,6 +322,7 @@ int main() {
     test_mtp_alignment();
     test_vision_control();
     test_prefix_identity();
+    test_yarn_scaling();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;
@@ -298,3 +330,4 @@ int main() {
     std::cout << "Qwen3.6 runtime mechanism checks passed\n";
     return 0;
 }
+

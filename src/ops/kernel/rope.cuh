@@ -31,6 +31,7 @@ static __device__ __constant__ float kTextRopeInvFrequency[32] = {
     2.738419634e-07F, 1.654817100e-07F,
 };
 
+
 static __device__ __constant__ double kDflashRopeInvFrequency[64] = {
     1.00000000000000000e+00, 7.77365030238775789e-01, 6.04296390238132863e-01,
     4.69758881670649164e-01, 3.65174127254837722e-01, 2.83873596475875456e-01,

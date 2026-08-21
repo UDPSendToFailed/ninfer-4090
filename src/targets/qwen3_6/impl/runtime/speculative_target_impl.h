@@ -12,7 +12,9 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
     if (frame.replay_records == nullptr) {
         throw std::logic_error("speculative target verify has no ReplaySSM record storage");
     }
+    card.set_attn_scale(execution.attn_scale);
     card.set_gdn_state_action(GdnStateAction::RecordForReplay, frame.replay_records);
+
     if (frame.feature_sink != nullptr) {
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.lanes, envelope,

@@ -140,4 +140,9 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x, cudaS
     detail::rope_single_launch(positions, rotary_dim, theta, x, stream);
 }
 
+void set_text_rope_frequencies(const float* inv_freq_32) {
+    detail::set_text_rope_frequencies_symbol(inv_freq_32);
+}
+
 } // namespace ninfer::ops
+

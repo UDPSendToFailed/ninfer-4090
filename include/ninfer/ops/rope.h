@@ -40,4 +40,9 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
 // from x; Q versus K role does not change the transformation.
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x, cudaStream_t stream);
 
+// Updates the device constant memory frequency table for Text RoPE (32 float values).
+// Passing nullptr restores the default native unscaled 256k frequency table.
+void set_text_rope_frequencies(const float* inv_freq_32);
+
 } // namespace ninfer::ops
+

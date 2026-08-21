@@ -3,8 +3,10 @@
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "targets/qwen3_6/impl/runtime/prompt_lookup.h"
+#include "targets/qwen3_6/impl/runtime/yarn.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
+#include "ninfer/ops/rope.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
 
@@ -188,6 +190,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       kv_packed_v(plan.kv_packed_v), kv_rotate_k(plan.kv_rotate_k), kv_rotate_v(plan.kv_rotate_v),
       kv_packed_k(plan.kv_packed_k), kv_e8_lattice(plan.kv_e8_lattice), kv_e8_root(plan.kv_e8_root),
       proposal_head(plan.proposal_head),
+      attn_scale(kAttentionScale * compute_yarn_config(plan.capacity).attn_temperature_multiplier),
       vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       text_kv_bytes(plan.persistent.decoder.text_kv.payload_bytes()),
@@ -313,6 +316,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
+    const auto yarn = compute_yarn_config(capacity);
+    ops::set_text_rope_frequencies(yarn.inv_freq.data());
     device.synchronize();
     prepare_graphs();
     work.reset();
@@ -321,6 +326,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
+    ops::set_text_rope_frequencies(nullptr);
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
 }
 
@@ -1207,7 +1213,8 @@ void ProgramImplCore::prepare_graphs() {
                                        io,
                                        prefill_hidden,
                                        prefill_chunk,
-                                       proposal_head};
+                                       proposal_head,
+                                       attn_scale};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -1503,7 +1510,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         schedule::PrefillContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, attn_scale},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -1764,7 +1771,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, attn_scale},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -1905,7 +1912,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         schedule::MtpBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                   replay_records ? &*replay_records : nullptr, io,
-                                                  prefill_hidden, prefill_chunk, proposal_head},
+                                                  prefill_hidden, prefill_chunk, proposal_head,
+                                                  attn_scale},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  *io.mtp_decode,
@@ -2067,7 +2075,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         schedule::DFlashBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
-                                                     proposal_head},
+                                                     proposal_head, attn_scale},
                                                     decoder->text_kv,
                                                     *dflash,
                                                     *io.dflash_decode,

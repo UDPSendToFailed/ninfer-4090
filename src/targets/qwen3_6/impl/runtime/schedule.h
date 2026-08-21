@@ -39,7 +39,9 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    float attn_scale = kAttentionScale;
 };
+
 
 struct PrefillContext {
     ExecutionCore execution;

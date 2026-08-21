@@ -16,7 +16,6 @@ namespace {
 
 constexpr std::int32_t kHeadDim                      = 256;
 constexpr std::int32_t kQuantGroup                   = 64;
-constexpr float kExpectedScale                       = 0.0625f;
 constexpr std::int32_t kSmallTChunkTokens            = 6;
 constexpr std::int32_t kMaximumVerifyTokens          = 16;
 constexpr std::int32_t kMaximumBatchSize             = 8;
@@ -207,8 +206,8 @@ void validate_attention_tensors(const Tensor& q, const Tensor& positions, const 
     if (positions.dtype != DType::I32) {
         throw std::invalid_argument(std::string(op) + ": positions must be I32");
     }
-    if (!std::isfinite(scale) || std::abs(scale - kExpectedScale) > 1.0e-6f) {
-        throw std::invalid_argument(std::string(op) + ": scale must be 1/sqrt(256)");
+    if (!std::isfinite(scale) || scale <= 0.0f) {
+        throw std::invalid_argument(std::string(op) + ": scale must be positive and finite");
     }
     const std::int32_t q_heads  = q.ne[1];
     const std::int32_t kv_heads = kv_heads_for_q_heads(q_heads, op);
@@ -239,8 +238,8 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
         (masked && valid_columns.dtype != DType::I32)) {
         throw std::invalid_argument(std::string(op) + ": batch metadata must be I32");
     }
-    if (!std::isfinite(scale) || std::abs(scale - kExpectedScale) > 1.0e-6f) {
-        throw std::invalid_argument(std::string(op) + ": scale must be 1/sqrt(256)");
+    if (!std::isfinite(scale) || scale <= 0.0f) {
+        throw std::invalid_argument(std::string(op) + ": scale must be positive and finite");
     }
     const std::int32_t q_heads  = q.ne[1];
     const std::int32_t kv_heads = kv_heads_for_q_heads(q_heads, op);

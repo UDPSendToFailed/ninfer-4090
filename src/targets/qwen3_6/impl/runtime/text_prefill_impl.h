@@ -43,6 +43,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
     card.set_linear_state_slots(current_state_slot, turn_checkpoint_state_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);
+    card.set_attn_scale(execution.attn_scale);
     if (execution.proposal_head == ProposalHead::Full) {
         card.set_proposal_head(nullptr, nullptr, 0);
         return;

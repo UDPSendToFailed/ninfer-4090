@@ -243,7 +243,9 @@ public:
     const bool kv_e8_lattice;
     const bool kv_e8_root;
     const ProposalHead proposal_head;
+    const float attn_scale;
     const bool vision_enabled;
+
     const bool use_cuda_graph;
     const std::size_t kv_payload_bytes;
     const std::size_t text_kv_bytes;
