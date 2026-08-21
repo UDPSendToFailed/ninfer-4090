@@ -16,7 +16,7 @@ struct GqaGeometry {
     static constexpr int KVHeads          = KVHeadsValue;
     static constexpr int GroupSize        = QHeads / KVHeads;
     static constexpr int DecodeSplitScale = DecodeSplitScaleValue;
-    static constexpr int DecodeSplits     = 85 * DecodeSplitScale;
+    static constexpr int DecodeSplits     = 64 * DecodeSplitScale;
 };
 
 using Gqa27Geometry = GqaGeometry<24, 4, 1>;

@@ -79,7 +79,7 @@ __device__ __forceinline__ bool gqa_valid_q_head(int kv_head, int q_head) {
 
 template <typename Geometry>
 __device__ __forceinline__ int gqa_small_t_default_splits(int window) {
-    int target_keys_per_split = 480 / Geometry::DecodeSplitScale;
+    int target_keys_per_split = 512 / Geometry::DecodeSplitScale;
     if (window <= 4096) {
         target_keys_per_split = 64 / Geometry::DecodeSplitScale;
     } else if (window <= 8198) {

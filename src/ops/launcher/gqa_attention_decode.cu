@@ -35,7 +35,7 @@ std::int32_t gqa_small_t_split_upper_bound(std::int32_t window) {
     include_tier(4096, 64 / Geometry::DecodeSplitScale);
     if (window > 4096) { include_tier(8198, 128 / Geometry::DecodeSplitScale); }
     if (window > 8198) { include_tier(16390, 256 / Geometry::DecodeSplitScale); }
-    if (window > 16390) { include_tier(window, 480 / Geometry::DecodeSplitScale); }
+    if (window > 16390) { include_tier(window, 512 / Geometry::DecodeSplitScale); }
 
     return (splits < Geometry::DecodeSplits) ? splits : Geometry::DecodeSplits;
 }
