@@ -722,19 +722,29 @@ private:
         request->lane_plan_versions[lane] = lane_plan_versions_[lane];
     }
 
+    // Lane choice maximizes reusable prefix; ties break toward the lane whose occupation costs
+    // least to replace - an empty lane before any retained session, then the shallowest
+    // retained session - so a fresh request never clobbers a deep resident session while a
+    // cheaper lane is available.
     [[nodiscard]] std::optional<LaneChoice>
     find_admission_lane(const std::shared_ptr<Request>& request) {
         std::optional<LaneChoice> selected;
         std::uint32_t selected_reuse = 0;
+        std::uint32_t selected_cost  = 0;
+        const auto prefer            = [&](std::uint32_t reuse, std::uint32_t cost) {
+            return !selected || reuse > selected_reuse ||
+                   (reuse == selected_reuse && cost < selected_cost);
+        };
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
-            if (instance_.program->can_admit_lane(lane, plan) &&
-                (!selected || reuse > selected_reuse)) {
+            const std::uint32_t cost  = instance_.program->retained_lane_depth(lane);
+            if (instance_.program->can_admit_lane(lane, plan) && prefer(reuse, cost)) {
                 selected       = LaneChoice{.lane = lane};
                 selected_reuse = reuse;
+                selected_cost  = cost;
             }
         }
         if (selected) { return selected; }
@@ -744,13 +754,15 @@ private:
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
+            const std::uint32_t cost  = instance_.program->retained_lane_depth(lane);
             if (instance_.program->can_admit_lane_after_retained_eviction(lane, plan) &&
-                (!selected || reuse > selected_reuse)) {
+                prefer(reuse, cost)) {
                 selected = LaneChoice{
                     .lane           = lane,
                     .evict_retained = true,
                 };
                 selected_reuse = reuse;
+                selected_cost  = cost;
             }
         }
         return selected;
