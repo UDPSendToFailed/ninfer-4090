@@ -43,6 +43,9 @@ struct ServeOptions {
     std::uint32_t vision_max_tokens        = 8192;
     bool use_cuda_graph                    = true;
     bool allow_prefix_reuse = true;
+    bool enable_prompt_cache               = false;
+    std::string prompt_cache_dir           = "";
+    std::size_t prompt_cache_max_bytes     = 30ULL << 30; // 30 GiB default
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;

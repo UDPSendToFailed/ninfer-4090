@@ -27,6 +27,11 @@ function(ninfer_add_test name)
       NINFER_SOURCE_DIR="${NINFER_NORMALIZED_SOURCE_DIR}"
       NINFER_PYTHON_EXECUTABLE="${NINFER_NORMALIZED_PYTHON}")
   endif()
+  if(WIN32 AND DSTORAGE_DLLS)
+    add_custom_command(TARGET ${name} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${DSTORAGE_DLLS} $<TARGET_FILE_DIR:${name}>
+    )
+  endif()
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
@@ -83,6 +88,9 @@ ninfer_add_test(ninfer_state_store_test
 ninfer_add_test(ninfer_gdn_replay_records_test
   SOURCES test_gdn_replay_records.cpp
   LIBRARIES ninfer_core)
+ninfer_add_test(ninfer_disk_state_cache_test
+  SOURCES test_disk_state_cache.cpp
+  LIBRARIES ninfer_core ninfer_ops)
 set_tests_properties(
   ninfer_artifact_materialization_test
   ninfer_device_test

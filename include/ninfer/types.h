@@ -85,6 +85,9 @@ struct EngineOptions {
     bool enable_vision                 = false;
     std::uint32_t vision_max_tokens    = 8192;
     bool use_cuda_graph = true;
+    bool enable_prompt_cache               = false;
+    std::filesystem::path prompt_cache_dir = "";          // empty resolves to default user cache dir
+    std::size_t prompt_cache_max_bytes     = 30ULL << 30; // 30 GiB LRU ceiling
     LoadProgress load_progress;
 };
 
@@ -354,6 +357,7 @@ enum class PrefixReusePath : std::uint8_t {
     FullReset,
     AppendAtFrontier,
     RestoreTurnCheckpoint,
+    RestoreDiskCheckpoint,
 };
 
 struct GenerationResult {

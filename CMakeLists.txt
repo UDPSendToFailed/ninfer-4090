@@ -121,6 +121,31 @@ if(NINFER_BUILD_SERVE)
   find_package(Threads REQUIRED)
 endif()
 
+if(WIN32)
+  include(FetchContent)
+  FetchContent_Declare(
+    directstorage
+    URL "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.DirectStorage/1.3.0"
+    DOWNLOAD_NAME "directstorage.1.3.0.zip"
+  )
+  FetchContent_MakeAvailable(directstorage)
+
+  add_library(ninfer_directstorage INTERFACE)
+  target_include_directories(ninfer_directstorage INTERFACE
+    ${directstorage_SOURCE_DIR}/native/include
+  )
+  target_link_libraries(ninfer_directstorage INTERFACE
+    ${directstorage_SOURCE_DIR}/native/lib/x64/dstorage.lib
+    d3d12.lib
+    dxgi.lib
+  )
+
+  set(DSTORAGE_DLLS
+    "${directstorage_SOURCE_DIR}/native/bin/x64/dstorage.dll"
+    "${directstorage_SOURCE_DIR}/native/bin/x64/dstoragecore.dll"
+  )
+endif()
+
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)
 if(NINFER_BUILD_APPS)

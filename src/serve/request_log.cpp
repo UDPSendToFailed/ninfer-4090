@@ -133,6 +133,8 @@ const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
         return "append_frontier";
     case ninfer::PrefixReusePath::RestoreTurnCheckpoint:
         return "restore_turn_checkpoint";
+    case ninfer::PrefixReusePath::RestoreDiskCheckpoint:
+        return "restore_disk_checkpoint";
     }
     return "unknown";
 }

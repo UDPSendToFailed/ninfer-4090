@@ -213,6 +213,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
+        } else if (arg == "--prompt-cache" || arg == "--disk-cache" || arg == "--enable-prompt-cache") {
+            options.enable_prompt_cache = true;
+        } else if (arg == "--no-prompt-cache" || arg == "--no-disk-cache") {
+            options.enable_prompt_cache = false;
+        } else if (arg == "--prompt-cache-dir" || arg == "--disk-cache-dir") {
+            options.prompt_cache_dir    = require_value(arg.c_str());
+            options.enable_prompt_cache = true;
+        } else if (arg == "--prompt-cache-gb" || arg == "--disk-cache-gb") {
+            const std::uint64_t gb = parse_u64(require_value(arg.c_str()), arg.c_str());
+            options.prompt_cache_max_bytes = static_cast<std::size_t>(gb << 30);
+            options.enable_prompt_cache    = true;
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {

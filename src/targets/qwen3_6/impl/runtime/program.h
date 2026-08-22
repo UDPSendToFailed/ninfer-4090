@@ -3,6 +3,7 @@
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
 #include "core/arena.h"
+#include "core/disk_state_cache.h"
 #include "core/gdn_replay_records.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
@@ -72,6 +73,7 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
+    std::filesystem::path disk_snapshot_path;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail
@@ -155,6 +157,7 @@ struct SequenceState {
     bool tail_hidden_valid        = false;
     bool retained                 = false;
     TurnCheckpoint turn_checkpoint;
+    std::uint32_t last_disk_snapshot_tokens = 0;
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -221,6 +224,88 @@ public:
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
+    void snapshot_lane_to_disk(std::uint32_t lane, DiskStateCache& disk_cache);
+    void snapshot_turn_checkpoint_to_disk(std::uint32_t lane, DiskStateCache& disk_cache);
+    void set_disk_state_cache(DiskStateCache* cache) noexcept { disk_state_cache = cache; }
+    [[nodiscard]] std::uint64_t model_identity_hash() const noexcept {
+        constexpr std::uint64_t kFnv1aPrime       = 1099511628211ULL;
+        constexpr std::uint64_t kFnv1aOffsetBasis = 14695981039346656037ULL;
+        auto combine = [](std::uint64_t h, std::uint64_t val) noexcept -> std::uint64_t {
+            return (h ^ val) * 1099511628211ULL;
+        };
+
+        std::uint64_t h = kFnv1aOffsetBasis;
+        h = combine(h, static_cast<std::uint64_t>(model.token_embedding.payload_bytes));
+        h = combine(h, static_cast<std::uint64_t>(model.token_embedding.shape[0]));
+        h = combine(h, static_cast<std::uint64_t>(model.token_embedding.shape[1]));
+        h = combine(h, static_cast<std::uint64_t>(capacity));
+        h = combine(h, static_cast<std::uint64_t>(kv_capacity));
+        h = combine(h, static_cast<std::uint64_t>(kv_dtype));
+        h = combine(h, static_cast<std::uint64_t>(kv_quant_group));
+
+        std::uint64_t flags = 0;
+        if (kv_packed_k)   flags |= (1ULL << 0);
+        if (kv_packed_v)   flags |= (1ULL << 1);
+        if (kv_rotate_k)   flags |= (1ULL << 2);
+        if (kv_rotate_v)   flags |= (1ULL << 3);
+        if (kv_e8_lattice) flags |= (1ULL << 4);
+        if (kv_e8_root)    flags |= (1ULL << 5);
+        if (vision_enabled) flags |= (1ULL << 6);
+        h = combine(h, flags);
+
+        h = combine(h, static_cast<std::uint64_t>(speculative_backend));
+        h = combine(h, static_cast<std::uint64_t>(draft_window));
+        h = combine(h, static_cast<std::uint64_t>(proposal_head));
+        return h;
+    }
+
+    [[nodiscard]] std::string config_signature_slug() const {
+        std::string s;
+        if (model.token_embedding.shape[1] == 5120) {
+            s += "qwen3_8_27b";
+        } else if (model.token_embedding.shape[1] == 2048) {
+            s += "qwen3_6_35b_a3b";
+        } else {
+            s += "qwen_h" + std::to_string(model.token_embedding.shape[1]);
+        }
+
+        if (kv_dtype == DType::BF16) {
+            s += "_bf16";
+        } else if (kv_e8_root) {
+            s += "_rk2v4-e8";
+        } else if (kv_e8_lattice) {
+            s += "_rk4v4-e8";
+        } else if (kv_packed_k) {
+            s += "_rk4v4";
+        } else if (kv_rotate_v) {
+            s += "_rk8v4";
+        } else {
+            s += "_int8";
+        }
+
+        if (speculative_backend == SpeculativeBackend::Mtp) {
+            s += "_mtp_d" + std::to_string(draft_window);
+            if (proposal_head == ProposalHead::Optimized) {
+                s += "_lmhead";
+            }
+        } else if (speculative_backend == SpeculativeBackend::DFlash) {
+            s += "_dflash_d" + std::to_string(draft_window);
+        } else {
+            s += "_none";
+        }
+
+        if (vision_enabled) {
+            s += "_vision";
+        }
+
+        if (capacity >= 1000 && (capacity % 1000 == 0)) {
+            s += "_ctx" + std::to_string(capacity / 1000) + "k";
+        } else {
+            s += "_ctx" + std::to_string(capacity);
+        }
+
+        return s;
+    }
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
@@ -290,6 +375,7 @@ public:
     qwen3_6::DFlashDecodeEgress* dflash_host_egress   = nullptr;
 
     std::size_t workspace_logical_peak_bytes = 0;
+    DiskStateCache* disk_state_cache          = nullptr;
 
 private:
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;

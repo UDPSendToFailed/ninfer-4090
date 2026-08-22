@@ -10,6 +10,10 @@
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
 
+#if defined(_WIN32)
+#include "core/direct_storage_engine.h"
+#endif
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -438,13 +442,14 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
          transient.alignment < request_plan.summary.transient_alignment)) {
         throw std::invalid_argument("request transient region does not satisfy the plan");
     }
-    if (request_plan.reuse != ReusePath::FullReset &&
+    const bool is_disk_restore = request_plan.reuse == ReusePath::RestoreDiskCheckpoint;
+    if (!is_disk_restore && request_plan.reuse != ReusePath::FullReset &&
         (!sequence.retained ||
          !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                           request_plan.reuse_base))) {
         throw std::logic_error("planned resident prefix is no longer reusable");
     }
-    if (request_plan.reuse == ReusePath::RestoreTurnCheckpoint &&
+    if (!is_disk_restore && request_plan.reuse == ReusePath::RestoreTurnCheckpoint &&
         (!sequence.turn_checkpoint.valid ||
          sequence.turn_checkpoint.frontier != request_plan.reuse_base)) {
         throw std::logic_error("planned turn checkpoint is unavailable");
@@ -482,6 +487,203 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             sequence.mtp_kv_valid  = 0;
             reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
                                 request_plan.backend_kv_page_entitlement);
+        } else if (is_disk_restore) {
+            sequence.kv.reset();
+            ordered_reset(sequence);
+            sequence.ledger.clear();
+            sequence.text_kv_valid = 0;
+            sequence.mtp_kv_valid  = 0;
+            reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
+                                request_plan.backend_kv_page_entitlement);
+            const std::uint32_t backend_base =
+                speculative_backend == SpeculativeBackend::Mtp
+                    ? (base > 0 ? base - 1 : 0)
+                    : speculative_backend == SpeculativeBackend::DFlash ? base : 0;
+            materialize_sequence_kv(sequence, base, backend_base);
+
+            DiskStateHeader header;
+            std::vector<TokenId> loaded_tokens;
+            std::vector<std::byte> loaded_gdn;
+            std::vector<std::byte> loaded_text_kv;
+            std::vector<std::byte> loaded_mtp_kv;
+            std::vector<std::byte> loaded_tail;
+
+#if defined(_WIN32)
+            void* d_ds_staging = nullptr;
+            std::size_t text_staging_bytes = 0;
+            if (disk_state_cache &&
+                disk_state_cache->load_snapshot_direct_storage(request_plan.disk_snapshot_path, header,
+                                                               loaded_tokens, device.stream, d_ds_staging,
+                                                               text_staging_bytes)) {
+                // DirectStorage VRAM restore
+                const std::byte* d_staging_bytes = static_cast<const std::byte*>(d_ds_staging);
+
+                // 1. Restore Text KV cache pages
+                if (sequence.kv && sequence.kv->text.valid() && header.text_page_count > 0 && text_staging_bytes > 0) {
+                    auto page_ids = sequence.kv->text.page_ids();
+                    const std::uint32_t pages_to_restore =
+                        std::min<std::uint32_t>(header.text_page_count,
+                                                static_cast<std::uint32_t>(page_ids.size()));
+                    std::vector<std::int32_t> valid_page_ids;
+                    for (std::uint32_t i = 0; i < pages_to_restore; ++i) {
+                        if (page_ids[i] >= 0) { valid_page_ids.push_back(page_ids[i]); }
+                    }
+                    if (!valid_page_ids.empty()) {
+                        auto& pool = decoder->text_kv.pool();
+                        pool.scatter_from_contiguous_device(valid_page_ids, const_cast<std::byte*>(d_staging_bytes), device.stream);
+                    }
+                }
+
+                // 2. Restore GDN state from manifest payload (located immediately after text staging)
+                std::size_t offset = text_staging_bytes;
+                const std::int32_t slot = LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
+                for (const auto& t : decoder->linear_attention.recurrent) {
+                    Tensor slot_t = t.slice(3, slot, 1);
+                    if (offset + slot_t.bytes() <= text_staging_bytes + header.gdn_state_bytes) {
+                        CUDA_CHECK(cudaMemcpyAsync(slot_t.data, d_staging_bytes + offset, slot_t.bytes(),
+                                                   cudaMemcpyDeviceToDevice, device.stream));
+                        offset += slot_t.bytes();
+                    }
+                }
+                for (const auto& t : decoder->linear_attention.conv) {
+                    Tensor slot_t = t.slice(2, slot, 1);
+                    if (offset + slot_t.bytes() <= text_staging_bytes + header.gdn_state_bytes) {
+                        CUDA_CHECK(cudaMemcpyAsync(slot_t.data, d_staging_bytes + offset, slot_t.bytes(),
+                                                   cudaMemcpyDeviceToDevice, device.stream));
+                        offset += slot_t.bytes();
+                    }
+                }
+
+                // 3. Restore MTP KV cache and tail hidden
+                offset = text_staging_bytes + header.gdn_state_bytes;
+                if (speculative_backend == SpeculativeBackend::Mtp) {
+                    if (decoder->mtp_cache() && sequence.kv && sequence.kv->backend &&
+                        sequence.kv->backend->valid() && header.mtp_kv_bytes > 0) {
+                        auto mtp_page_ids = sequence.kv->backend->page_ids();
+                        const std::uint32_t mtp_pages_to_restore =
+                            std::min<std::uint32_t>(header.mtp_page_count,
+                                                    static_cast<std::uint32_t>(mtp_page_ids.size()));
+                        std::vector<std::int32_t> valid_mtp_page_ids;
+                        for (std::uint32_t i = 0; i < mtp_pages_to_restore; ++i) {
+                            if (mtp_page_ids[i] >= 0) { valid_mtp_page_ids.push_back(mtp_page_ids[i]); }
+                        }
+                        if (!valid_mtp_page_ids.empty()) {
+                            auto& mtp_pool = decoder->mtp_cache()->pool();
+                            mtp_pool.scatter_from_contiguous_device(valid_mtp_page_ids, const_cast<std::byte*>(d_staging_bytes + offset), device.stream);
+                        }
+                        offset += header.mtp_kv_bytes;
+                    }
+                    if (sequence.tail_hidden.data != nullptr && header.tail_hidden_bytes > 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, d_staging_bytes + offset,
+                                                   std::min(sequence.tail_hidden.bytes(),
+                                                            static_cast<std::size_t>(header.tail_hidden_bytes)),
+                                                   cudaMemcpyDeviceToDevice, device.stream));
+                        sequence.tail_hidden_valid = true;
+                        offset += header.tail_hidden_bytes;
+                    }
+                    sequence.mtp_kv_valid = base > 0 ? base - 1 : 0;
+                }
+
+                sequence.text_kv_valid      = base;
+                sequence.rope_delta         = header.rope_delta;
+                sequence.execution_frontier = base;
+                sequence.ledger_frontier    = static_cast<std::uint32_t>(loaded_tokens.size());
+                sequence.ledger.assign(loaded_tokens.begin(), loaded_tokens.end());
+                sequence.retained           = true;
+                set_device_i32(io.rope_delta, sequence.rope_delta);
+
+                CUDA_CHECK(cudaStreamSynchronize(device.stream));
+                ::ninfer::core::DirectStorageEngine::instance().release_staging();
+            } else
+#endif
+            if (disk_state_cache &&
+                disk_state_cache->load_snapshot(request_plan.disk_snapshot_path, header,
+                                                loaded_tokens, loaded_gdn, loaded_text_kv,
+                                                loaded_mtp_kv, loaded_tail)) {
+                // Restore GDN state
+                const std::int32_t slot =
+                    LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
+                std::size_t gdn_offset = 0;
+                for (const auto& t : decoder->linear_attention.recurrent) {
+                    Tensor slot_t = t.slice(3, slot, 1);
+                    if (gdn_offset + slot_t.bytes() <= loaded_gdn.size()) {
+                        CUDA_CHECK(cudaMemcpyAsync(slot_t.data, loaded_gdn.data() + gdn_offset,
+                                                   slot_t.bytes(), cudaMemcpyHostToDevice,
+                                                   device.stream));
+                        gdn_offset += slot_t.bytes();
+                    }
+                }
+                for (const auto& t : decoder->linear_attention.conv) {
+                    Tensor slot_t = t.slice(2, slot, 1);
+                    if (gdn_offset + slot_t.bytes() <= loaded_gdn.size()) {
+                        CUDA_CHECK(cudaMemcpyAsync(slot_t.data, loaded_gdn.data() + gdn_offset,
+                                                   slot_t.bytes(), cudaMemcpyHostToDevice,
+                                                   device.stream));
+                        gdn_offset += slot_t.bytes();
+                    }
+                }
+
+                // Restore Text KV cache pages
+                if (sequence.kv && sequence.kv->text.valid() && !loaded_text_kv.empty()) {
+                    auto page_ids                    = sequence.kv->text.page_ids();
+                    const std::uint32_t pages_to_restore =
+                        std::min<std::uint32_t>(header.text_page_count,
+                                                static_cast<std::uint32_t>(page_ids.size()));
+                    std::vector<std::int32_t> valid_page_ids;
+                    for (std::uint32_t i = 0; i < pages_to_restore; ++i) {
+                        if (page_ids[i] >= 0) { valid_page_ids.push_back(page_ids[i]); }
+                    }
+                    if (!valid_page_ids.empty()) {
+                        auto& pool = decoder->text_kv.pool();
+                        void* d_text_staging = nullptr;
+                        CUDA_CHECK(cudaMallocAsync(&d_text_staging, loaded_text_kv.size(), device.stream));
+                        CUDA_CHECK(cudaMemcpyAsync(d_text_staging, loaded_text_kv.data(), loaded_text_kv.size(),
+                                                   cudaMemcpyHostToDevice, device.stream));
+                        pool.scatter_from_contiguous_device(valid_page_ids, d_text_staging, device.stream);
+                        CUDA_CHECK(cudaFreeAsync(d_text_staging, device.stream));
+                    }
+                }
+
+                // Restore MTP KV and tail hidden
+                if (speculative_backend == SpeculativeBackend::Mtp) {
+                    if (decoder->mtp_cache() && sequence.kv && sequence.kv->backend &&
+                        sequence.kv->backend->valid() && !loaded_mtp_kv.empty()) {
+                        auto mtp_page_ids      = sequence.kv->backend->page_ids();
+                        const std::uint32_t mtp_pages_to_restore =
+                            std::min<std::uint32_t>(header.mtp_page_count,
+                                                    static_cast<std::uint32_t>(mtp_page_ids.size()));
+                        std::vector<std::int32_t> valid_mtp_page_ids;
+                        for (std::uint32_t i = 0; i < mtp_pages_to_restore; ++i) {
+                            if (mtp_page_ids[i] >= 0) { valid_mtp_page_ids.push_back(mtp_page_ids[i]); }
+                        }
+                        if (!valid_mtp_page_ids.empty()) {
+                            auto& mtp_pool = decoder->mtp_cache()->pool();
+                            void* d_mtp_staging = nullptr;
+                            CUDA_CHECK(cudaMallocAsync(&d_mtp_staging, loaded_mtp_kv.size(), device.stream));
+                            CUDA_CHECK(cudaMemcpyAsync(d_mtp_staging, loaded_mtp_kv.data(), loaded_mtp_kv.size(),
+                                                       cudaMemcpyHostToDevice, device.stream));
+                            mtp_pool.scatter_from_contiguous_device(valid_mtp_page_ids, d_mtp_staging, device.stream);
+                            CUDA_CHECK(cudaFreeAsync(d_mtp_staging, device.stream));
+                        }
+                    }
+                    if (sequence.tail_hidden.data != nullptr && !loaded_tail.empty()) {
+                        CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, loaded_tail.data(),
+                                                   std::min(sequence.tail_hidden.bytes(),
+                                                            loaded_tail.size()),
+                                                   cudaMemcpyHostToDevice, device.stream));
+                        sequence.tail_hidden_valid = true;
+                    }
+                    sequence.mtp_kv_valid = base > 0 ? base - 1 : 0;
+                }
+
+                sequence.text_kv_valid      = base;
+                sequence.rope_delta         = header.rope_delta;
+                sequence.execution_frontier = base;
+                sequence.ledger_frontier    = static_cast<std::uint32_t>(loaded_tokens.size());
+                sequence.ledger.assign(loaded_tokens.begin(), loaded_tokens.end());
+                sequence.retained           = true;
+                set_device_i32(io.rope_delta, sequence.rope_delta);
+            }
         } else if (request_plan.reuse == ReusePath::AppendAtFrontier) {
             if (!sequence.kv) {
                 throw std::logic_error("resident prefix has no KV allocation bundle");
@@ -544,7 +746,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                                                 : 0U;
         materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
         install_sampling(sequence, request, request_plan.sampling);
-        sequence.rope_delta = prompt.rope_delta;
+        if (request_plan.disk_snapshot_path.empty() || prompt.rope_delta != 0) {
+            sequence.rope_delta = prompt.rope_delta;
+        }
         set_device_i32(io.rope_delta, sequence.rope_delta);
 
         if (request_plan.turn_checkpoint_action != TurnCheckpointAction::KeepExisting) {
@@ -2237,6 +2441,272 @@ void ProgramImplCore::reset_memory_peaks() noexcept {
     persistent.reset_peak();
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
+}
+
+void ProgramImplCore::snapshot_lane_to_disk(std::uint32_t lane, DiskStateCache& disk_cache) {
+    if (lane >= max_concurrency) { return; }
+    SequenceState& sequence = sequences[lane];
+    if (sequence.ledger.empty() || sequence.text_kv_valid == 0) { return; }
+
+    const std::uint32_t current_tokens = static_cast<std::uint32_t>(sequence.ledger.size());
+    if (current_tokens < 128) { return; } // Avoid persisting engine warmup dummy prompts
+    if (sequence.last_disk_snapshot_tokens > 0 &&
+        current_tokens < sequence.last_disk_snapshot_tokens + 256) {
+        return;
+    }
+    sequence.last_disk_snapshot_tokens = current_tokens;
+
+    const std::uint64_t model_hash = model_identity_hash();
+    std::vector<TokenId> ledger_tokens(sequence.ledger.begin(), sequence.ledger.end());
+
+    // 1. Gather GDN recurrent + conv state for this lane
+    std::vector<std::byte> gdn_payload;
+    const std::int32_t current_slot = LinearStateSlots::current_state_slot(lane, max_concurrency);
+    for (const auto& t : decoder->linear_attention.recurrent) {
+        Tensor slot_t = t.slice(3, current_slot, 1);
+        const std::size_t old_sz = gdn_payload.size();
+        gdn_payload.resize(old_sz + slot_t.bytes());
+        CUDA_CHECK(cudaMemcpyAsync(gdn_payload.data() + old_sz, slot_t.data, slot_t.bytes(),
+                                   cudaMemcpyDeviceToHost, device.stream));
+    }
+    for (const auto& t : decoder->linear_attention.conv) {
+        Tensor slot_t = t.slice(2, current_slot, 1);
+        const std::size_t old_sz = gdn_payload.size();
+        gdn_payload.resize(old_sz + slot_t.bytes());
+        CUDA_CHECK(cudaMemcpyAsync(gdn_payload.data() + old_sz, slot_t.data, slot_t.bytes(),
+                                   cudaMemcpyDeviceToHost, device.stream));
+    }
+
+    // 2. Identify missing CoW Text KV physical pages and gather only the delta
+    const std::size_t total_tokens = ledger_tokens.size();
+    const std::size_t page_size = static_cast<std::size_t>(kPagedKVPageSize);
+    const std::uint32_t text_page_count = static_cast<std::uint32_t>((total_tokens + page_size - 1) / page_size);
+
+    std::vector<std::int32_t> valid_page_ids;
+    if (sequence.kv && sequence.kv->text.valid()) {
+        for (std::int32_t id : sequence.kv->text.page_ids()) {
+            if (id >= 0) { valid_page_ids.push_back(id); }
+        }
+    }
+
+    std::vector<std::uint64_t> all_page_hashes;
+    all_page_hashes.reserve(text_page_count);
+    std::vector<std::uint64_t> missing_page_hashes;
+    std::vector<std::int32_t> missing_physical_page_ids;
+
+    for (std::uint32_t i = 0; i < text_page_count; ++i) {
+        const std::size_t span_end = std::min<std::size_t>(total_tokens, static_cast<std::size_t>(i + 1) * page_size);
+        const std::uint64_t phash = DiskStateCache::hash_prompt_prefix(std::span<const TokenId>(ledger_tokens.data(), span_end));
+        all_page_hashes.push_back(phash);
+        if (!disk_cache.has_page(phash)) {
+            missing_page_hashes.push_back(phash);
+            if (i < valid_page_ids.size()) {
+                missing_physical_page_ids.push_back(valid_page_ids[i]);
+            }
+        }
+    }
+
+    std::vector<std::byte> missing_pages_data;
+    std::uint32_t single_page_bytes = 0;
+    void* h_text_pinned = nullptr;
+    std::size_t missing_total_bytes = 0;
+
+    if (!missing_physical_page_ids.empty()) {
+        const auto& pool = decoder->text_kv.pool();
+        single_page_bytes = static_cast<std::uint32_t>(pool.total_page_bytes());
+        missing_total_bytes = pool.total_page_bytes() * missing_physical_page_ids.size();
+
+        void* d_staging = nullptr;
+        CUDA_CHECK(cudaMallocAsync(&d_staging, missing_total_bytes, device.stream));
+        pool.gather_to_contiguous_device(missing_physical_page_ids, d_staging, device.stream);
+
+        CUDA_CHECK(cudaMallocHost(&h_text_pinned, missing_total_bytes));
+        CUDA_CHECK(cudaMemcpyAsync(h_text_pinned, d_staging, missing_total_bytes,
+                                   cudaMemcpyDeviceToHost, device.stream));
+        CUDA_CHECK(cudaFreeAsync(d_staging, device.stream));
+    } else if (sequence.kv && sequence.kv->text.valid()) {
+        const auto& pool = decoder->text_kv.pool();
+        single_page_bytes = static_cast<std::uint32_t>(pool.total_page_bytes());
+    }
+
+    // 3. Gather MTP KV cache pages if present
+    std::vector<std::byte> mtp_kv_payload;
+    std::uint32_t mtp_page_count = 0;
+    if (decoder->mtp_cache() && sequence.kv && sequence.kv->backend && sequence.kv->backend->valid()) {
+        std::vector<std::int32_t> valid_mtp_page_ids;
+        for (std::int32_t id : sequence.kv->backend->page_ids()) {
+            if (id >= 0) { valid_mtp_page_ids.push_back(id); }
+        }
+        mtp_page_count = static_cast<std::uint32_t>(valid_mtp_page_ids.size());
+        if (!valid_mtp_page_ids.empty()) {
+            const auto& mtp_pool = decoder->mtp_cache()->pool();
+            const std::size_t total_plane_bytes = mtp_pool.total_page_bytes() * valid_mtp_page_ids.size();
+            mtp_kv_payload.resize(total_plane_bytes);
+
+            void* d_mtp_staging = nullptr;
+            CUDA_CHECK(cudaMallocAsync(&d_mtp_staging, total_plane_bytes, device.stream));
+            mtp_pool.gather_to_contiguous_device(valid_mtp_page_ids, d_mtp_staging, device.stream);
+            CUDA_CHECK(cudaMemcpyAsync(mtp_kv_payload.data(), d_mtp_staging, total_plane_bytes,
+                                       cudaMemcpyDeviceToHost, device.stream));
+            CUDA_CHECK(cudaFreeAsync(d_mtp_staging, device.stream));
+        }
+    }
+
+    std::vector<std::byte> tail_hidden_payload;
+    if (sequence.tail_hidden_valid && sequence.tail_hidden.data != nullptr) {
+        tail_hidden_payload.resize(sequence.tail_hidden.bytes());
+        CUDA_CHECK(cudaMemcpyAsync(tail_hidden_payload.data(), sequence.tail_hidden.data,
+                                   sequence.tail_hidden.bytes(), cudaMemcpyDeviceToHost, device.stream));
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+
+    if (h_text_pinned && missing_total_bytes > 0) {
+        missing_pages_data.resize(missing_total_bytes);
+        std::memcpy(missing_pages_data.data(), h_text_pinned, missing_total_bytes);
+        CUDA_CHECK(cudaFreeHost(h_text_pinned));
+        h_text_pinned = nullptr;
+    }
+
+    disk_cache.enqueue_save_cow(model_hash, std::move(ledger_tokens), 0, sequence.rope_delta,
+                                std::move(gdn_payload), std::move(all_page_hashes),
+                                std::move(missing_page_hashes), std::move(missing_pages_data),
+                                single_page_bytes, std::move(mtp_kv_payload),
+                                mtp_page_count, std::move(tail_hidden_payload));
+}
+
+void ProgramImplCore::snapshot_turn_checkpoint_to_disk(std::uint32_t lane, DiskStateCache& disk_cache) {
+    if (lane >= max_concurrency) { return; }
+    SequenceState& sequence = sequences[lane];
+    if (!sequence.turn_checkpoint.valid || sequence.turn_checkpoint.frontier < 128 ||
+        sequence.ledger.empty() || sequence.turn_checkpoint.frontier > sequence.ledger.size()) {
+        return;
+    }
+    const std::uint32_t frontier = sequence.turn_checkpoint.frontier;
+    const std::uint64_t model_hash = model_identity_hash();
+    std::vector<TokenId> turn_toks(sequence.ledger.begin(), sequence.ledger.begin() + frontier);
+
+    // 1. Gather GDN linear state from turn_checkpoint_state_slot
+    std::vector<std::byte> gdn_payload;
+    const std::int32_t slot = LinearStateSlots::turn_checkpoint_state_slot(lane, max_concurrency);
+    for (const auto& t : decoder->linear_attention.recurrent) {
+        Tensor slot_t = t.slice(3, slot, 1);
+        const std::size_t old_sz = gdn_payload.size();
+        gdn_payload.resize(old_sz + slot_t.bytes());
+        CUDA_CHECK(cudaMemcpyAsync(gdn_payload.data() + old_sz, slot_t.data, slot_t.bytes(),
+                                   cudaMemcpyDeviceToHost, device.stream));
+    }
+    for (const auto& t : decoder->linear_attention.conv) {
+        Tensor slot_t = t.slice(2, slot, 1);
+        const std::size_t old_sz = gdn_payload.size();
+        gdn_payload.resize(old_sz + slot_t.bytes());
+        CUDA_CHECK(cudaMemcpyAsync(gdn_payload.data() + old_sz, slot_t.data, slot_t.bytes(),
+                                   cudaMemcpyDeviceToHost, device.stream));
+    }
+
+    // 2. Gather Text KV cache pages up to frontier
+    const std::size_t total_tokens = turn_toks.size();
+    const std::size_t page_size = static_cast<std::size_t>(kPagedKVPageSize);
+    const std::uint32_t text_page_count = static_cast<std::uint32_t>((total_tokens + page_size - 1) / page_size);
+
+    std::vector<std::int32_t> valid_page_ids;
+    if (sequence.kv && sequence.kv->text.valid()) {
+        for (std::int32_t id : sequence.kv->text.page_ids()) {
+            if (id >= 0) {
+                valid_page_ids.push_back(id);
+                if (valid_page_ids.size() == text_page_count) { break; }
+            }
+        }
+    }
+
+    std::vector<std::uint64_t> all_page_hashes;
+    all_page_hashes.reserve(text_page_count);
+    std::vector<std::uint64_t> missing_page_hashes;
+    std::vector<std::int32_t> missing_physical_page_ids;
+
+    for (std::uint32_t i = 0; i < text_page_count; ++i) {
+        const std::size_t span_end = std::min<std::size_t>(total_tokens, static_cast<std::size_t>(i + 1) * page_size);
+        const std::uint64_t phash = DiskStateCache::hash_prompt_prefix(std::span<const TokenId>(turn_toks.data(), span_end));
+        all_page_hashes.push_back(phash);
+        if (!disk_cache.has_page(phash)) {
+            missing_page_hashes.push_back(phash);
+            if (i < valid_page_ids.size()) {
+                missing_physical_page_ids.push_back(valid_page_ids[i]);
+            }
+        }
+    }
+
+    std::vector<std::byte> missing_pages_data;
+    std::uint32_t single_page_bytes = 0;
+    void* h_text_pinned = nullptr;
+    std::size_t missing_total_bytes = 0;
+
+    if (!missing_physical_page_ids.empty()) {
+        const auto& pool = decoder->text_kv.pool();
+        single_page_bytes = static_cast<std::uint32_t>(pool.total_page_bytes());
+        missing_total_bytes = pool.total_page_bytes() * missing_physical_page_ids.size();
+
+        void* d_staging = nullptr;
+        CUDA_CHECK(cudaMallocAsync(&d_staging, missing_total_bytes, device.stream));
+        pool.gather_to_contiguous_device(missing_physical_page_ids, d_staging, device.stream);
+
+        CUDA_CHECK(cudaMallocHost(&h_text_pinned, missing_total_bytes));
+        CUDA_CHECK(cudaMemcpyAsync(h_text_pinned, d_staging, missing_total_bytes,
+                                   cudaMemcpyDeviceToHost, device.stream));
+        CUDA_CHECK(cudaFreeAsync(d_staging, device.stream));
+    } else if (sequence.kv && sequence.kv->text.valid()) {
+        const auto& pool = decoder->text_kv.pool();
+        single_page_bytes = static_cast<std::uint32_t>(pool.total_page_bytes());
+    }
+
+    // 3. Gather MTP KV cache pages up to frontier if present
+    std::vector<std::byte> mtp_kv_payload;
+    std::uint32_t mtp_page_count = 0;
+    if (decoder->mtp_cache() && sequence.kv && sequence.kv->backend && sequence.kv->backend->valid()) {
+        const std::uint32_t needed_mtp_pages = (frontier > 0 ? frontier - 1 + page_size - 1 : 0) / page_size;
+        std::vector<std::int32_t> valid_mtp_page_ids;
+        for (std::int32_t id : sequence.kv->backend->page_ids()) {
+            if (id >= 0) {
+                valid_mtp_page_ids.push_back(id);
+                if (valid_mtp_page_ids.size() == needed_mtp_pages) { break; }
+            }
+        }
+        mtp_page_count = static_cast<std::uint32_t>(valid_mtp_page_ids.size());
+        if (!valid_mtp_page_ids.empty()) {
+            const auto& mtp_pool = decoder->mtp_cache()->pool();
+            const std::size_t total_plane_bytes = mtp_pool.total_page_bytes() * valid_mtp_page_ids.size();
+            mtp_kv_payload.resize(total_plane_bytes);
+
+            void* d_mtp_staging = nullptr;
+            CUDA_CHECK(cudaMallocAsync(&d_mtp_staging, total_plane_bytes, device.stream));
+            mtp_pool.gather_to_contiguous_device(valid_mtp_page_ids, d_mtp_staging, device.stream);
+            CUDA_CHECK(cudaMemcpyAsync(mtp_kv_payload.data(), d_mtp_staging, total_plane_bytes,
+                                       cudaMemcpyDeviceToHost, device.stream));
+            CUDA_CHECK(cudaFreeAsync(d_mtp_staging, device.stream));
+        }
+    }
+
+    std::vector<std::byte> tail_hidden_payload;
+    if (sequence.turn_checkpoint_hidden.data != nullptr) {
+        tail_hidden_payload.resize(sequence.turn_checkpoint_hidden.bytes());
+        CUDA_CHECK(cudaMemcpyAsync(tail_hidden_payload.data(), sequence.turn_checkpoint_hidden.data,
+                                   sequence.turn_checkpoint_hidden.bytes(), cudaMemcpyDeviceToHost, device.stream));
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+
+    if (h_text_pinned && missing_total_bytes > 0) {
+        missing_pages_data.resize(missing_total_bytes);
+        std::memcpy(missing_pages_data.data(), h_text_pinned, missing_total_bytes);
+        CUDA_CHECK(cudaFreeHost(h_text_pinned));
+        h_text_pinned = nullptr;
+    }
+
+    disk_cache.enqueue_save_cow(model_hash, std::move(turn_toks), 0, sequence.rope_delta,
+                                std::move(gdn_payload), std::move(all_page_hashes),
+                                std::move(missing_page_hashes), std::move(missing_pages_data),
+                                single_page_bytes, std::move(mtp_kv_payload),
+                                mtp_page_count, std::move(tail_hidden_payload));
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

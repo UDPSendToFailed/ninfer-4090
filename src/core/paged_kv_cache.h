@@ -107,6 +107,7 @@ struct PagedKVResize;
 class PagedKVPool {
 public:
     PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout);
+    ~PagedKVPool();
 
     PagedKVPool(const PagedKVPool&)            = delete;
     PagedKVPool& operator=(const PagedKVPool&) = delete;
@@ -130,6 +131,23 @@ public:
     // Zeros only the named physical page groups across every storage plane.
     void zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream = nullptr);
 
+    [[nodiscard]] std::size_t page_bytes(std::size_t plane_index) const;
+    void copy_page_to_host(std::size_t plane_index, std::int32_t page_id, void* dst,
+                           cudaStream_t stream = nullptr) const;
+    void copy_page_from_host(std::size_t plane_index, std::int32_t page_id, const void* src,
+                             cudaStream_t stream = nullptr);
+    void copy_pages_to_host(std::size_t plane_index, std::span<const std::int32_t> page_ids, void* dst,
+                            cudaStream_t stream = nullptr) const;
+    void copy_pages_from_host(std::size_t plane_index, std::span<const std::int32_t> page_ids, const void* src,
+                              cudaStream_t stream = nullptr);
+
+    // Device-side gather/scatter across all planes
+    void gather_to_contiguous_device(std::span<const std::int32_t> page_ids, void* d_staging,
+                                     cudaStream_t stream = nullptr) const;
+    void scatter_from_contiguous_device(std::span<const std::int32_t> page_ids, const void* d_staging,
+                                       cudaStream_t stream = nullptr);
+    [[nodiscard]] std::size_t total_page_bytes() const noexcept;
+
 private:
     friend class PagedKVAllocation;
     friend void resize_paged_kv_bundle(std::span<const PagedKVResize> changes);
@@ -151,6 +169,9 @@ private:
     std::vector<bool> row_in_use_;
     std::uint32_t entitled_pages_ = 0;
     std::uint32_t mapped_pages_   = 0;
+    void* d_planes_               = nullptr;
+    std::uint32_t max_page_head_uint4s_ = 0;
+    std::uint32_t max_num_heads_        = 0;
 };
 
 class PagedKVAllocation {

@@ -179,36 +179,51 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
 
-    if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained) {
-        const bool dflash_append_ready =
-            speculative_backend != SpeculativeBackend::DFlash ||
-            sequence.dflash_context_frontier == sequence.execution_frontier;
-        if (sequence.execution_frontier != 0 && dflash_append_ready &&
-            qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
-                                            sequence.execution_frontier)) {
-            plan->reuse      = ReusePath::AppendAtFrontier;
-            plan->reuse_base = sequence.execution_frontier;
-        } else if (sequence.turn_checkpoint.valid && sequence.turn_checkpoint.frontier != 0 &&
-                   sequence.turn_checkpoint.frontier < prompt.token_ids.size() &&
-                   qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
-                                                   sequence.prefix_identity,
-                                                   sequence.turn_checkpoint.frontier)) {
-            plan->reuse      = ReusePath::RestoreTurnCheckpoint;
-            plan->reuse_base = sequence.turn_checkpoint.frontier;
+    if (base.allow_prefix_reuse && prompt.identity.reusable) {
+        if (sequence.retained) {
+            const bool dflash_append_ready =
+                speculative_backend != SpeculativeBackend::DFlash ||
+                sequence.dflash_context_frontier == sequence.execution_frontier;
+            if (sequence.execution_frontier != 0 && dflash_append_ready &&
+                qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
+                                                sequence.execution_frontier)) {
+                plan->reuse      = ReusePath::AppendAtFrontier;
+                plan->reuse_base = sequence.execution_frontier;
+            } else if (sequence.turn_checkpoint.valid && sequence.turn_checkpoint.frontier != 0 &&
+                       sequence.turn_checkpoint.frontier < prompt.token_ids.size() &&
+                       qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
+                                                       sequence.prefix_identity,
+                                                       sequence.turn_checkpoint.frontier)) {
+                plan->reuse      = ReusePath::RestoreTurnCheckpoint;
+                plan->reuse_base = sequence.turn_checkpoint.frontier;
+            }
+        }
+        if (plan->reuse == ReusePath::FullReset && disk_state_cache && disk_state_cache->enabled()) {
+            const std::uint64_t model_hash = model_identity_hash();
+            auto disk_match = disk_state_cache->find_longest_matching_prefix(model_hash, prompt.token_ids);
+            if (disk_match && disk_match->matched_tokens > 0 &&
+                disk_match->matched_tokens < prompt.token_ids.size()) {
+                plan->reuse              = ReusePath::RestoreDiskCheckpoint;
+                plan->reuse_base         = disk_match->matched_tokens;
+                plan->disk_snapshot_path = disk_match->file_path;
+            }
         }
     }
 
     if (speculative_backend == SpeculativeBackend::Mtp) {
+        const bool is_disk_restore = plan->reuse == ReusePath::RestoreDiskCheckpoint;
         const bool append_ready =
             plan->reuse == ReusePath::AppendAtFrontier && sequence.tail_hidden_valid &&
             decoder->mtp_cache() != nullptr &&
             (plan->reuse_base == 0 || sequence.mtp_kv_valid >= plan->reuse_base - 1);
-        const bool checkpoint_ready = plan->reuse == ReusePath::RestoreTurnCheckpoint &&
-                                      decoder->mtp_cache() != nullptr &&
-                                      sequence.mtp_kv_valid >= plan->reuse_base - 1;
+        const bool checkpoint_ready =
+            (plan->reuse == ReusePath::RestoreTurnCheckpoint && decoder->mtp_cache() != nullptr &&
+             sequence.mtp_kv_valid >= plan->reuse_base - 1) ||
+            is_disk_restore;
         if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready) {
-            plan->reuse      = ReusePath::FullReset;
-            plan->reuse_base = 0;
+            plan->reuse              = ReusePath::FullReset;
+            plan->reuse_base         = 0;
+            plan->disk_snapshot_path.clear();
         }
     }
 
@@ -222,6 +237,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
 
     const std::optional<std::uint32_t> desired = base.turn_rewrite_boundary;
     const bool can_keep                        = desired && plan->reuse != ReusePath::FullReset &&
+                          plan->reuse != ReusePath::RestoreDiskCheckpoint &&
                           sequence.turn_checkpoint.valid &&
                           sequence.turn_checkpoint.frontier == *desired &&
                           qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
@@ -230,6 +246,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         plan->turn_checkpoint_action = TurnCheckpointAction::Drop;
     } else if (can_keep) {
         plan->turn_checkpoint_action = TurnCheckpointAction::KeepExisting;
+    } else if (plan->reuse == ReusePath::RestoreDiskCheckpoint) {
+        plan->turn_checkpoint_action = TurnCheckpointAction::Drop;
     } else {
         if (*desired <= plan->reuse_base) {
             plan->reuse      = ReusePath::FullReset;
@@ -248,7 +266,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             plan->mtp_bridge  = plan->reuse_base < plan->summary.prompt_tokens
                                     ? MtpBridgeMode::BeforeSuffix
                                     : MtpBridgeMode::AfterExactHit;
-        } else if (plan->reuse == ReusePath::RestoreTurnCheckpoint) {
+        } else if (plan->reuse == ReusePath::RestoreTurnCheckpoint ||
+                   plan->reuse == ReusePath::RestoreDiskCheckpoint) {
             plan->prepare_mtp = true;
             plan->mtp_bridge  = MtpBridgeMode::BeforeSuffix;
         }

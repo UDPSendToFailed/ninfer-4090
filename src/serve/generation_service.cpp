@@ -267,6 +267,9 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.enable_vision        = options_.enable_vision;
     engine_options.vision_max_tokens    = options_.vision_max_tokens;
     engine_options.use_cuda_graph       = options_.use_cuda_graph;
+    engine_options.enable_prompt_cache  = options_.enable_prompt_cache;
+    engine_options.prompt_cache_dir     = options_.prompt_cache_dir;
+    engine_options.prompt_cache_max_bytes = options_.prompt_cache_max_bytes;
     engine_options.speculative          = options_.speculative;
     engine_options.load_progress        = std::move(load_progress);
     engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));

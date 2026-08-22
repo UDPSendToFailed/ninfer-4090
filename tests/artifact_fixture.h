@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -14,6 +15,12 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace ninfer::test::artifact_fixture {
 
@@ -75,8 +82,15 @@ inline TemporaryArtifact write_fixture(const Json& directory, std::string_view s
         }
     }
 
+    static std::atomic<std::uint64_t> counter{0};
+#ifdef _WIN32
+    const auto pid = _getpid();
+#else
+    const auto pid = getpid();
+#endif
     auto path = std::filesystem::temp_directory_path() /
-                ("ninfer_artifact_" + std::string(suffix) + ".ninfer");
+                ("ninfer_artifact_" + std::string(suffix) + "_" + std::to_string(pid) + "_" +
+                 std::to_string(counter.fetch_add(1)) + ".ninfer");
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     output.write(reinterpret_cast<const char*>(file.data()),
                  static_cast<std::streamsize>(file.size()));

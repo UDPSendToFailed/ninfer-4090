@@ -123,6 +123,67 @@ int expect_zeroed_pages(ninfer::PagedKVPool& pool, ninfer::PagedKVPlaneOrder ord
     return 1;
 }
 
+int expect_page_host_roundtrip(ninfer::PagedKVPool& pool, ninfer::PagedKVPlaneOrder order,
+                               cudaStream_t stream, const char* label) {
+    const std::size_t planes = pool.plane_count();
+
+    // 1. Fill entire device pool with a known background pattern (0xAA)
+    for (std::size_t p = 0; p < planes; ++p) {
+        const ninfer::Tensor& plane = pool.plane(p);
+        CUDA_CHECK(cudaMemsetAsync(plane.data, 0xaa, plane.bytes(), stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // 2. Generate unique deterministic data for physical page 3 across all planes
+    const std::int32_t target_page = 3;
+    std::vector<std::vector<std::byte>> original_page_data(planes);
+    for (std::size_t p = 0; p < planes; ++p) {
+        const std::size_t bytes = pool.page_bytes(p);
+        original_page_data[p].resize(bytes);
+        for (std::size_t i = 0; i < bytes; ++i) {
+            original_page_data[p][i] = static_cast<std::byte>((p * 37 + i * 13 + target_page) & 0xFF);
+        }
+        // Write to GPU using copy_page_from_host
+        pool.copy_page_from_host(p, target_page, original_page_data[p].data(), stream);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // 3. Read back using copy_page_to_host into a clean buffer
+    std::vector<std::vector<std::byte>> readback_data(planes);
+    for (std::size_t p = 0; p < planes; ++p) {
+        const std::size_t bytes = pool.page_bytes(p);
+        readback_data[p].resize(bytes, std::byte{0});
+        pool.copy_page_to_host(p, target_page, readback_data[p].data(), stream);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // 4. Verify byte-exact equality for target page across all planes
+    for (std::size_t p = 0; p < planes; ++p) {
+        if (readback_data[p] != original_page_data[p]) {
+            std::cerr << label << " plane " << p << " roundtrip data mismatch for page "
+                      << target_page << '\n';
+            return 1;
+        }
+    }
+
+    // 5. Verify that neighboring physical page 2 was not overwritten
+    for (std::size_t p = 0; p < planes; ++p) {
+        const std::size_t bytes = pool.page_bytes(p);
+        std::vector<std::byte> neighbor(bytes);
+        pool.copy_page_to_host(p, 2, neighbor.data(), stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (std::size_t i = 0; i < bytes; ++i) {
+            if (static_cast<unsigned char>(neighbor[i]) != 0xaa) {
+                std::cerr << label << " plane " << p << " corrupted neighbor page 2 at byte " << i
+                          << '\n';
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -169,6 +230,8 @@ int main() {
     const std::int32_t selected_pages[] = {1, 2, 6};
     failures += expect_zeroed_pages(paged_pool, ninfer::PagedKVPlaneOrder::PageMajor,
                                     selected_pages, ctx.stream, "page-major selective zero");
+    failures += expect_page_host_roundtrip(paged_pool, ninfer::PagedKVPlaneOrder::PageMajor,
+                                           ctx.stream, "page-major page host roundtrip");
 
     auto head_major_plan = plan_paged_cache(10, 10, 1, {{ninfer::DType::BF16, 128, 8}},
                                             ninfer::PagedKVPlaneOrder::HeadMajor);
@@ -179,6 +242,8 @@ int main() {
     failures += check_shape(head_major_pool.plane(0), {128, 64, 10, 8}, "head-major paged plane");
     failures += expect_zeroed_pages(head_major_pool, ninfer::PagedKVPlaneOrder::HeadMajor,
                                     selected_pages, ctx.stream, "head-major selective zero");
+    failures += expect_page_host_roundtrip(head_major_pool, ninfer::PagedKVPlaneOrder::HeadMajor,
+                                           ctx.stream, "head-major page host roundtrip");
 
     auto allocation_a = paged_pool.reserve(3);
     auto allocation_b = paged_pool.reserve(3);

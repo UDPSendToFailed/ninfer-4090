@@ -224,6 +224,26 @@ SpeculativeStats Program<Variant>::speculative_stats_lane(std::uint32_t lane) co
 }
 
 template <>
+void Program<Variant>::snapshot_lane_to_disk(std::uint32_t lane, DiskStateCache& disk_cache) {
+    impl_->snapshot_lane_to_disk(lane, disk_cache);
+}
+
+template <>
+void Program<Variant>::snapshot_turn_checkpoint_to_disk(std::uint32_t lane, DiskStateCache& disk_cache) {
+    impl_->snapshot_turn_checkpoint_to_disk(lane, disk_cache);
+}
+
+template <>
+void Program<Variant>::set_disk_state_cache(DiskStateCache* cache) noexcept {
+    impl_->set_disk_state_cache(cache);
+}
+
+template <>
+std::string Program<Variant>::config_signature_slug() const {
+    return impl_->config_signature_slug();
+}
+
+template <>
 MemorySummary Program<Variant>::memory_summary() const noexcept {
     return impl_->memory_summary();
 }

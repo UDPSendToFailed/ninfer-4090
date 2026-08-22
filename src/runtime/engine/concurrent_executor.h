@@ -2,6 +2,7 @@
 
 // Small fixed-capacity request scheduling and batched decode execution for every backend.
 
+#include "core/disk_state_cache.h"
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
@@ -55,6 +56,18 @@ public:
             admission_capacity_.main_kv_pages == 0) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
+        DiskStateCacheConfig disk_config;
+        if (!options.prompt_cache_dir.empty()) {
+            disk_config.cache_dir = options.prompt_cache_dir;
+        }
+        const std::string slug = instance_.program->config_signature_slug();
+        if (!slug.empty()) {
+            disk_config.cache_dir /= slug;
+        }
+        disk_config.max_cache_bytes = options.prompt_cache_max_bytes;
+        disk_config.enabled         = options.enable_prompt_cache;
+        disk_cache_                 = std::make_unique<DiskStateCache>(std::move(disk_config));
+        instance_.program->set_disk_state_cache(disk_cache_.get());
         worker_ = std::thread([this] { worker_loop(); });
     }
 
@@ -126,6 +139,10 @@ public:
         if (submitted >= pending_deadline) {
             throw RequestError(RequestErrorKind::QueueTimeout,
                                "inference request expired before submission");
+        }
+
+        if (disk_cache_) {
+            disk_cache_->cancel_in_flight();
         }
 
         std::uint64_t request_id = 0;
@@ -441,6 +458,10 @@ private:
             result.timings = instance_.program->generation_timings_lane(*request->lane);
             result.timings.prepare_seconds = request->prepare_seconds;
             result.speculative = instance_.program->speculative_stats_lane(*request->lane);
+            if (disk_cache_ && disk_cache_->enabled() && reason != FinishReason::Cancelled) {
+                instance_.program->snapshot_turn_checkpoint_to_disk(*request->lane, *disk_cache_);
+                instance_.program->snapshot_lane_to_disk(*request->lane, *disk_cache_);
+            }
         }
         if (request->first_token) {
             result.timings.first_token_seconds =
@@ -1175,6 +1196,7 @@ private:
     std::uint64_t next_protection_epoch_ = 1;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
+    std::unique_ptr<DiskStateCache> disk_cache_;
     bool stopping_ = false;
     bool failed_   = false;
     std::thread worker_;

@@ -680,6 +680,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         }
     }
 
+    impl->enable_prompt_cache = inputs.enable_prompt_cache;
+
     impl->device_reservation_bytes = checked_add(
         checked_add(
             checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
@@ -720,10 +722,11 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                        options.kv_cache == KvCacheStorage::RK4V4E8,
         .kv_e8_lattice = options.kv_cache == KvCacheStorage::RK4V4E8,
         .kv_e8_root    = options.kv_cache == KvCacheStorage::RK2V4E8,
-        .proposal_head  = options.speculative.proposal_head,
-        .features       = qwen3_6::startup_features(options),
-        .use_cuda_graph = options.use_cuda_graph,
-        .device         = options.device,
+        .proposal_head       = options.speculative.proposal_head,
+        .features            = qwen3_6::startup_features(options),
+        .use_cuda_graph      = options.use_cuda_graph,
+        .enable_prompt_cache = options.enable_prompt_cache,
+        .device              = options.device,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
