@@ -197,6 +197,71 @@ int test_preserve_thinking_options() {
     return failures;
 }
 
+int test_chat_template_thinking_aliases() {
+    const Json base = {
+        {"model", "m"},
+        {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})},
+    };
+    int failures = 0;
+
+    Json nested_enable                    = base;
+    nested_enable["chat_template_kwargs"] = Json{{"enable_thinking", false}};
+    failures += check(
+        parse_chat_completion_request(nested_enable, default_limits()).enable_thinking == false,
+        "nested enable_thinking false was not parsed");
+
+    Json nested_effort                    = base;
+    nested_effort["chat_template_kwargs"] = Json{{"reasoning_effort", "low"}};
+    const GenerationRequest nested_effort_request =
+        parse_chat_completion_request(nested_effort, default_limits());
+    failures += check(nested_effort_request.reasoning_effort == RequestedReasoningEffort::Low,
+                      "nested reasoning_effort was not parsed");
+    failures += check(nested_effort_request.reasoning_effort_param ==
+                          "chat_template_kwargs.reasoning_effort",
+                      "nested reasoning_effort parameter name was not retained");
+
+    Json agreement                = base;
+    agreement["enable_thinking"]  = false;
+    agreement["reasoning_effort"] = "low";
+    agreement["chat_template_kwargs"] =
+        Json{{"enable_thinking", false}, {"reasoning_effort", "low"}};
+    const GenerationRequest agreement_request =
+        parse_chat_completion_request(agreement, default_limits());
+    failures += check(agreement_request.enable_thinking == false &&
+                          agreement_request.reasoning_effort == RequestedReasoningEffort::Low,
+                      "matching top-level and nested thinking options were rejected");
+
+    Json enable_conflict                    = agreement;
+    enable_conflict["enable_thinking"]      = true;
+    enable_conflict["chat_template_kwargs"] = Json{{"enable_thinking", false}};
+    failures += check(api_code([&] {
+                          (void)parse_chat_completion_request(enable_conflict, default_limits());
+                      }) == "conflicting_template_option",
+                      "conflicting enable_thinking aliases were accepted");
+
+    Json effort_conflict                    = agreement;
+    effort_conflict["reasoning_effort"]     = "medium";
+    effort_conflict["chat_template_kwargs"] = Json{{"reasoning_effort", "low"}};
+    failures += check(api_code([&] {
+                          (void)parse_chat_completion_request(effort_conflict, default_limits());
+                      }) == "conflicting_template_option",
+                      "conflicting reasoning_effort aliases were accepted");
+
+    Json unknown                    = base;
+    unknown["chat_template_kwargs"] = Json{{"enable_thinking", false}, {"future", true}};
+    failures += check(api_code([&] {
+                          (void)parse_chat_completion_request(unknown, default_limits());
+                      }) == "chat_template_option_not_supported",
+                      "unknown nested option was accepted");
+
+    Json bad_enable                    = base;
+    bad_enable["chat_template_kwargs"] = Json{{"enable_thinking", "false"}};
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(bad_enable, default_limits()); }),
+        "non-boolean nested enable_thinking was accepted");
+    return failures;
+}
+
 int test_reasoning_effort() {
     const Json base = {
         {"model", "m"},
@@ -901,6 +966,7 @@ int main() {
     int failures = 0;
     failures += test_parse_string_content();
     failures += test_preserve_thinking_options();
+    failures += test_chat_template_thinking_aliases();
     failures += test_reasoning_effort();
     failures += test_parse_parts_and_flatten();
     failures += test_developer_role_mapped();

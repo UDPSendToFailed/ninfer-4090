@@ -83,8 +83,8 @@ The endpoint supports:
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
 - function tools, tool choices, assistant tool-call history, and tool-result messages;
-- the top-level `reasoning_effort` field;
-- the `enable_thinking` extension;
+- the top-level `reasoning_effort` field and its `chat_template_kwargs.reasoning_effort` alias;
+- the `enable_thinking` extension and its `chat_template_kwargs.enable_thinking` alias;
 - `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias.
 
 The request `model` must equal the public model ID: the artifact `identity.model_id` by default, or
@@ -102,7 +102,9 @@ For Chat Completions, `reasoning_effort: "none"` disables thinking. `low`, `medi
 select the corresponding template effort when available. The other OpenAI protocol values
 `minimal`, `high`, and `max` are parsed but rejected when the loaded template does not expose them.
 `enable_thinking` controls the same new-turn thinking switch; a contradictory combination with
-`reasoning_effort` returns `conflicting_template_option`.
+`reasoning_effort` returns `conflicting_template_option`. The aliases under `chat_template_kwargs`
+are the llama.cpp and vLLM spellings. When an option is supplied both at the top level and under
+`chat_template_kwargs`, the values must agree.
 
 `preserve_thinking` controls whether reasoning from closed assistant turns remains in later
 prompts. It defaults to the server setting, which is off unless `--preserve-thinking` is used. If
