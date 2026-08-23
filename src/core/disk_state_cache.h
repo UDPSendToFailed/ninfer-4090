@@ -176,6 +176,9 @@ public:
     // Evicts oldest manifests if total cache size exceeds max_cache_bytes
     void prune_lru();
 
+    // Performs mark-and-sweep compaction on the physical page pool to reclaim dead pages
+    void compact_pool();
+
     // Immediately cancels any currently running or queued background save tasks
     void cancel_in_flight() noexcept;
 

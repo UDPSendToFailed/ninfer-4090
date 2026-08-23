@@ -18,6 +18,7 @@
 #include <sstream>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace ninfer {
 
@@ -82,6 +83,24 @@ bool is_valid_header(const DiskStateHeader& h, std::uint64_t file_size) {
                                          h.mtp_kv_bytes +
                                          h.tail_hidden_bytes;
     return file_size == expected_total;
+}
+
+void read_manifest_page_hashes(const std::filesystem::path& path,
+                               const DiskStateHeader& header,
+                               std::unordered_set<std::uint64_t>& out_hashes) {
+    if (header.text_page_count == 0) { return; }
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) { return; }
+    const std::uint64_t page_hashes_offset =
+        sizeof(DiskStateHeader) + static_cast<std::uint64_t>(header.token_count) * sizeof(TokenId);
+    file.seekg(static_cast<std::streamoff>(page_hashes_offset));
+    std::vector<std::uint64_t> hashes(header.text_page_count);
+    if (file.read(reinterpret_cast<char*>(hashes.data()),
+                  header.text_page_count * sizeof(std::uint64_t))) {
+        for (std::uint64_t h : hashes) {
+            out_hashes.insert(h);
+        }
+    }
 }
 
 } // namespace
@@ -167,6 +186,128 @@ public:
 
         data_file.flush();
         index_file.flush();
+    }
+
+    struct CompactStats {
+        std::size_t live_pages_retained = 0;
+        std::size_t dead_pages_purged   = 0;
+        std::uint64_t bytes_freed       = 0;
+        std::int64_t elapsed_ms         = 0;
+    };
+
+    [[nodiscard]] std::size_t total_pages() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return page_index_.size();
+    }
+
+    CompactStats compact(const std::unordered_set<std::uint64_t>& live_hashes,
+                         std::size_t min_dead_pages = 1) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        CompactStats stats{};
+        std::error_code ec;
+
+        if (!std::filesystem::exists(pool_data_path_, ec)) {
+            page_index_.clear();
+            std::filesystem::remove(pool_index_path_, ec);
+            return stats;
+        }
+
+        const std::uint64_t old_file_size = std::filesystem::file_size(pool_data_path_, ec);
+
+        if (live_hashes.empty()) {
+            stats.dead_pages_purged = page_index_.size();
+            stats.bytes_freed       = old_file_size;
+            page_index_.clear();
+            std::filesystem::remove(pool_data_path_, ec);
+            std::filesystem::remove(pool_index_path_, ec);
+            return stats;
+        }
+
+        std::size_t dead_count = 0;
+        for (const auto& [hash, old_rec] : page_index_) {
+            if (!live_hashes.contains(hash)) {
+                ++dead_count;
+            }
+        }
+
+        if (dead_count < min_dead_pages) {
+            // Below threshold: avoid heavy full-pool rewrites for trivial orphaned page counts
+            stats.live_pages_retained = page_index_.size();
+            return stats;
+        }
+
+        const auto t_compact_0 = std::chrono::steady_clock::now();
+
+        const auto temp_data_path  = pool_data_path_.string() + ".tmp";
+        const auto temp_index_path = pool_index_path_.string() + ".tmp";
+
+        // Clean up any stale leftover temporary files
+        std::filesystem::remove(temp_data_path, ec);
+        std::filesystem::remove(temp_index_path, ec);
+
+        std::ifstream src_data(pool_data_path_, std::ios::binary);
+        std::ofstream dst_data(temp_data_path, std::ios::binary | std::ios::trunc);
+        std::ofstream dst_index(temp_index_path, std::ios::binary | std::ios::trunc);
+
+        if (!src_data.is_open() || !dst_data.is_open() || !dst_index.is_open()) {
+            std::filesystem::remove(temp_data_path, ec);
+            std::filesystem::remove(temp_index_path, ec);
+            return stats;
+        }
+
+        std::unordered_map<std::uint64_t, PageIndexRecord> new_page_index;
+        new_page_index.reserve(live_hashes.size());
+        std::uint64_t new_file_size = 0;
+        std::vector<char> buffer;
+
+        for (const auto& [hash, old_rec] : page_index_) {
+            if (!live_hashes.contains(hash)) {
+                ++stats.dead_pages_purged;
+                continue;
+            }
+
+            const std::uint64_t aligned_page_bytes =
+                (static_cast<std::uint64_t>(old_rec.page_bytes) + 4095ULL) & ~4095ULL;
+            if (buffer.size() < aligned_page_bytes) {
+                buffer.resize(aligned_page_bytes);
+            }
+
+            src_data.seekg(static_cast<std::streamoff>(old_rec.file_offset));
+            if (!src_data.read(buffer.data(), static_cast<std::streamsize>(aligned_page_bytes))) {
+                continue;
+            }
+
+            dst_data.write(buffer.data(), static_cast<std::streamsize>(aligned_page_bytes));
+
+            PageIndexRecord new_rec;
+            new_rec.page_hash   = hash;
+            new_rec.file_offset = new_file_size;
+            new_rec.page_bytes  = old_rec.page_bytes;
+            new_rec.reserved    = 0;
+
+            dst_index.write(reinterpret_cast<const char*>(&new_rec), sizeof(new_rec));
+            new_page_index[hash] = new_rec;
+            new_file_size += aligned_page_bytes;
+            ++stats.live_pages_retained;
+        }
+
+        dst_data.flush();
+        dst_index.flush();
+        src_data.close();
+        dst_data.close();
+        dst_index.close();
+
+        // Atomic file swap
+        std::filesystem::remove(pool_data_path_, ec);
+        std::filesystem::rename(temp_data_path, pool_data_path_, ec);
+        std::filesystem::remove(pool_index_path_, ec);
+        std::filesystem::rename(temp_index_path, pool_index_path_, ec);
+
+        page_index_       = std::move(new_page_index);
+        stats.bytes_freed = (old_file_size > new_file_size) ? (old_file_size - new_file_size) : 0;
+        stats.elapsed_ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t_compact_0).count();
+        return stats;
     }
 
 private:
@@ -592,8 +733,10 @@ public:
             }
         }
 
+        std::uint64_t pool_bytes = 0;
         if (std::filesystem::exists(journal_.pool_data_path(), ec)) {
-            total_bytes += std::filesystem::file_size(journal_.pool_data_path(), ec);
+            pool_bytes = std::filesystem::file_size(journal_.pool_data_path(), ec);
+            total_bytes += pool_bytes;
         }
 
         if (total_bytes <= config_.max_cache_bytes) { return; }
@@ -618,6 +761,45 @@ public:
                       << " manifest(s) (" << std::fixed << std::setprecision(1) << evicted_mb
                       << "MB freed, limit=" << limit_gb << "GB)\n" << std::flush;
         }
+
+        // Perform Mark-and-Sweep compaction on the page store journal if manifests were evicted
+        // or if pool_bytes alone exceeds 40% of max_cache_bytes
+        if (evicted_count > 0 || pool_bytes > (config_.max_cache_bytes * 4 / 10)) {
+            std::unordered_set<std::uint64_t> live_hashes;
+            for (const auto& [manifest_path, header] : index_) {
+                read_manifest_page_hashes(manifest_path, header, live_hashes);
+            }
+            // Require at least 32 dead pages (or pool > 50% limit) to avoid heavy full-pool rewrites for single-manifest evictions
+            const std::size_t min_dead = (pool_bytes > (config_.max_cache_bytes / 2)) ? 16 : 32;
+            const auto stats = journal_.compact(live_hashes, min_dead);
+            if (stats.dead_pages_purged > 0) {
+                const double freed_mb = static_cast<double>(stats.bytes_freed) / (1024.0 * 1024.0);
+                std::cout << "[info] ninfer: [prompt-cache] compacted page pool: purged "
+                          << stats.dead_pages_purged << " dead page(s), retained "
+                          << stats.live_pages_retained << " live page(s) ("
+                          << std::fixed << std::setprecision(1) << freed_mb << "MB freed in "
+                          << stats.elapsed_ms << "ms)\n"
+                          << std::flush;
+            }
+        }
+    }
+
+    void compact_pool() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::unordered_set<std::uint64_t> live_hashes;
+        for (const auto& [manifest_path, header] : index_) {
+            read_manifest_page_hashes(manifest_path, header, live_hashes);
+        }
+        const auto stats = journal_.compact(live_hashes);
+        if (stats.dead_pages_purged > 0) {
+            const double freed_mb = static_cast<double>(stats.bytes_freed) / (1024.0 * 1024.0);
+            std::cout << "[info] ninfer: [prompt-cache] compacted page pool: purged "
+                      << stats.dead_pages_purged << " dead page(s), retained "
+                      << stats.live_pages_retained << " live page(s) ("
+                      << std::fixed << std::setprecision(1) << freed_mb << "MB freed in "
+                      << stats.elapsed_ms << "ms)\n"
+                      << std::flush;
+        }
     }
 
     void cancel_in_flight() noexcept {
@@ -641,6 +823,7 @@ private:
     void scan_cache_dir() {
         std::error_code ec;
         const auto manifest_dir = config_.cache_dir / "manifests";
+        std::size_t removed_invalid_manifests = 0;
         for (const auto& entry : std::filesystem::directory_iterator(manifest_dir, ec)) {
             if (entry.is_regular_file() && entry.path().extension() == ".tmp") {
                 std::filesystem::remove(entry.path(), ec);
@@ -654,13 +837,48 @@ private:
                     DiskStateHeader h;
                     f.read(reinterpret_cast<char*>(&h), sizeof(h));
                     if (f && is_valid_header(h, file_size)) {
-                        index_[entry.path()] = h;
-                        valid                = true;
+                        std::unordered_set<std::uint64_t> hashes;
+                        read_manifest_page_hashes(entry.path(), h, hashes);
+                        bool all_pages_exist = true;
+                        for (std::uint64_t ph : hashes) {
+                            if (!journal_.has_page(ph)) {
+                                all_pages_exist = false;
+                                break;
+                            }
+                        }
+                        if (all_pages_exist) {
+                            index_[entry.path()] = h;
+                            valid                = true;
+                        }
                     }
                 }
                 if (!valid) {
                     std::filesystem::remove(entry.path(), ec);
+                    ++removed_invalid_manifests;
                 }
+            }
+        }
+
+        if (removed_invalid_manifests > 0) {
+            std::cout << "[info] ninfer: [prompt-cache] removed " << removed_invalid_manifests
+                      << " invalid/incomplete manifest(s) on startup\n" << std::flush;
+        }
+
+        // On startup: purge dead pages from prior abnormal terminations / deletions
+        if (std::filesystem::exists(journal_.pool_data_path(), ec)) {
+            std::unordered_set<std::uint64_t> live_hashes;
+            for (const auto& [manifest_path, header] : index_) {
+                read_manifest_page_hashes(manifest_path, header, live_hashes);
+            }
+            const auto stats = journal_.compact(live_hashes);
+            if (stats.dead_pages_purged > 0) {
+                const double freed_mb = static_cast<double>(stats.bytes_freed) / (1024.0 * 1024.0);
+                std::cout << "[info] ninfer: [prompt-cache] startup compaction: purged "
+                          << stats.dead_pages_purged << " dead page(s), retained "
+                          << stats.live_pages_retained << " live page(s) ("
+                          << std::fixed << std::setprecision(1) << freed_mb << "MB freed in "
+                          << stats.elapsed_ms << "ms)\n"
+                          << std::flush;
             }
         }
     }
@@ -857,6 +1075,10 @@ void DiskStateCache::enqueue_save(std::uint64_t model_hash,
 
 void DiskStateCache::prune_lru() {
     impl_->prune_lru();
+}
+
+void DiskStateCache::compact_pool() {
+    impl_->compact_pool();
 }
 
 void DiskStateCache::cancel_in_flight() noexcept {

@@ -261,6 +261,120 @@ void test_cancel_in_flight() {
     std::filesystem::remove_all(test_dir, ec);
 }
 
+void test_mark_and_sweep_pool_compaction() {
+    const std::filesystem::path test_dir = "./.test_ninfer_cache_compaction";
+    std::error_code ec;
+    std::filesystem::remove_all(test_dir, ec);
+
+    DiskStateCacheConfig config;
+    config.cache_dir       = test_dir;
+    config.max_cache_bytes = 100ULL << 20; // 100 MB
+    config.enabled         = true;
+
+    const std::uint64_t model_hash = 0xCAFEBABEDEADBEEFULL;
+
+    // Tokens:
+    // Turn 1: 128 tokens (2 pages: P0, P1)
+    // Turn 2: 192 tokens (3 pages: P0, P1, P2)
+    // Turn 3: 256 tokens (4 pages: P0, P1, P2, P3)
+    // Branch: 192 tokens (3 pages: P0, P1, P_branch)
+    const auto tokens_turn1 = generate_tokens(128, 1);
+    const auto tokens_turn2 = generate_tokens(192, 1);
+    const auto tokens_turn3 = generate_tokens(256, 1);
+    auto tokens_branch = tokens_turn1;
+    auto branch_suffix = generate_tokens(64, 999);
+    tokens_branch.insert(tokens_branch.end(), branch_suffix.begin(), branch_suffix.end());
+
+    constexpr std::uint32_t page_bytes = 8192; // 8 KiB page
+    const auto kv_turn1 = generate_deterministic_bytes(2 * page_bytes, 101);
+    const auto kv_turn2 = generate_deterministic_bytes(3 * page_bytes, 102);
+    const auto kv_turn3 = generate_deterministic_bytes(4 * page_bytes, 103);
+    const auto kv_branch = generate_deterministic_bytes(3 * page_bytes, 104);
+
+    const auto gdn_state = generate_deterministic_bytes(4096, 201);
+    const auto mtp_state = generate_deterministic_bytes(2048, 202);
+    const auto tail_state = generate_deterministic_bytes(1024, 203);
+
+    std::filesystem::path manifest_turn1_path;
+    std::filesystem::path manifest_turn2_path;
+    std::filesystem::path manifest_turn3_path;
+    std::filesystem::path manifest_branch_path;
+
+    {
+        DiskStateCache cache(config);
+        cache.enqueue_save(model_hash, tokens_turn1, 1, 0, gdn_state, kv_turn1, 2, mtp_state, 1, tail_state);
+        cache.enqueue_save(model_hash, tokens_turn2, 2, 0, gdn_state, kv_turn2, 3, mtp_state, 1, tail_state);
+        cache.enqueue_save(model_hash, tokens_turn3, 3, 0, gdn_state, kv_turn3, 4, mtp_state, 1, tail_state);
+        cache.enqueue_save(model_hash, tokens_branch, 2, 0, gdn_state, kv_branch, 3, mtp_state, 1, tail_state);
+
+        auto match1 = wait_for_match(cache, model_hash, tokens_turn1);
+        auto match2 = wait_for_match(cache, model_hash, tokens_turn2);
+        auto match3 = wait_for_match(cache, model_hash, tokens_turn3);
+        auto match_b = wait_for_match(cache, model_hash, tokens_branch);
+
+        expect(match1.has_value() && match2.has_value() && match3.has_value() && match_b.has_value(),
+               "All 4 manifests must be persisted and indexed");
+
+        manifest_turn1_path = match1->file_path;
+        manifest_turn2_path = match2->file_path;
+        manifest_turn3_path = match3->file_path;
+        manifest_branch_path = match_b->file_path;
+    }
+
+    const auto pool_data_path = test_dir / "pool_data.ninfer_pages";
+    const auto pool_index_path = test_dir / "pool_index.ninfer_idx";
+
+    expect(std::filesystem::exists(pool_data_path), "pool_data file must exist");
+    expect(std::filesystem::exists(pool_index_path), "pool_index file must exist");
+
+    const std::uint64_t initial_pool_size = std::filesystem::file_size(pool_data_path, ec);
+    expect(initial_pool_size == 5 * 8192, "Initial pool size must equal 5 sector-aligned pages (40 KiB)");
+
+    // Scenario 1: Evict/Delete Turn 2, Turn 3, and Branch manifests so that P2, P3, and P_branch become dead pages!
+    std::filesystem::remove(manifest_turn2_path, ec);
+    std::filesystem::remove(manifest_turn3_path, ec);
+    std::filesystem::remove(manifest_branch_path, ec);
+
+    {
+        // Re-open cache: scan_cache_dir discovers only Turn 1 is live and triggers startup compaction!
+        DiskStateCache cache(config);
+
+        const std::uint64_t compacted_pool_size = std::filesystem::file_size(pool_data_path, ec);
+        expect(compacted_pool_size == 2 * 8192,
+               "Compacted pool size must shrink to exactly 2 live pages (16 KiB)");
+
+        // Verify that Turn 1 can still be loaded and restored with 100% bit-exact parity!
+        DiskStateHeader out_h;
+        std::vector<TokenId> out_toks;
+        std::vector<std::byte> out_gdn, out_kv, out_mtp, out_tail;
+        const bool load_ok = cache.load_snapshot(manifest_turn1_path, out_h, out_toks, out_gdn, out_kv, out_mtp, out_tail);
+        expect(load_ok, "load_snapshot on Turn 1 must succeed after compaction");
+        expect(out_toks == tokens_turn1, "Restored tokens must match original");
+        expect(out_gdn == gdn_state, "Restored GDN state must match original");
+        expect(out_mtp == mtp_state, "Restored MTP state must match original");
+        expect(out_tail == tail_state, "Restored tail hidden must match original");
+        expect(out_kv == kv_turn1, "Restored Text KV payload must be bit-exact after pool compaction");
+
+        // Verify that a subsequent startup/compaction when dead_count == 0 is a pure NO-OP with zero disk writes
+        const auto write_time_before = std::filesystem::last_write_time(pool_data_path, ec);
+        cache.compact_pool();
+        const auto write_time_after = std::filesystem::last_write_time(pool_data_path, ec);
+        expect(write_time_before == write_time_after,
+               "Compaction with zero dead pages must be a pure NO-OP and not rewrite the pool file");
+    }
+
+    // Scenario 2: Explicit compact_pool() call with empty live set reclaims 100% of space
+    std::filesystem::remove(manifest_turn1_path, ec);
+    {
+        DiskStateCache cache(config);
+        cache.compact_pool();
+        expect(!std::filesystem::exists(pool_data_path) || std::filesystem::file_size(pool_data_path, ec) == 0,
+               "Compacting an empty cache must reclaim 100% of pool bytes");
+    }
+
+    std::filesystem::remove_all(test_dir, ec);
+}
+
 void test_paged_kv_gather_scatter_page_major_layout_verification() {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
@@ -742,6 +856,7 @@ int main() {
     test_corruption_and_version_invalidation();
     test_multi_config_isolation_and_cross_contamination();
     test_cancel_in_flight();
+    test_mark_and_sweep_pool_compaction();
     test_paged_kv_gather_scatter_page_major_layout_verification();
 #if defined(_WIN32)
     test_cow_multi_turn_delta_splicing_live_gpu();
