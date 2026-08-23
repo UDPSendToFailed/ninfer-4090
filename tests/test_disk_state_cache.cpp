@@ -375,6 +375,81 @@ void test_mark_and_sweep_pool_compaction() {
     std::filesystem::remove_all(test_dir, ec);
 }
 
+void test_concurrent_compaction_and_non_blocking_lookup() {
+    const std::filesystem::path test_dir = "./.test_ninfer_cache_concurrent_compaction";
+    std::error_code ec;
+    std::filesystem::remove_all(test_dir, ec);
+
+    DiskStateCacheConfig config;
+    config.cache_dir       = test_dir;
+    config.max_cache_bytes = 100ULL << 20; // 100 MB
+    config.enabled         = true;
+
+    const std::uint64_t model_hash = 0xABCD1234EF567890ULL;
+    const auto tokens_turn1 = generate_tokens(128, 42);
+    const auto tokens_turn2 = generate_tokens(256, 42);
+
+    constexpr std::uint32_t page_bytes = 8192;
+    const auto kv_turn1 = generate_deterministic_bytes(2 * page_bytes, 201);
+    const auto kv_turn2 = generate_deterministic_bytes(4 * page_bytes, 202);
+    const auto gdn_state = generate_deterministic_bytes(4096, 301);
+    const auto mtp_state = generate_deterministic_bytes(2048, 302);
+    const auto tail_state = generate_deterministic_bytes(1024, 303);
+
+    std::filesystem::path manifest_turn1_path;
+    std::filesystem::path manifest_turn2_path;
+
+    {
+        DiskStateCache cache(config);
+        cache.enqueue_save(model_hash, tokens_turn1, 1, 0, gdn_state, kv_turn1, 2, mtp_state, 1, tail_state);
+        cache.enqueue_save(model_hash, tokens_turn2, 2, 0, gdn_state, kv_turn2, 4, mtp_state, 1, tail_state);
+
+        auto match1 = wait_for_match(cache, model_hash, tokens_turn1);
+        auto match2 = wait_for_match(cache, model_hash, tokens_turn2);
+        expect(match1.has_value() && match2.has_value(), "Both manifests must be written");
+        manifest_turn1_path = match1->file_path;
+        manifest_turn2_path = match2->file_path;
+    }
+
+    // Delete Turn 2 manifest to create dead pages
+    std::filesystem::remove(manifest_turn2_path, ec);
+
+    {
+        DiskStateCache cache(config);
+
+        // Spawn a thread to trigger compaction
+        std::atomic<bool> thread_started{false};
+        std::thread compactor([&]() {
+            thread_started.store(true);
+            cache.compact_pool();
+        });
+
+        while (!thread_started.load()) {
+            std::this_thread::yield();
+        }
+
+        // Concurrently query prefix match: must return immediately without blocking or deadlock!
+        const auto match = cache.find_longest_matching_prefix(model_hash, tokens_turn1);
+        expect(match.has_value(), "Concurrent prefix query during compaction must succeed");
+        expect(match->matched_tokens == 128, "Matched token count must be 128");
+
+        // Concurrently invoke cancel_in_flight: must cancel cooperative background compaction immediately
+        cache.cancel_in_flight();
+
+        compactor.join();
+
+        // Verify remaining live turn 1 is intact
+        DiskStateHeader out_h;
+        std::vector<TokenId> out_toks;
+        std::vector<std::byte> out_gdn, out_kv, out_mtp, out_tail;
+        const bool ok = cache.load_snapshot(manifest_turn1_path, out_h, out_toks, out_gdn, out_kv, out_mtp, out_tail);
+        expect(ok, "Live snapshot must remain readable after concurrent compaction / cancellation");
+        expect(out_toks == tokens_turn1, "Restored tokens must match");
+    }
+
+    std::filesystem::remove_all(test_dir, ec);
+}
+
 void test_paged_kv_gather_scatter_page_major_layout_verification() {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
@@ -857,6 +932,7 @@ int main() {
     test_multi_config_isolation_and_cross_contamination();
     test_cancel_in_flight();
     test_mark_and_sweep_pool_compaction();
+    test_concurrent_compaction_and_non_blocking_lookup();
     test_paged_kv_gather_scatter_page_major_layout_verification();
 #if defined(_WIN32)
     test_cow_multi_turn_delta_splicing_live_gpu();
