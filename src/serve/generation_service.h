@@ -75,6 +75,7 @@ struct PreparedRequest {
     bool timings_per_token                 = false;
     std::size_t tool_name_max_length       = 64;
     bool enable_thinking                   = true;
+    std::optional<ninfer::ReasoningEffort> reasoning_effort;
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;
     std::shared_ptr<RequestLifetime> lifetime;

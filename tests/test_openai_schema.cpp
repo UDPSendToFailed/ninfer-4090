@@ -266,6 +266,25 @@ int test_reasoning_effort() {
     failures +=
         check(throws_api([&] { (void)parse_chat_completion_request(invalid, default_limits()); }),
               "non-string Chat Completions reasoning effort was accepted");
+
+    ServeOptions server_with_low_effort;
+    server_with_low_effort.default_reasoning_effort = RequestedReasoningEffort::Low;
+
+    GenerationRequest plain_req = parse_chat_completion_request(base, default_limits());
+    const ResolvedPromptSemantics default_effort_semantics =
+        resolve_prompt_semantics(plain_req, server_with_low_effort, effort_capabilities());
+    failures += check(default_effort_semantics.reasoning_effort == ninfer::ReasoningEffort::Low,
+                      "server default reasoning effort was not applied to plain Chat Completions request");
+
+    Json client_xhigh                = base;
+    client_xhigh["reasoning_effort"] = "xhigh";
+    GenerationRequest client_xhigh_req =
+        parse_chat_completion_request(client_xhigh, default_limits());
+    const ResolvedPromptSemantics client_override_semantics =
+        resolve_prompt_semantics(client_xhigh_req, server_with_low_effort, effort_capabilities());
+    failures += check(client_override_semantics.reasoning_effort == ninfer::ReasoningEffort::XHigh,
+                      "client explicit reasoning effort did not override server default");
+
     return failures;
 }
 

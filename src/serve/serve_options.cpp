@@ -76,7 +76,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
            "[--vision] [--vision-max-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
-           "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] [--ui] [--no-ui] "
+           "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--reasoning-effort low|medium|xhigh] [--cors] [--ui] [--no-ui] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
@@ -96,6 +96,7 @@ std::string serve_usage_text(const char* argv0) {
            " MiB of sizing headroom\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
+           "       --reasoning-effort sets default thinking depth (low|medium|xhigh) when omitted by client\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
            "       --greedy forces temperature 0 (exact argmax).\n";
@@ -230,6 +231,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_thinking = false;
         } else if (arg == "--preserve-thinking") {
             options.preserve_thinking = true;
+        } else if (arg == "--reasoning-effort" || arg == "--thinking-effort") {
+            const std::string val = require_value(arg.c_str());
+            const auto effort     = parse_requested_reasoning_effort(val);
+            if (!effort) {
+                throw std::invalid_argument("invalid value for " + arg + ": '" + val +
+                                            "' (expected low, medium, or xhigh)");
+            }
+            options.default_reasoning_effort = *effort;
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--ui") {

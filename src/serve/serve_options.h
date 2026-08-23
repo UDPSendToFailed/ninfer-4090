@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "serve/request.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -49,6 +50,7 @@ struct ServeOptions {
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;
+    std::optional<RequestedReasoningEffort> default_reasoning_effort;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
     bool enable_ui         = true;  // enable built-in WebUI on GET / and static assets (--no-ui disables)

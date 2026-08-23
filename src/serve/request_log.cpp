@@ -197,6 +197,14 @@ Json request_json(const RequestLogContext& context) {
                 {"tool_choice", tool_choice_name(context.tool_choice)},
                 {"has_tool_history", context.has_tool_history},
                 {"enable_thinking", context.enable_thinking},
+                {"reasoning_effort",
+                 context.reasoning_effort
+                     ? Json(*context.reasoning_effort == ninfer::ReasoningEffort::Low
+                                ? "low"
+                                : (*context.reasoning_effort == ninfer::ReasoningEffort::Medium
+                                       ? "medium"
+                                       : "xhigh"))
+                     : Json(nullptr)},
                 {"preserve_thinking", context.preserve_thinking},
                 {"preserve_thinking_semantic_change", context.preserve_thinking_semantic_change},
                 {"sampling", sampler_json(context.sampling)}};
@@ -286,6 +294,7 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.tool_choice                        = request.tool_choice;
     context.has_tool_history                   = request.has_tool_history();
     context.enable_thinking                    = prepared.enable_thinking;
+    context.reasoning_effort                   = prepared.reasoning_effort;
     context.preserve_thinking                  = prepared.preserve_thinking;
     context.preserve_thinking_semantic_change  = prepared.preserve_thinking_semantic_change;
     context.sampling                           = prepared.sampling;
@@ -293,6 +302,20 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
 }
 
 std::string format_request_start(const RequestLogContext& context) {
+    std::string thinking_str = context.enable_thinking ? "on" : "off";
+    if (context.enable_thinking && context.reasoning_effort) {
+        switch (*context.reasoning_effort) {
+        case ninfer::ReasoningEffort::Low:
+            thinking_str += " (low)";
+            break;
+        case ninfer::ReasoningEffort::Medium:
+            thinking_str += " (medium)";
+            break;
+        case ninfer::ReasoningEffort::XHigh:
+            thinking_str += " (xhigh)";
+            break;
+        }
+    }
     std::ostringstream out;
     out << "[req " << context.id << "] " << context.protocol << ' '
         << (context.stream ? "stream" : "non-stream") << " msgs=" << context.message_count
@@ -301,7 +324,7 @@ std::string format_request_start(const RequestLogContext& context) {
         << " tools=" << context.tool_count
         << " tool_choice=" << tool_choice_name(context.tool_choice)
         << " tool_history=" << (context.has_tool_history ? "yes" : "no")
-        << " thinking=" << (context.enable_thinking ? "on" : "off")
+        << " thinking=" << thinking_str
         << " preserve_thinking=" << (context.preserve_thinking ? "on" : "off")
         << " preserve_change=" << (context.preserve_thinking_semantic_change ? "yes" : "no")
         << " sampler=[" << sampler_str(context.sampling) << "] \xE2\x86\x92 submitted";
@@ -384,6 +407,11 @@ std::string format_server_start_json(
                               {"request_log_jsonl", options.request_log_jsonl},
                               {"default_output_tokens", options.default_max_tokens},
                               {"default_thinking", options.enable_thinking},
+                              {"default_reasoning_effort",
+                               options.default_reasoning_effort
+                                   ? Json(requested_reasoning_effort_name(
+                                         *options.default_reasoning_effort))
+                                   : Json(nullptr)},
                               {"default_preserve_thinking", options.preserve_thinking}};
     record["artifact"] = Json{{"path", options.artifact_path},
                               {"size_bytes", std::move(artifact_size)},

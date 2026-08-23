@@ -121,9 +121,13 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         .reasoning_effort  = std::nullopt,
         .preserve_thinking = request.preserve_thinking.value_or(server.preserve_thinking),
     };
-    if (!request.reasoning_effort) { return result; }
+    const std::optional<RequestedReasoningEffort> effort =
+        request.reasoning_effort
+            ? request.reasoning_effort
+            : (result.enable_thinking ? server.default_reasoning_effort : std::nullopt);
+    if (!effort) { return result; }
 
-    const RequestedReasoningEffort requested = *request.reasoning_effort;
+    const RequestedReasoningEffort requested = *effort;
     const bool enables_thinking              = requested != RequestedReasoningEffort::None;
     if (request.enable_thinking && *request.enable_thinking != enables_thinking) {
         invalid_prompt_option("reasoning effort conflicts with enable_thinking",

@@ -47,6 +47,8 @@ int main() {
                       "Responses store defaults mismatch");
     failures += check(!defaults.model_id_override.has_value(),
                       "model id override is unexpectedly configured by default");
+    failures += check(!defaults.default_reasoning_effort.has_value(),
+                      "reasoning effort is unexpectedly configured by default");
     failures += check(
         !defaults.sampling_overrides.temperature && !defaults.sampling_overrides.top_p &&
             !defaults.sampling_overrides.top_k && !defaults.sampling_overrides.presence_penalty &&
@@ -185,12 +187,71 @@ int main() {
         check(!resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
               "request preserve-thinking override did not win");
 
+    const ServeOptions effort_low =
+        parse({"ninfer-serve", "model.ninfer", "--reasoning-effort", "low"});
+    failures += check(effort_low.default_reasoning_effort == RequestedReasoningEffort::Low,
+                      "--reasoning-effort low was not parsed");
+
+    const ServeOptions effort_med =
+        parse({"ninfer-serve", "model.ninfer", "--reasoning-effort", "medium"});
+    failures += check(effort_med.default_reasoning_effort == RequestedReasoningEffort::Medium,
+                      "--reasoning-effort medium was not parsed");
+
+    const ServeOptions effort_xhigh =
+        parse({"ninfer-serve", "model.ninfer", "--reasoning-effort", "xhigh"});
+    failures += check(effort_xhigh.default_reasoning_effort == RequestedReasoningEffort::XHigh,
+                      "--reasoning-effort xhigh was not parsed");
+
+    const ServeOptions thinking_effort_alias =
+        parse({"ninfer-serve", "model.ninfer", "--thinking-effort", "low"});
+    failures += check(thinking_effort_alias.default_reasoning_effort == RequestedReasoningEffort::Low,
+                      "--thinking-effort alias was not parsed");
+
+    bool invalid_effort_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--reasoning-effort", "ultra"});
+    } catch (const std::invalid_argument&) { invalid_effort_rejected = true; }
+    failures += check(invalid_effort_rejected, "invalid --reasoning-effort value was accepted");
+
+    // Test default reasoning effort resolution in semantics
+    ninfer::PromptCapabilities effort_caps;
+    effort_caps.enable_thinking  = true;
+    effort_caps.reasoning_effort = ninfer::ReasoningEffortCapabilities{
+        .low            = true,
+        .medium         = true,
+        .xhigh          = true,
+        .default_effort = ninfer::ReasoningEffort::XHigh,
+    };
+    GenerationRequest effort_req;
+    failures += check(
+        resolve_prompt_semantics(effort_req, effort_low, effort_caps).reasoning_effort ==
+            ninfer::ReasoningEffort::Low,
+        "server default reasoning effort (low) was not applied to request omitting effort");
+
+    // Client explicit reasoning effort overrides server default
+    effort_req.reasoning_effort = RequestedReasoningEffort::XHigh;
+    failures += check(
+        resolve_prompt_semantics(effort_req, effort_low, effort_caps).reasoning_effort ==
+            ninfer::ReasoningEffort::XHigh,
+        "client explicit reasoning effort did not override server default");
+
+    // When client disables thinking, reasoning effort is not applied
+    effort_req.reasoning_effort = std::nullopt;
+    effort_req.enable_thinking  = false;
+    const ResolvedPromptSemantics non_thinking_sem =
+        resolve_prompt_semantics(effort_req, effort_low, effort_caps);
+    failures += check(!non_thinking_sem.enable_thinking && !non_thinking_sem.reasoning_effort.has_value(),
+                      "server default reasoning effort conflicted with client disabled thinking");
+
     failures +=
         check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
               "serve help omits --no-prefix-reuse");
     failures +=
         check(serve_usage_text("ninfer-serve").find("--preserve-thinking") != std::string::npos,
               "serve help omits --preserve-thinking");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--reasoning-effort") != std::string::npos,
+              "serve help omits --reasoning-effort");
     failures += check(serve_usage_text("ninfer-serve").find("--vision") != std::string::npos,
                       "serve help omits --vision");
     failures +=

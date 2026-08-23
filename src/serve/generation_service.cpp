@@ -367,6 +367,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     const ResolvedPromptSemantics semantics =
         resolve_prompt_semantics(request, options_, prompt_capabilities_);
     prepared.enable_thinking                   = semantics.enable_thinking;
+    prepared.reasoning_effort                  = semantics.reasoning_effort;
     prepared.preserve_thinking                 = semantics.preserve_thinking;
     prepared.preserve_thinking_semantic_change = request.preserve_thinking_semantic_change;
     const std::size_t media_items              = media_item_count(request);
