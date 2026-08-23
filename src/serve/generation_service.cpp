@@ -21,6 +21,24 @@ CompletionUsage make_completion_usage(const GenerationOutcome& outcome) {
                            static_cast<int>(outcome.metrics.prefix_cache_hit_tokens)};
 }
 
+CompletionTimings make_completion_timings(const GenerationOutcome& outcome) {
+    CompletionTimings timings;
+    const int cached = static_cast<int>(outcome.metrics.prefix_cache_hit_tokens);
+    const int prompt_eval = std::max(0, outcome.prompt_tokens - cached);
+    timings.prompt_n = prompt_eval;
+    timings.prompt_ms = outcome.metrics.prefill_seconds * 1000.0;
+    timings.prompt_per_second = outcome.metrics.prefill_seconds > 0.0
+        ? static_cast<double>(prompt_eval) / outcome.metrics.prefill_seconds
+        : 0.0;
+    timings.predicted_n = outcome.completion_tokens;
+    timings.predicted_ms = outcome.metrics.decode_seconds * 1000.0;
+    timings.predicted_per_second = outcome.metrics.decode_seconds > 0.0
+        ? static_cast<double>(outcome.completion_tokens) / outcome.metrics.decode_seconds
+        : 0.0;
+    timings.cache_n = outcome.metrics.prefix_cache_hit_tokens;
+    return timings;
+}
+
 struct RequestCapacity {
     explicit RequestCapacity(std::size_t limit) : maximum(limit) {}
 
@@ -223,24 +241,25 @@ public:
 
     void publish(ninfer::OutputDelta delta) override {
         if (delta.text.empty()) { return; }
+        const std::uint32_t tokens = std::max(1U, delta.tokens);
         if (delta.channel == ninfer::OutputChannel::Reasoning) {
-            if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
+            if (sink_->on_reasoning) { sink_->on_reasoning(delta.text, tokens); }
         } else {
             std::string visible =
                 filter_tool_calls_ ? tool_filter_.feed(delta.text) : std::move(delta.text);
-            publish_content(visible);
+            publish_content(visible, tokens);
         }
     }
 
     std::size_t finish(bool is_tool_call_response) {
-        if (filter_tool_calls_) { publish_content(tool_filter_.finish(is_tool_call_response)); }
+        if (filter_tool_calls_) { publish_content(tool_filter_.finish(is_tool_call_response), 1); }
         return content_bytes_;
     }
 
 private:
-    void publish_content(const std::string& text) {
+    void publish_content(const std::string& text, std::uint32_t tokens) {
         if (text.empty() || !sink_->on_content) { return; }
-        sink_->on_content(text);
+        sink_->on_content(text, tokens);
         content_bytes_ += text.size();
     }
 
@@ -343,6 +362,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     ninfer::RequestOptions request_options = to_request_options(request, options_);
     prepared.include_usage                 = request.include_usage;
     prepared.tool_capable                  = request.uses_tools() || request.has_tool_history();
+    prepared.timings_per_token             = request.timings_per_token;
     prepared.tool_name_max_length          = request.tool_name_max_length;
     const ResolvedPromptSemantics semantics =
         resolve_prompt_semantics(request, options_, prompt_capabilities_);

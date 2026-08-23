@@ -17,6 +17,9 @@ target_include_directories(ninfer-serve PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party
   ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
 target_link_libraries(ninfer-serve PRIVATE ninfer_serve ninfer_product_load_progress)
+if(TARGET ninfer_ui_assets)
+  add_dependencies(ninfer-serve ninfer_ui_assets)
+endif()
 
 if(WIN32 AND DSTORAGE_DLLS)
   add_custom_command(TARGET ninfer POST_BUILD

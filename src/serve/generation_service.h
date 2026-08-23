@@ -54,10 +54,11 @@ struct GenerationOutcome {
 };
 
 [[nodiscard]] CompletionUsage make_completion_usage(const GenerationOutcome& outcome);
+[[nodiscard]] CompletionTimings make_completion_timings(const GenerationOutcome& outcome);
 
 struct StreamSink {
-    std::function<void(const std::string& delta_text)> on_content;
-    std::function<void(const std::string& delta_text)> on_reasoning;
+    std::function<void(const std::string& delta_text, std::uint32_t tokens)> on_content;
+    std::function<void(const std::string& delta_text, std::uint32_t tokens)> on_reasoning;
     std::function<bool()> is_cancelled;
 };
 
@@ -71,6 +72,7 @@ struct PreparedRequest {
     int prompt_tokens                      = 0;
     bool include_usage                     = false;
     bool tool_capable                      = false;
+    bool timings_per_token                 = false;
     std::size_t tool_name_max_length       = 64;
     bool enable_thinking                   = true;
     bool preserve_thinking                 = false;

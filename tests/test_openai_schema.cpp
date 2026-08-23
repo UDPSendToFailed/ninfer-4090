@@ -115,6 +115,20 @@ int test_parse_string_content() {
     failures += check(!req.stream, "stream defaults false");
     failures += check(req.max_tokens == 512, "max_tokens default applied");
     failures += check(!req.max_tokens_set, "max_tokens_set false when defaulted");
+
+    // Single-model / WebUI requests can omit the model field
+    const Json no_model_body = {{"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
+    const GenerationRequest no_model_req = parse_chat_completion_request(no_model_body, default_limits());
+    failures += check(no_model_req.model.empty(), "model is empty when omitted");
+    failures += check(no_model_req.messages.size() == 1, "messages parsed without model");
+
+    // timings_per_token and return_progress flags
+    failures += check(!req.timings_per_token, "timings_per_token defaults false");
+    const Json timings_body = {{"model", "m"}, {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}, {"timings_per_token", true}};
+    failures += check(parse_chat_completion_request(timings_body, default_limits()).timings_per_token, "timings_per_token parsed");
+    const Json progress_body = {{"model", "m"}, {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}, {"return_progress", true}};
+    failures += check(parse_chat_completion_request(progress_body, default_limits()).timings_per_token, "return_progress parsed as timings_per_token");
+
     return failures;
 }
 
@@ -360,12 +374,15 @@ int test_reject_unsupported() {
     try {
         (void)parse_chat_completion_request(rf_text, default_limits());
     } catch (...) { text_ok = false; }
-    failures += check(text_ok, "text response_format accepted");
-
     Json no_model = {{"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
-    failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(no_model, default_limits()); }),
-              "missing model rejected");
+    const auto no_model_req = parse_chat_completion_request(no_model, default_limits());
+    failures += check(no_model_req.model.empty(), "missing model accepted and leaves model empty");
+
+    Json invalid_model = {
+        {"model", 123}, {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(invalid_model, default_limits()); }),
+        "non-string model rejected");
 
     Json function_role = {
         {"model", "m"}, {"messages", Json::array({Json{{"role", "function"}, {"content", "x"}}})}};
@@ -668,6 +685,16 @@ int test_chunk_serialization() {
     const Json content_usage = parse_sse(make_chat_chunk_content("id", "m", 1, "x", true));
     failures += check(content_usage.contains("usage") && content_usage.at("usage").is_null(),
                       "content usage null when include_usage=true");
+    failures += check(!content_usage.contains("timings"), "content chunk has no timings by default");
+
+    const CompletionTimings live_timings{10, 50.0, 200.0, 3, 30.0, 100.0, 0};
+    const Json content_timings = parse_sse(make_chat_chunk_content("id", "m", 1, "x", false, live_timings));
+    failures += check(content_timings.contains("timings"), "content chunk contains live timings when provided");
+    failures += check(content_timings.at("timings").at("predicted_n") == 3, "content live timings predicted_n match");
+
+    const Json reasoning_timings = parse_sse(make_chat_chunk_reasoning("id", "m", 1, "thinking...", false, live_timings));
+    failures += check(reasoning_timings.contains("timings"), "reasoning chunk contains live timings when provided");
+    failures += check(reasoning_timings.at("timings").at("predicted_n") == 3, "reasoning live timings predicted_n match");
 
     // Final chunk carries finish_reason with an empty delta and no usage stats.
     const Json final_chunk = parse_sse(make_chat_chunk_final("id", "m", 1, "length", true));
@@ -682,7 +709,8 @@ int test_chunk_serialization() {
 
     // Dedicated usage chunk: empty choices, populated usage.
     const CompletionUsage usage{2, 5, 1};
-    const Json usage_chunk = parse_sse(make_chat_chunk_usage("id", "m", 1, usage));
+    const CompletionTimings timings{2, 10.0, 200.0, 5, 50.0, 100.0, 1};
+    const Json usage_chunk = parse_sse(make_chat_chunk_usage("id", "m", 1, usage, timings));
     failures += check(usage_chunk.at("choices").is_array() && usage_chunk.at("choices").empty(),
                       "usage chunk has empty choices");
     failures +=
@@ -690,8 +718,19 @@ int test_chunk_serialization() {
     failures += check(usage_chunk.at("usage").at("total_tokens") == 7, "usage chunk total");
     failures += check(usage_chunk.at("usage").at("prompt_tokens_details").at("cached_tokens") == 1,
                       "usage chunk cached prompt tokens");
+    failures += check(usage_chunk.contains("timings"), "usage chunk contains timings");
+    failures += check(usage_chunk.at("timings").at("prompt_n") == 2, "timings prompt_n");
+    failures += check(usage_chunk.at("timings").at("predicted_n") == 5, "timings predicted_n");
+    failures += check(usage_chunk.at("timings").at("cache_n") == 1, "timings cache_n");
+    failures += check(usage_chunk.at("timings").at("prompt_per_second") == 200.0, "timings prompt_per_second");
+    failures += check(usage_chunk.at("timings").at("predicted_per_second") == 100.0, "timings predicted_per_second");
+
+    const Json final_timings = parse_sse(make_chat_chunk_final("id", "m", 1, "stop", false, timings));
+    failures += check(final_timings.contains("timings"), "final chunk contains timings");
+    failures += check(final_timings.at("timings").at("predicted_n") == 5, "final timings predicted_n");
 
     failures += check(sse_done() == "data: [DONE]\n\n", "done sentinel");
+    failures += check(sse_ping() == ": ping\n\n", "ping comment");
     return failures;
 }
 
@@ -723,16 +762,20 @@ int test_models_and_error() {
     const Json list = Json::parse(make_models_list("qwen3.6-27b", 1, 65536, true));
     failures += check(list.at("object") == "list", "models list object");
     failures += check(list.at("data").at(0).at("id") == "qwen3.6-27b", "models list id");
+    failures += check(list.at("data").at(0).at("name") == "qwen3.6-27b", "models list name");
     failures += check(list.at("data").at(0).at("object") == "model", "models list entry object");
     failures += check(list.at("data").at(0).at("owned_by") == "ninfer", "models list owner");
     failures += check(list.at("data").at(0).at("context_window") == 65536, "models list context");
+    failures += check(list.at("data").at(0).at("max_output_tokens") == 65536, "models list max_output_tokens");
     failures += check(list.at("data").at(0).at("modalities").at("vision") == true,
                       "models list vision modality");
 
     const Json one = Json::parse(make_model_object("qwen3.6-27b", 1, 65536, false));
     failures += check(one.at("id") == "qwen3.6-27b" && one.at("object") == "model", "model object");
+    failures += check(one.at("name") == "qwen3.6-27b", "model name");
     failures += check(one.at("owned_by") == "ninfer", "model owner");
     failures += check(one.at("context_window") == 65536, "model object context");
+    failures += check(one.at("max_output_tokens") == 65536, "model object max_output_tokens");
     failures += check(one.at("modalities").at("vision") == false, "model object vision modality");
 
     ApiError error;

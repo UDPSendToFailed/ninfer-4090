@@ -314,6 +314,7 @@ enum class FinishReason : std::uint8_t {
 struct OutputDelta {
     OutputChannel channel = OutputChannel::Content;
     std::string text;
+    std::uint32_t tokens  = 1;
 };
 
 class OutputSink {

@@ -67,15 +67,8 @@ ApiError response_not_found(const std::string& id) {
     return error;
 }
 
-void validate_model(const std::string& requested, const std::string& available) {
-    if (requested == available) { return; }
-    ApiError error;
-    error.status  = 404;
-    error.type    = "invalid_request_error";
-    error.param   = "model";
-    error.code    = "model_not_found";
-    error.message = "model '" + requested + "' not found";
-    throw ApiException(std::move(error));
+void validate_model(std::string& requested, const std::string& available) {
+    if (requested.empty()) { requested = available; }
 }
 
 Json parse_json_body(const httplib::Request& request) {
@@ -286,16 +279,33 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             stream->started = true;
             try {
                 write_stream_items(sink, *stream, stream->encoder->start());
+                auto last_activity = std::chrono::steady_clock::now();
                 StreamSink output;
-                output.on_reasoning = [&](const std::string& text) {
+                output.on_reasoning = [&](const std::string& text, std::uint32_t) {
+                    last_activity = std::chrono::steady_clock::now();
                     write_stream_items(sink, *stream, stream->encoder->reasoning_delta(text));
                 };
-                output.on_content = [&](const std::string& text) {
+                output.on_content = [&](const std::string& text, std::uint32_t) {
+                    last_activity = std::chrono::steady_clock::now();
                     write_stream_items(sink, *stream, stream->encoder->content_delta(text));
                 };
                 output.is_cancelled = [&] {
-                    return stream->cancelled.load(std::memory_order_acquire) ||
-                           (sink.is_writable && !sink.is_writable());
+                    if (stream->cancelled.load(std::memory_order_acquire)) {
+                        return true;
+                    }
+                    if (sink.is_writable && !sink.is_writable()) {
+                        return true;
+                    }
+                    const auto now = std::chrono::steady_clock::now();
+                    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_activity).count() >= 2000) {
+                        last_activity = now;
+                        try {
+                            write_stream_item(sink, *stream, sse_ping());
+                        } catch (const ClientDisconnected&) {
+                            return true;
+                        }
+                    }
+                    return false;
                 };
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);

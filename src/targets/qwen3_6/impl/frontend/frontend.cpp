@@ -720,6 +720,12 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
     impl_->preview_output.clear();
 
     const auto complete = [&](std::uint32_t count, FinishReason reason) {
+        if (impl_->preview_output.size() == 1) {
+            impl_->preview_output[0].tokens = count;
+        } else if (impl_->preview_output.size() == 2) {
+            impl_->preview_output[0].tokens = 1;
+            impl_->preview_output[1].tokens = std::max(1U, count - 1);
+        }
         impl_->preview_ready = true;
         return runtime::OutputDecision{.accepted_tokens = count, .finish_reason = reason};
     };

@@ -337,10 +337,13 @@ if(NINFER_BUILD_SERVE)
     serve/http_server.cpp
     serve/responses_http.cpp
     serve/serve_metrics.cpp
-    serve/serve_options.cpp)
+    serve/serve_options.cpp
+    ${NINFER_UI_CPP})
   ninfer_internal_includes(ninfer_serve)
-  target_include_directories(ninfer_serve PRIVATE
-    ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
+  target_include_directories(ninfer_serve
+    PUBLIC ${NINFER_UI_GEN_DIR}
+    PRIVATE ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
+  add_dependencies(ninfer_serve ninfer_ui_assets)
   target_link_libraries(ninfer_serve
     PUBLIC ninfer_engine Threads::Threads
     PRIVATE ninfer_media_acquire ${NINFER_CUDART_TARGET})

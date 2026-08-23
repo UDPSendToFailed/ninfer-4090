@@ -5,6 +5,7 @@
 #include "serve/openai_schema.h"
 #include "serve/request_log.h"
 #include "serve/translate.h"
+#include "ui.h"
 
 #include <nlohmann/json.hpp>
 
@@ -284,50 +285,150 @@ void HttpServer::register_routes() {
         }
         res.set_content(slots.dump(), "application/json");
     });
-    server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
+    server_.Get("/props", [this](const httplib::Request&, httplib::Response& res) {
+        ninfer::SamplingPreset sampling;
+        if (service_ != nullptr) {
+            const auto defaults = service_->sampling_defaults();
+            sampling = defaults.for_mode(options_.enable_thinking ? ninfer::SamplingMode::Thinking
+                                                                  : ninfer::SamplingMode::NonThinking);
+        }
+        const float temp = options_.sampling_overrides.temperature.value_or(sampling.temperature);
+        const float top_p = options_.sampling_overrides.top_p.value_or(sampling.top_p);
+        const int top_k = options_.sampling_overrides.top_k.value_or(sampling.top_k);
+        const std::uint64_t seed = options_.sampling_overrides.seed.value_or(0);
+        const bool vision = options_.enable_vision;
+
+        nlohmann::json default_gen = {
+            {"n_ctx", options_.max_context},
+            {"params", {
+                {"temp", temp},
+                {"top_p", top_p},
+                {"top_k", top_k},
+                {"seed", seed}
+            }}
+        };
+        nlohmann::json props = {
+            {"default_generation_settings", default_gen},
+            {"total_slots", options_.max_concurrency},
+            {"model_alias", public_model_id_},
+            {"modalities", {
+                {"vision", vision},
+                {"video", false},
+                {"audio", false}
+            }},
+            {"endpoint_slots", true},
+            {"endpoint_props", true},
+            {"endpoint_metrics", true},
+            {"ui", options_.enable_ui}
+        };
+        res.set_content(props.dump(), "application/json");
+    });
+
+    const auto register_get = [&](const std::string& path, httplib::Server::Handler handler) {
+        server_.Get(path, handler);
+        server_.Get("/v1" + path, handler);
+        server_.Get("/v1/v1" + path, handler);
+    };
+    const auto register_post = [&](const std::string& path, httplib::Server::Handler handler) {
+        server_.Post(path, handler);
+        server_.Post("/v1" + path, handler);
+        server_.Post("/v1/v1" + path, handler);
+    };
+    const auto register_delete = [&](const std::string& path, httplib::Server::Handler handler) {
+        server_.Delete(path, handler);
+        server_.Delete("/v1" + path, handler);
+        server_.Delete("/v1/v1" + path, handler);
+    };
+
+    register_get("/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
     });
-    server_.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
+    register_get(R"(/models/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
         handle_model(req, res);
     });
-    server_.Post("/v1/chat/completions",
-                 [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_chat_completions(req, res);
-                 });
-    server_.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
+    register_post("/chat/completions",
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_chat_completions(req, res);
+                  });
+    register_post("/responses", [this](const httplib::Request& req, httplib::Response& res) {
         handle_responses(req, res);
     });
-    server_.Post("/v1/responses/input_tokens",
+    register_post("/responses/input_tokens",
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_response_input_tokens(req, res);
+                  });
+    register_post("/responses/compact",
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_response_compact(req, res);
+                  });
+    register_post(R"(/responses/([^/]+)/cancel)",
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_response_cancel(req, res);
+                  });
+    register_get(R"(/responses/([^/]+)/input_items)",
                  [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_response_input_tokens(req, res);
+                     handle_response_input_items(req, res);
                  });
-    server_.Post("/v1/responses/compact",
+    register_get(R"(/responses/([^/]+))",
                  [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_response_compact(req, res);
+                     handle_response_get(req, res);
                  });
-    server_.Post(R"(/v1/responses/([^/]+)/cancel)",
-                 [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_response_cancel(req, res);
-                 });
-    server_.Get(R"(/v1/responses/([^/]+)/input_items)",
-                [this](const httplib::Request& req, httplib::Response& res) {
-                    handle_response_input_items(req, res);
-                });
-    server_.Get(R"(/v1/responses/([^/]+))",
-                [this](const httplib::Request& req, httplib::Response& res) {
-                    handle_response_get(req, res);
-                });
-    server_.Delete(R"(/v1/responses/([^/]+))",
-                   [this](const httplib::Request& req, httplib::Response& res) {
-                       handle_response_delete(req, res);
-                   });
-    server_.Post("/v1/messages/count_tokens",
-                 [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_count_tokens(req, res);
-                 });
-    server_.Post("/v1/messages", [this](const httplib::Request& req, httplib::Response& res) {
+    register_delete(R"(/responses/([^/]+))",
+                    [this](const httplib::Request& req, httplib::Response& res) {
+                        handle_response_delete(req, res);
+                    });
+    register_post("/messages/count_tokens",
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_count_tokens(req, res);
+                  });
+    register_post("/messages", [this](const httplib::Request& req, httplib::Response& res) {
         handle_messages(req, res);
     });
+
+    if (options_.enable_ui && ninfer_ui_has_assets()) {
+        auto serve_asset = [](const std::string& name, httplib::Response& res, const httplib::Request& req) {
+            const NinferUiAsset* asset = ninfer_ui_find_asset(name);
+            if (!asset) {
+                asset = ninfer_ui_find_asset("index.html");
+            }
+            if (!asset) {
+                res.status = 404;
+                return;
+            }
+            res.set_header("ETag", asset->etag);
+            const std::string inm = req.get_header_value("If-None-Match");
+            if (!inm.empty() && (inm == asset->etag || inm == "W/" + asset->etag)) {
+                res.status = 304;
+                return;
+            }
+            res.set_header("Cache-Control", asset->name == "index.html" ? "no-cache" : "max-age=31536000, immutable");
+            res.set_content(reinterpret_cast<const char*>(asset->data), asset->size, asset->type.c_str());
+        };
+
+        server_.Get("/", [serve_asset](const httplib::Request& req, httplib::Response& res) {
+            serve_asset("index.html", res, req);
+        });
+        server_.Get("/index.html", [serve_asset](const httplib::Request& req, httplib::Response& res) {
+            serve_asset("index.html", res, req);
+        });
+        server_.Get(R"(/([^/].*))", [serve_asset](const httplib::Request& req, httplib::Response& res) {
+            std::string path = req.matches[1];
+            if (path.rfind("v1/", 0) == 0 || path == "health" || path == "metrics" ||
+                path == "slots" || path == "props" || path == "models") {
+                res.status = 404;
+                return;
+            }
+            const NinferUiAsset* asset = ninfer_ui_find_asset(path);
+            if (asset) {
+                serve_asset(path, res, req);
+            } else if (path.find('.') == std::string::npos) {
+                // SPA client route fallback
+                serve_asset("index.html", res, req);
+            } else {
+                res.status = 404;
+            }
+        });
+    }
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
@@ -337,18 +438,9 @@ void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) 
 }
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
-    const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
-    if (id != public_model_id_) {
-        ApiError error;
-        error.status  = 404;
-        error.type    = "invalid_request_error";
-        error.code    = "model_not_found";
-        error.message = "model '" + id + "' not found";
-        write_error(res, error);
-        return;
-    }
-    res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.max_context,
-                                      options_.enable_vision),
+    const std::string id = req.matches.size() > 1 ? req.matches[1].str() : public_model_id_;
+    res.set_content(make_model_object(id.empty() ? public_model_id_ : id, unix_time_now(),
+                                      options_.max_context, options_.enable_vision),
                     "application/json");
 }
 
@@ -369,14 +461,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
-        request                   = parse_chat_completion_request(body, limits);
-        if (request.model != public_model_id_) {
-            ApiError error;
-            error.status  = 404;
-            error.type    = "invalid_request_error";
-            error.code    = "model_not_found";
-            error.message = "model '" + request.model + "' not found";
-            throw ApiException(std::move(error));
+        request = parse_chat_completion_request(body, limits);
+        if (request.model.empty()) {
+            request.model = public_model_id_;
         }
         prepared = service_->prepare(
             request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
@@ -400,15 +487,17 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 return req.is_connection_alive && !req.is_connection_alive();
             });
             log_request_done(log_context, outcome);
-            const CompletionUsage usage = make_completion_usage(outcome);
+            const CompletionUsage usage     = make_completion_usage(outcome);
+            const CompletionTimings timings = make_completion_timings(outcome);
             std::string response_body;
             if (!outcome.tool_calls.empty()) {
                 response_body = make_chat_completion_tool_response(
-                    id, model, created, outcome.text, outcome.reasoning, outcome.tool_calls, usage);
+                    id, model, created, outcome.text, outcome.reasoning, outcome.tool_calls, usage,
+                    timings);
             } else {
                 response_body = make_chat_completion_response(
                     id, model, created, outcome.text, outcome.reasoning,
-                    finish_reason_wire(outcome.finish_reason), usage);
+                    finish_reason_wire(outcome.finish_reason), usage, timings);
             }
             set_owned_content(res, std::move(response_body), prepared.lifetime);
         } catch (const std::exception& e) {
@@ -439,24 +528,70 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             try {
                 write_stream_item(sink, *stream,
                                   make_chat_chunk_role(id, model, created, include_usage));
-                StreamSink output;
-                output.on_content = [&](const std::string& text) {
-                    write_stream_item(
-                        sink, *stream,
-                        make_chat_chunk_content(id, model, created, text, include_usage));
+                const bool timings_per_token = stream->prepared.timings_per_token;
+                const int prompt_tokens      = stream->prepared.prompt_tokens;
+                std::size_t streamed_tokens  = 0;
+                std::chrono::steady_clock::time_point decode_start{};
+                bool decode_started          = false;
+
+                const auto get_chunk_timings = [&](std::uint32_t tokens) -> std::optional<CompletionTimings> {
+                    if (!timings_per_token) { return std::nullopt; }
+                    const auto now = std::chrono::steady_clock::now();
+                    if (!decode_started) {
+                        decode_start   = now;
+                        decode_started = true;
+                    }
+                    streamed_tokens += tokens;
+                    const double elapsed_ms =
+                        std::chrono::duration<double, std::milli>(now - decode_start).count();
+                    CompletionTimings t;
+                    t.prompt_n = prompt_tokens;
+                    t.predicted_n = static_cast<int>(streamed_tokens);
+                    t.predicted_ms = elapsed_ms;
+                    t.predicted_per_second = elapsed_ms > 0.0
+                        ? (static_cast<double>(streamed_tokens) / (elapsed_ms / 1000.0))
+                        : 0.0;
+                    return t;
                 };
-                output.on_reasoning = [&](const std::string& text) {
+
+                auto last_activity = std::chrono::steady_clock::now();
+                StreamSink output;
+                output.on_content = [&](const std::string& text, std::uint32_t tokens) {
+                    last_activity = std::chrono::steady_clock::now();
                     write_stream_item(
                         sink, *stream,
-                        make_chat_chunk_reasoning(id, model, created, text, include_usage));
+                        make_chat_chunk_content(id, model, created, text, include_usage,
+                                                get_chunk_timings(tokens)));
+                };
+                output.on_reasoning = [&](const std::string& text, std::uint32_t tokens) {
+                    last_activity = std::chrono::steady_clock::now();
+                    write_stream_item(
+                        sink, *stream,
+                        make_chat_chunk_reasoning(id, model, created, text, include_usage,
+                                                  get_chunk_timings(tokens)));
                 };
                 output.is_cancelled = [&] {
-                    return stream->cancelled.load(std::memory_order_acquire) ||
-                           (sink.is_writable && !sink.is_writable());
+                    if (stream->cancelled.load(std::memory_order_acquire)) {
+                        return true;
+                    }
+                    if (sink.is_writable && !sink.is_writable()) {
+                        return true;
+                    }
+                    const auto now = std::chrono::steady_clock::now();
+                    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_activity).count() >= 2000) {
+                        last_activity = now;
+                        try {
+                            write_stream_item(sink, *stream, sse_ping());
+                        } catch (const ClientDisconnected&) {
+                            return true;
+                        }
+                    }
+                    return false;
                 };
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
+                const CompletionTimings timings = make_completion_timings(outcome);
                 const std::string_view remaining = unstreamed_content(outcome);
                 if (!outcome.tool_calls.empty()) {
                     if (!remaining.empty()) {
@@ -470,7 +605,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                                           id, model, created, outcome.tool_calls, include_usage));
                     write_stream_item(
                         sink, *stream,
-                        make_chat_chunk_final(id, model, created, "tool_calls", include_usage));
+                        make_chat_chunk_final(id, model, created, "tool_calls", include_usage,
+                                              timings));
                 } else {
                     if (tool_capable && !remaining.empty()) {
                         write_stream_item(sink, *stream,
@@ -482,12 +618,12 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         sink, *stream,
                         make_chat_chunk_final(id, model, created,
                                               finish_reason_wire(outcome.finish_reason),
-                                              include_usage));
+                                              include_usage, timings));
                 }
                 if (include_usage) {
                     const CompletionUsage usage = make_completion_usage(outcome);
                     write_stream_item(sink, *stream,
-                                      make_chat_chunk_usage(id, model, created, usage));
+                                      make_chat_chunk_usage(id, model, created, usage, timings));
                 }
                 write_stream_item(sink, *stream, sse_done());
                 sink.done();
@@ -641,8 +777,10 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             try {
                 write_stream_item(sink, *stream, make_message_start(id, model, input_tokens));
 
+                auto last_activity = std::chrono::steady_clock::now();
                 StreamSink output;
-                output.on_reasoning = [&](const std::string& text) {
+                output.on_reasoning = [&](const std::string& text, std::uint32_t) {
+                    last_activity = std::chrono::steady_clock::now();
                     if (!thinking_open) {
                         thinking_index = next_index++;
                         thinking_open  = true;
@@ -652,7 +790,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     write_stream_item(sink, *stream,
                                       make_content_block_delta_thinking(thinking_index, text));
                 };
-                output.on_content = [&](const std::string& text) {
+                output.on_content = [&](const std::string& text, std::uint32_t) {
+                    last_activity = std::chrono::steady_clock::now();
                     if (thinking_open) {
                         write_stream_item(sink, *stream, make_content_block_stop(thinking_index));
                         thinking_open = false;
@@ -666,8 +805,22 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                                       make_content_block_delta_text(text_index, text));
                 };
                 output.is_cancelled = [&] {
-                    return stream->cancelled.load(std::memory_order_acquire) ||
-                           (sink.is_writable && !sink.is_writable());
+                    if (stream->cancelled.load(std::memory_order_acquire)) {
+                        return true;
+                    }
+                    if (sink.is_writable && !sink.is_writable()) {
+                        return true;
+                    }
+                    const auto now = std::chrono::steady_clock::now();
+                    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_activity).count() >= 2000) {
+                        last_activity = now;
+                        try {
+                            write_stream_item(sink, *stream, make_messages_ping());
+                        } catch (const ClientDisconnected&) {
+                            return true;
+                        }
+                    }
+                    return false;
                 };
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);

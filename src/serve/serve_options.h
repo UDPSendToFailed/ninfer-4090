@@ -51,6 +51,7 @@ struct ServeOptions {
     bool preserve_thinking = false;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
+    bool enable_ui         = true;  // enable built-in WebUI on GET / and static assets (--no-ui disables)
     // Process-level explicit overrides layered between registered model/mode defaults and request
     // fields. An omitted seed is replaced per request with a fresh random seed.
     SamplingOverrides sampling_overrides;

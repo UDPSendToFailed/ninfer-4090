@@ -119,6 +119,7 @@ else()
 endif()
 if(NINFER_BUILD_SERVE)
   find_package(Threads REQUIRED)
+  include(cmake/ninfer_ui.cmake)
 endif()
 
 if(WIN32)

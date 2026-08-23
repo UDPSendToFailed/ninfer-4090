@@ -52,6 +52,16 @@ struct CompletionUsage {
     int cached_tokens     = 0;
 };
 
+struct CompletionTimings {
+    int prompt_n                = 0;
+    double prompt_ms            = 0.0;
+    double prompt_per_second    = 0.0;
+    int predicted_n             = 0;
+    double predicted_ms         = 0.0;
+    double predicted_per_second = 0.0;
+    std::uint32_t cache_n       = 0;
+};
+
 enum class ContentKind {
     Text,
     Image,
@@ -174,6 +184,7 @@ struct GenerationRequest {
     bool max_tokens_set = false;
     bool stream         = false;
     bool include_usage  = false;
+    bool timings_per_token = false;
     std::optional<bool> enable_thinking; // non-standard extension; falls back to server default
     std::optional<RequestedReasoningEffort> reasoning_effort;
     std::string reasoning_effort_param = "reasoning_effort";

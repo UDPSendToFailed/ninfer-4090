@@ -52,8 +52,17 @@ int main() {
             !defaults.sampling_overrides.top_k && !defaults.sampling_overrides.presence_penalty &&
             !defaults.sampling_overrides.frequency_penalty,
         "server defaults unexpectedly override registered model sampling");
+    failures += check(defaults.enable_ui, "WebUI is unexpectedly disabled by default");
     failures += check(resolve_public_model_id(defaults, "artifact-model") == "artifact-model",
                       "artifact model id was not selected by default");
+
+    const ServeOptions ui_disabled =
+        parse({"ninfer-serve", "model.ninfer", "--no-ui"});
+    failures += check(!ui_disabled.enable_ui, "--no-ui did not disable WebUI");
+
+    const ServeOptions ui_enabled =
+        parse({"ninfer-serve", "model.ninfer", "--ui"});
+    failures += check(ui_enabled.enable_ui, "--ui did not enable WebUI");
 
     const ServeOptions rotor =
         parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "rk8v4"});

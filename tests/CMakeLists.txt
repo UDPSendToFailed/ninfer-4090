@@ -14,7 +14,11 @@ function(ninfer_add_test name)
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/src
     ${PROJECT_SOURCE_DIR}/third_party
-    ${PROJECT_SOURCE_DIR}/third_party/utf8proc)
+    ${PROJECT_SOURCE_DIR}/third_party/utf8proc
+    ${NINFER_UI_GEN_DIR})
+  if(TARGET ninfer_ui_assets)
+    add_dependencies(${name} ninfer_ui_assets)
+  endif()
   if(arg_LIBRARIES)
     target_link_libraries(${name} PRIVATE ${arg_LIBRARIES})
   else()
@@ -169,6 +173,9 @@ ninfer_add_test(ninfer_serve_options_test
   LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_request_log_test
   SOURCES test_request_log.cpp
+  LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_serve_ui_test
+  SOURCES test_serve_ui.cpp
   LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_bench_support_test
   SOURCES test_ninfer_bench_support.cpp

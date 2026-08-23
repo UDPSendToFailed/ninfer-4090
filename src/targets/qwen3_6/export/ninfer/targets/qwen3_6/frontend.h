@@ -70,6 +70,10 @@ public:
 
     [[nodiscard]] const OutputDelta& back() const noexcept { return values_[size_ - 1]; }
 
+    [[nodiscard]] OutputDelta& operator[](std::size_t index) noexcept { return values_[index]; }
+
+    [[nodiscard]] const OutputDelta& operator[](std::size_t index) const noexcept { return values_[index]; }
+
     void clear() noexcept;
     void push_back(OutputDelta value);
 

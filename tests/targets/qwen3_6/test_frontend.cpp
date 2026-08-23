@@ -657,6 +657,7 @@ int test_cross_round_stop(const Frontend& frontend) {
     const auto first = session.commit_preview();
     failures += check(channel_text(first, ninfer::OutputChannel::Content) == "hello",
                       "cross-round stop did not retain the ambiguous suffix");
+    failures += check(first.size() == 1 && first[0].tokens == 1, "first delta tokens count should be 1");
 
     const auto second_decision =
         session.preview(std::array<ninfer::TokenId, 1>{2}, 1, ninfer::FinishReason::OutputLimit);
@@ -802,6 +803,20 @@ int test_disabled_vision() {
     return failures;
 }
 
+int test_speculative_output_token_count(const Frontend& frontend) {
+    auto prompt = frontend.prepare_tokens({0});
+    ninfer::StopPolicy stop;
+    auto session = frontend.make_output_session(prompt, stop);
+
+    const auto decision =
+        session.preview(std::array<ninfer::TokenId, 2>{1, 1}, 4, ninfer::FinishReason::OutputLimit);
+    int failures = check(decision.accepted_tokens == 2, "accepted 2 speculative tokens");
+    const auto output = session.commit_preview();
+    failures += check(output.size() == 1, "emitted one merged delta");
+    failures += check(output[0].tokens == 2, "delta token count matches 2 accepted speculative tokens");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -822,6 +837,7 @@ int main() {
         failures += test_reasoning_split(frontend);
         failures += test_utf8_and_hidden_eos(frontend);
         failures += test_disabled_vision();
+        failures += test_speculative_output_token_count(frontend);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& e) {
         std::cerr << "test_frontend exception: " << e.what() << '\n';
