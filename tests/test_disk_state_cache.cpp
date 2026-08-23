@@ -336,8 +336,9 @@ void test_mark_and_sweep_pool_compaction() {
     std::filesystem::remove(manifest_branch_path, ec);
 
     {
-        // Re-open cache: scan_cache_dir discovers only Turn 1 is live and triggers startup compaction!
+        // Re-open cache and trigger forced compaction
         DiskStateCache cache(config);
+        cache.compact_pool(/*force=*/true);
 
         const std::uint64_t compacted_pool_size = std::filesystem::file_size(pool_data_path, ec);
         expect(compacted_pool_size == 2 * 8192,
@@ -355,9 +356,9 @@ void test_mark_and_sweep_pool_compaction() {
         expect(out_tail == tail_state, "Restored tail hidden must match original");
         expect(out_kv == kv_turn1, "Restored Text KV payload must be bit-exact after pool compaction");
 
-        // Verify that a subsequent startup/compaction when dead_count == 0 is a pure NO-OP with zero disk writes
+        // Verify that a subsequent compaction when dead_count == 0 is a pure NO-OP with zero disk writes
         const auto write_time_before = std::filesystem::last_write_time(pool_data_path, ec);
-        cache.compact_pool();
+        cache.compact_pool(/*force=*/true);
         const auto write_time_after = std::filesystem::last_write_time(pool_data_path, ec);
         expect(write_time_before == write_time_after,
                "Compaction with zero dead pages must be a pure NO-OP and not rewrite the pool file");
@@ -445,6 +446,126 @@ void test_concurrent_compaction_and_non_blocking_lookup() {
         const bool ok = cache.load_snapshot(manifest_turn1_path, out_h, out_toks, out_gdn, out_kv, out_mtp, out_tail);
         expect(ok, "Live snapshot must remain readable after concurrent compaction / cancellation");
         expect(out_toks == tokens_turn1, "Restored tokens must match");
+    }
+
+    std::filesystem::remove_all(test_dir, ec);
+}
+
+void test_compaction_fragmentation_thresholds() {
+    const std::filesystem::path test_dir = "./.test_ninfer_cache_frag_thresholds";
+    std::error_code ec;
+    std::filesystem::remove_all(test_dir, ec);
+
+    DiskStateCacheConfig config;
+    config.cache_dir       = test_dir;
+    config.max_cache_bytes = 100ULL << 20; // 100 MB
+    config.enabled         = true;
+
+    const std::uint64_t model_hash = 0x1122334455667788ULL;
+    const auto tokens_turn1 = generate_tokens(8 * 64, 10);  // 8 pages = 512 tokens
+    const auto tokens_turn2 = generate_tokens(10 * 64, 20); // 10 pages = 640 tokens
+
+    constexpr std::uint32_t page_bytes = 8192;
+    const auto kv_turn1 = generate_deterministic_bytes(8 * page_bytes, 101); // 8 pages
+    const auto kv_turn2 = generate_deterministic_bytes(10 * page_bytes, 102); // 10 pages
+    const auto gdn_state = generate_deterministic_bytes(4096, 301);
+    const auto mtp_state = generate_deterministic_bytes(2048, 302);
+    const auto tail_state = generate_deterministic_bytes(1024, 303);
+
+    std::filesystem::path manifest1_path, manifest2_path;
+    {
+        DiskStateCache cache(config);
+        cache.enqueue_save(model_hash, tokens_turn1, 1, 0, gdn_state, kv_turn1, 8, mtp_state, 1, tail_state);
+        cache.enqueue_save(model_hash, tokens_turn2, 2, 0, gdn_state, kv_turn2, 10, mtp_state, 1, tail_state);
+
+        auto m1 = wait_for_match(cache, model_hash, tokens_turn1);
+        auto m2 = wait_for_match(cache, model_hash, tokens_turn2);
+        expect(m1.has_value() && m2.has_value(), "Both manifests written");
+        manifest1_path = m1->file_path;
+        manifest2_path = m2->file_path;
+    }
+
+    // Delete Turn 2 manifest (orphans 2 pages out of 10 = 20% fragmentation < 25%, and < 2GB)
+    std::filesystem::remove(manifest2_path, ec);
+
+    const std::filesystem::path pool_data_path = test_dir / "pool_data.ninfer_pages";
+    {
+        DiskStateCache cache(config);
+        const auto write_time_before = std::filesystem::last_write_time(pool_data_path, ec);
+        const auto size_before = std::filesystem::file_size(pool_data_path, ec);
+
+        // Under normal unforced operation (force=false), low fragmentation must be a strict NO-OP (0 disk writes)
+        cache.compact_pool(/*force=*/false);
+
+        const auto write_time_after = std::filesystem::last_write_time(pool_data_path, ec);
+        const auto size_after = std::filesystem::file_size(pool_data_path, ec);
+        expect(write_time_before == write_time_after && size_before == size_after,
+               "Unforced compaction below 25% fragmentation must be a zero-cost NO-OP");
+
+        // Forced compaction (force=true) must purge the dead pages
+        cache.compact_pool(/*force=*/true);
+        const auto size_compacted = std::filesystem::file_size(pool_data_path, ec);
+        expect(size_compacted < size_before, "Forced compaction must reclaim dead space");
+
+        // Verify remaining live Turn 1 data is intact
+        DiskStateHeader out_h;
+        std::vector<TokenId> out_toks;
+        std::vector<std::byte> out_gdn, out_kv, out_mtp, out_tail;
+        expect(cache.load_snapshot(manifest1_path, out_h, out_toks, out_gdn, out_kv, out_mtp, out_tail),
+               "Live manifest must load cleanly");
+        expect(out_kv == kv_turn1, "Live KV payload must be bit-exact");
+    }
+
+    std::filesystem::remove_all(test_dir, ec);
+}
+
+void test_bulk_lru_watermark_eviction() {
+    const std::filesystem::path test_dir = "./.test_ninfer_cache_bulk_lru";
+    std::error_code ec;
+    std::filesystem::remove_all(test_dir, ec);
+
+    DiskStateCacheConfig config;
+    config.cache_dir       = test_dir;
+    config.max_cache_bytes = 10ULL << 20; // 10 MB limit (Low watermark = 7.5 MB)
+    config.enabled         = true;
+
+    const std::uint64_t model_hash = 0xCAFE12345678ULL;
+    constexpr std::uint32_t page_bytes = 8192;
+    const auto kv = generate_deterministic_bytes(1 * page_bytes, 401);
+    const auto gdn_state = generate_deterministic_bytes(2ULL << 20, 501); // 2 MB payload per manifest
+    const auto mtp_state = generate_deterministic_bytes(1024, 502);
+    const auto tail_state = generate_deterministic_bytes(1024, 503);
+
+    {
+        DiskStateCache cache(config);
+        // Write 6 manifests (~2 MB each = ~12 MB total)
+        for (int i = 1; i <= 6; ++i) {
+            const auto tokens = generate_tokens(64 * i, 100 + i);
+            cache.enqueue_save(model_hash, tokens, i, 0, gdn_state, kv, 1, mtp_state, 1, tail_state);
+            wait_for_match(cache, model_hash, tokens);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        // Trigger LRU prune: must ensure total cache bytes <= 10 MB high watermark,
+        // and if it exceeded high watermark, pruned down to 7.5 MB low watermark
+        cache.prune_lru();
+
+        // Calculate total remaining cache size
+        std::uint64_t total_remaining = 0;
+        std::size_t remaining_manifests = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(test_dir / "manifests", ec)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".ninfer_manifest") {
+                total_remaining += entry.file_size(ec);
+                ++remaining_manifests;
+            }
+        }
+        if (std::filesystem::exists(test_dir / "pool_data.ninfer_pages", ec)) {
+            total_remaining += std::filesystem::file_size(test_dir / "pool_data.ninfer_pages", ec);
+        }
+
+        expect(total_remaining <= config.max_cache_bytes,
+               "Total cache bytes must not exceed max_cache_bytes ceiling");
+        expect(remaining_manifests < 6, "Oldest manifests must have been evicted");
     }
 
     std::filesystem::remove_all(test_dir, ec);
@@ -932,6 +1053,8 @@ int main() {
     test_multi_config_isolation_and_cross_contamination();
     test_cancel_in_flight();
     test_mark_and_sweep_pool_compaction();
+    test_compaction_fragmentation_thresholds();
+    test_bulk_lru_watermark_eviction();
     test_concurrent_compaction_and_non_blocking_lookup();
     test_paged_kv_gather_scatter_page_major_layout_verification();
 #if defined(_WIN32)

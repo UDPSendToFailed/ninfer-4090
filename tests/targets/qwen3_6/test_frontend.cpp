@@ -442,6 +442,45 @@ int test_reasoning_effort_chat_template() {
                       .text.find("old thought") == std::string::npos,
               "explicit preserve_thinking=false did not remove prior thinking");
 
+    // Test client sending thinking inside content with reasoning_effort active (e.g. VS Code / OpenAI clients)
+    fi::ChatMessage embedded_thinking = chat_message(
+        "assistant", "<think>\nembedded model thought\n</think>\n\nactual assistant answer");
+    fi::ChatRenderOptions effort_low;
+    effort_low.reasoning_effort      = ninfer::ReasoningEffort::Low;
+    effort_low.add_generation_prompt = true;
+    effort_low.preserve_thinking     = true;
+
+    const std::string turn2_rendered =
+        reasoning_effort_template()
+            .render({chat_message("user", "q1"), embedded_thinking, chat_message("user", "q2")},
+                    effort_low)
+            .text;
+
+    // Must NOT contain duplicate empty <think>\n\n</think>\n\n tags
+    failures += check(turn2_rendered.find("<think>\n\n</think>\n\n<think>") == std::string::npos,
+                      "effort template inserted duplicate/empty think tags before embedded thinking");
+
+    // Must cleanly format previous assistant turn with exact thinking preservation
+    failures += check(turn2_rendered.find("<|im_start|>assistant\n<think>\nembedded model thought\n"
+                                          "</think>\n\nactual assistant answer<|im_end|>\n") !=
+                          std::string::npos,
+                      "embedded thinking inside content was not properly extracted and preserved");
+
+    // Turn 1 generation output simulation: verify exact prefix equivalence for 100% cache hits
+    fi::ChatRenderOptions turn1_opts;
+    turn1_opts.reasoning_effort      = ninfer::ReasoningEffort::Low;
+    turn1_opts.add_generation_prompt = true;
+    const std::string turn1_rendered =
+        reasoning_effort_template().render({chat_message("user", "q1")}, turn1_opts).text;
+
+    const std::string simulated_turn1_full_stream =
+        turn1_rendered + "embedded model thought\n</think>\n\nactual assistant answer<|im_end|>\n";
+
+    // Turn 2 prefix up to the second user query must be bit-for-bit identical to Turn 1 + output!
+    failures += check(
+        turn2_rendered.starts_with(simulated_turn1_full_stream),
+        "Turn 2 rendered prompt does not share exact prefix with Turn 1 full stream; cache prefix broken!");
+
     fi::ChatMessage empty_arguments = chat_message("assistant", "");
     empty_arguments.tool_calls.push_back({.id = "", .name = "f", .arguments_json = ""});
     failures += check(reasoning_effort_template()

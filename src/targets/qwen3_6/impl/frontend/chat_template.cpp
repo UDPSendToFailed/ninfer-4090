@@ -381,7 +381,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         std::string body = content;
         if (!message.reasoning_content.empty()) {
             reasoning = message.reasoning_content;
-        } else if (!effort_template) {
+        } else {
             ThinkParts parts = derive_think_parts(content);
             reasoning        = std::move(parts.reasoning);
             body             = std::move(parts.content);

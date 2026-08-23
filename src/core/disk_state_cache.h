@@ -177,7 +177,7 @@ public:
     void prune_lru();
 
     // Performs mark-and-sweep compaction on the physical page pool to reclaim dead pages
-    void compact_pool();
+    void compact_pool(bool force = true);
 
     // Immediately cancels any currently running or queued background save tasks
     void cancel_in_flight() noexcept;

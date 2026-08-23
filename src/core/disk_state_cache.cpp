@@ -201,7 +201,10 @@ public:
     }
 
     CompactStats compact(const std::unordered_set<std::uint64_t>& live_hashes,
-                         std::size_t min_dead_pages = 1,
+                         std::size_t min_dead_pages = 256,
+                         std::uint64_t min_dead_bytes = 2ULL << 30, // 2 GiB minimum dead space
+                         double min_dead_ratio = 0.25,              // 25% minimum fragmentation ratio
+                         bool force = false,
                          const std::atomic<bool>* cancel_token = nullptr) {
         CompactStats stats{};
         std::error_code ec;
@@ -228,14 +231,26 @@ public:
         }
 
         std::size_t dead_count = 0;
+        std::uint64_t dead_bytes = 0;
         for (const auto& [hash, old_rec] : local_index) {
             if (!live_hashes.contains(hash)) {
                 ++dead_count;
+                const std::uint64_t aligned_page_bytes =
+                    (static_cast<std::uint64_t>(old_rec.page_bytes) + 4095ULL) & ~4095ULL;
+                dead_bytes += aligned_page_bytes;
             }
         }
 
-        if (dead_count < min_dead_pages) {
-            // Below threshold: avoid heavy full-pool rewrites for trivial orphaned page counts
+        if (!force) {
+            const double dead_ratio = old_file_size > 0
+                ? (static_cast<double>(dead_bytes) / static_cast<double>(old_file_size))
+                : 0.0;
+            if (dead_count < min_dead_pages || dead_bytes < min_dead_bytes || dead_ratio < min_dead_ratio) {
+                // Below threshold: avoid heavy full-pool rewrites for low fragmentation or small dead space
+                stats.live_pages_retained = local_index.size();
+                return stats;
+            }
+        } else if (dead_count < min_dead_pages) {
             stats.live_pages_retained = local_index.size();
             return stats;
         }
@@ -774,10 +789,15 @@ public:
                 total_bytes += pool_bytes;
             }
 
-            if (total_bytes > config_.max_cache_bytes) {
+            // High Watermark: 100% of max_cache_bytes
+            // Low Watermark: 75% of max_cache_bytes (frees 25% headroom in one pass to prevent turn-by-turn thrashing)
+            const std::uint64_t high_watermark = config_.max_cache_bytes;
+            const std::uint64_t low_watermark  = config_.max_cache_bytes * 3 / 4;
+
+            if (total_bytes > high_watermark) {
                 std::sort(entries.begin(), entries.end()); // Oldest first
                 for (const auto& [time, path] : entries) {
-                    if (total_bytes <= config_.max_cache_bytes) { break; }
+                    if (total_bytes <= low_watermark) { break; }
                     const auto sz = std::filesystem::file_size(path, ec);
                     std::filesystem::remove(path, ec);
                     total_bytes -= sz;
@@ -798,16 +818,18 @@ public:
         if (evicted_count > 0) {
             const double evicted_mb = static_cast<double>(evicted_bytes) / (1024.0 * 1024.0);
             const double limit_gb = static_cast<double>(config_.max_cache_bytes) / (1024.0 * 1024.0 * 1024.0);
-            std::cout << "[info] ninfer: [prompt-cache] LRU evicted " << evicted_count
+            std::cout << "[info] ninfer: [prompt-cache] LRU bulk evicted " << evicted_count
                       << " manifest(s) (" << std::fixed << std::setprecision(1) << evicted_mb
                       << "MB freed, limit=" << limit_gb << "GB)\n" << std::flush;
         }
 
-        // Perform Mark-and-Sweep compaction without holding outer mutex_ so incoming inference requests
-        // are never blocked from admitting or checking prefix cache matches.
+        // Perform Mark-and-Sweep compaction only if dead space >= 2.0 GiB AND fragmentation >= 25%
         if (should_compact) {
-            const std::size_t min_dead = (pool_bytes > (config_.max_cache_bytes / 2)) ? 16 : 32;
-            const auto stats = journal_.compact(live_hashes, min_dead, &cancel_requested_);
+            constexpr std::size_t kMinDeadPages = 256;
+            constexpr std::uint64_t kMinDeadBytes = 2ULL << 30; // 2 GiB
+            constexpr double kMinDeadRatio = 0.25;               // 25% fragmentation
+            const auto stats = journal_.compact(live_hashes, kMinDeadPages, kMinDeadBytes, kMinDeadRatio,
+                                               /*force=*/false, &cancel_requested_);
             if (stats.dead_pages_purged > 0) {
                 const double freed_mb = static_cast<double>(stats.bytes_freed) / (1024.0 * 1024.0);
                 std::cout << "[info] ninfer: [prompt-cache] compacted page pool: purged "
@@ -820,7 +842,7 @@ public:
         }
     }
 
-    void compact_pool() {
+    void compact_pool(bool force = true) {
         std::unordered_set<std::uint64_t> live_hashes;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -828,7 +850,11 @@ public:
                 read_manifest_page_hashes(manifest_path, header, live_hashes);
             }
         }
-        const auto stats = journal_.compact(live_hashes, 1, &cancel_requested_);
+        const std::size_t min_dead_pages   = force ? 1 : 256;
+        const std::uint64_t min_dead_bytes = force ? 0 : (2ULL << 30);
+        const double min_dead_ratio        = force ? 0.0 : 0.25;
+        const auto stats = journal_.compact(live_hashes, min_dead_pages, min_dead_bytes,
+                                           min_dead_ratio, force, &cancel_requested_);
         if (stats.dead_pages_purged > 0) {
             const double freed_mb = static_cast<double>(stats.bytes_freed) / (1024.0 * 1024.0);
             std::cout << "[info] ninfer: [prompt-cache] compacted page pool: purged "
@@ -902,23 +928,7 @@ private:
                       << " invalid/incomplete manifest(s) on startup\n" << std::flush;
         }
 
-        // On startup: purge dead pages from prior abnormal terminations / deletions
-        if (std::filesystem::exists(journal_.pool_data_path(), ec)) {
-            std::unordered_set<std::uint64_t> live_hashes;
-            for (const auto& [manifest_path, header] : index_) {
-                read_manifest_page_hashes(manifest_path, header, live_hashes);
-            }
-            const auto stats = journal_.compact(live_hashes);
-            if (stats.dead_pages_purged > 0) {
-                const double freed_mb = static_cast<double>(stats.bytes_freed) / (1024.0 * 1024.0);
-                std::cout << "[info] ninfer: [prompt-cache] startup compaction: purged "
-                          << stats.dead_pages_purged << " dead page(s), retained "
-                          << stats.live_pages_retained << " live page(s) ("
-                          << std::fixed << std::setprecision(1) << freed_mb << "MB freed in "
-                          << stats.elapsed_ms << "ms)\n"
-                          << std::flush;
-            }
-        }
+        // On startup: index existing valid manifests. Startup is zero-I/O and finishes in <5ms.
     }
 
     void background_writer_loop(std::stop_token stop) {
@@ -1115,8 +1125,8 @@ void DiskStateCache::prune_lru() {
     impl_->prune_lru();
 }
 
-void DiskStateCache::compact_pool() {
-    impl_->compact_pool();
+void DiskStateCache::compact_pool(bool force) {
+    impl_->compact_pool(force);
 }
 
 void DiskStateCache::cancel_in_flight() noexcept {
