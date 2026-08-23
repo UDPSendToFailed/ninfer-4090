@@ -603,8 +603,18 @@ public:
           processor(processor_options(resources)), vision_enabled(vision_enabled_) {
         // The vision encode workspace is sized to vision_max_tokens; keep the processor
         // budget in lockstep so oversized media fails as MediaBudgetExceeded before it
-        // reaches the encoder.
-        if (vision_max_tokens_ > 0) { processor.max_vision_tokens = vision_max_tokens_; }
+        // reaches the encoder, and smart_resize_image downscales high-res media within
+        // the allocated vision token budget.
+        if (vision_max_tokens_ > 0) {
+            processor.max_vision_tokens   = vision_max_tokens_;
+            processor.max_raw_patches     = static_cast<std::uint64_t>(vision_max_tokens_) * (fi::kMerge * fi::kMerge);
+            const std::uint64_t budget_pixels =
+                static_cast<std::uint64_t>(vision_max_tokens_) * (fi::kFactor * fi::kFactor);
+            processor.image_max_pixels    = std::min(processor.image_max_pixels, budget_pixels);
+            processor.video_max_pixels    = std::min(processor.video_max_pixels, budget_pixels);
+            const std::uint64_t max_spatial = processor.max_raw_patches;
+            processor.max_attention_pairs = std::max(processor.max_attention_pairs, max_spatial * max_spatial);
+        }
         if (registered_checkpoint) { validate_registered_tokenizer(*tokenizer); }
         for (const int token : tokenizer->default_stop_token_ids()) {
             if (!tokenizer->is_valid_token(token)) {

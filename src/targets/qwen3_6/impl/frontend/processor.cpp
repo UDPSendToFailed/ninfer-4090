@@ -21,10 +21,6 @@
 namespace ninfer::targets::qwen3_6::frontend_internal {
 namespace {
 
-constexpr int kPatch                    = 16;
-constexpr int kTemporal                 = 2;
-constexpr int kMerge                    = 2;
-constexpr int kFactor                   = kPatch * kMerge;
 constexpr int kPatchFeatures            = 3 * kTemporal * kPatch * kPatch;
 constexpr int kImageToken               = 248056;
 constexpr int kVideoToken               = 248057;
