@@ -205,14 +205,28 @@ bool DirectStorageEngine::allocate_staging_vram(std::size_t required_bytes) {
 
 void DirectStorageEngine::release_staging() noexcept {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    if (d_staging_ptr_) {
-        cudaFree(d_staging_ptr_);
-        d_staging_ptr_ = nullptr;
+
+    // 1. Ensure D3D12 / DirectStorage queue has 100% finished retiring all DMA requests
+    if (d3d12_fence_ && fence_value_ > 0) {
+        if (d3d12_fence_->GetCompletedValue() < fence_value_) {
+            HANDLE event = CreateEventEx(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
+            if (event) {
+                if (SUCCEEDED(d3d12_fence_->SetEventOnCompletion(fence_value_, event))) {
+                    WaitForSingleObject(event, 5000); // 5s safety timeout
+                }
+                CloseHandle(event);
+            }
+        }
     }
+
+    // 2. Safely tear down CUDA external memory mappings
     if (cuda_ext_mem_) {
         cudaDestroyExternalMemory(cuda_ext_mem_);
         cuda_ext_mem_ = nullptr;
     }
+    d_staging_ptr_ = nullptr;
+
+    // 3. Safely reset D3D12 COM resources
     staging_resource_.Reset();
     pool_file_.Reset();
     manifest_file_.Reset();

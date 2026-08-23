@@ -1042,6 +1042,72 @@ void test_full_state_direct_storage_restore_live_gpu() {
 
     std::filesystem::remove_all(test_dir, ec);
 }
+
+void test_direct_storage_rapid_restore_and_teardown_stress() {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
+        return;
+    }
+    DeviceContext ctx(0);
+
+    const std::filesystem::path test_dir = "./.test_ninfer_ds_stress";
+    std::error_code ec;
+    std::filesystem::remove_all(test_dir, ec);
+
+    DiskStateCacheConfig config;
+    config.cache_dir       = test_dir;
+    config.max_cache_bytes = 100ULL << 20;
+    config.enabled         = true;
+
+    const std::uint64_t model_hash = 0xFEEDBEEFCAFE1234ULL;
+    const auto tokens = generate_tokens(8 * 64, 77); // 8 pages = 512 tokens
+    constexpr std::uint32_t page_bytes = 8192;
+    const auto original_kv = generate_deterministic_bytes(8 * page_bytes, 801);
+    const auto original_gdn = generate_deterministic_bytes(256 * 1024, 802); // 256 KB GDN
+    const auto original_mtp = generate_deterministic_bytes(1024, 804);
+    const auto original_tail = generate_deterministic_bytes(1024, 803);
+
+    std::filesystem::path manifest_path;
+    {
+        DiskStateCache cache(config);
+        cache.enqueue_save(model_hash, tokens, 1, 0, original_gdn, original_kv, 8, original_mtp, 1, original_tail);
+        auto match = wait_for_match(cache, model_hash, tokens);
+        expect(match.has_value(), "Stress test snapshot must be written");
+        manifest_path = match->file_path;
+    }
+
+    {
+        DiskStateCache cache(config);
+
+        // Perform 10 rapid back-to-back restore and immediate teardown cycles
+        for (int iter = 0; iter < 10; ++iter) {
+            DiskStateHeader loaded_header;
+            std::vector<TokenId> loaded_tokens;
+            void* d_ds_staging = nullptr;
+            std::size_t text_staging_bytes = 0;
+
+            const bool ok = cache.load_snapshot_direct_storage(manifest_path, loaded_header, loaded_tokens,
+                                                              ctx.stream, d_ds_staging, text_staging_bytes);
+            expect(ok, "DirectStorage restore iteration " + std::to_string(iter) + " must succeed");
+            expect(d_ds_staging != nullptr, "Staging pointer must be valid");
+
+            // Copy back staging payload to verify byte-exact parity
+            const std::size_t total_payload_sz = text_staging_bytes + loaded_header.gdn_state_bytes + loaded_header.tail_hidden_bytes;
+            std::vector<std::byte> readback(total_payload_sz);
+            CUDA_CHECK(cudaMemcpyAsync(readback.data(), d_ds_staging, total_payload_sz, cudaMemcpyDeviceToHost, ctx.stream));
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+
+            // Immediate teardown: tests CPU D3D12 fence synchronization handshake and driver safety
+            ninfer::core::DirectStorageEngine::instance().release_staging();
+
+            // Verify payload prefix matches original Text KV bytes
+            expect(std::memcmp(readback.data(), original_kv.data(), original_kv.size()) == 0,
+                   "Text KV data in iteration " + std::to_string(iter) + " must be bit-exact");
+        }
+    }
+
+    std::filesystem::remove_all(test_dir, ec);
+}
 #endif
 
 int main() {
@@ -1060,6 +1126,7 @@ int main() {
 #if defined(_WIN32)
     test_cow_multi_turn_delta_splicing_live_gpu();
     test_full_state_direct_storage_restore_live_gpu();
+    test_direct_storage_rapid_restore_and_teardown_stress();
 #endif
 
     if (failures != 0) {
