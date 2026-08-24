@@ -451,10 +451,7 @@ void q5_rowsplit_gemm_mma_kernel(
 #pragma unroll
                 for (int pair = 0; pair < 4; ++pair) {
                     residual_values.pack.pair[pair] =
-                        __floats2bfloat162_rn(__low2float(residual_values.pack.pair[pair]) +
-                                                  __low2float(projected.pack.pair[pair]),
-                                              __high2float(residual_values.pack.pair[pair]) +
-                                                  __high2float(projected.pack.pair[pair]));
+                        __hadd2(residual_values.pack.pair[pair], projected.pack.pair[pair]);
                 }
                 store_vec(&out[static_cast<std::int64_t>(col) * rows + row], residual_values.raw);
             } else if (col < cols && row < rows) {
@@ -467,10 +464,7 @@ void q5_rowsplit_gemm_mma_kernel(
 #pragma unroll
                     for (int pair = 0; pair < 4; ++pair) {
                         residual_values.pack.pair[pair] =
-                            __floats2bfloat162_rn(__low2float(residual_values.pack.pair[pair]) +
-                                                      __low2float(projected.pack.pair[pair]),
-                                                  __high2float(residual_values.pack.pair[pair]) +
-                                                      __high2float(projected.pack.pair[pair]));
+                            __hadd2(residual_values.pack.pair[pair], projected.pack.pair[pair]);
                     }
                     store_vec(&out[static_cast<std::int64_t>(col) * rows + row],
                               residual_values.raw);
@@ -480,9 +474,9 @@ void q5_rowsplit_gemm_mma_kernel(
                         if (row + i < rows) {
                             const std::int64_t index =
                                 static_cast<std::int64_t>(col) * rows + row + i;
-                            out[index] = __float2bfloat16_rn(
-                                __bfloat162float(out[index]) +
-                                __bfloat162float(projected_shared[local_col * BM + local_row + i]));
+                            out[index] = __hadd(
+                                out[index],
+                                projected_shared[local_col * BM + local_row + i]);
                         }
                     }
                 }
@@ -499,10 +493,12 @@ void q5_rowsplit_gemm_mma_kernel(
                 const int output_col1 = output_col0 + 1;
                 const float* values   = accum[mi][ni];
                 auto store_value      = [&](std::int64_t index, float value) {
+                    const __nv_bfloat16 val_bf16 = __float2bfloat16_rn(value);
                     if constexpr (Epilogue == Q5MmaEpilogue::AddResidual) {
-                        value = __bfloat162float(residual[index]) + value;
+                        out[index] = __hadd(val_bf16, residual[index]);
+                    } else {
+                        out[index] = val_bf16;
                     }
-                    out[index] = __float2bfloat16_rn(value);
                 };
                 if constexpr (kFull) {
                     store_value(static_cast<std::int64_t>(output_col0) * rows + output_row0,

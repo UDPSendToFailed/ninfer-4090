@@ -212,9 +212,13 @@ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void w8_rowsplit_medium_t_sp
     if (k_split == 0) {
         const W8OutputTile output_tile = output.tile(cta_row0);
         const auto store               = [&](int row, int col, float value) {
-            __nv_bfloat16* destination = output_tile.at(row, col);
-            if constexpr (AddResidual) { value += __bfloat162float(*destination); }
-            *destination = __float2bfloat16_rn(value);
+            __nv_bfloat16* destination   = output_tile.at(row, col);
+            const __nv_bfloat16 val_bf16 = __float2bfloat16_rn(value);
+            if constexpr (AddResidual) {
+                *destination = __hadd(val_bf16, *destination);
+            } else {
+                *destination = val_bf16;
+            }
         };
 #pragma unroll
         for (int ni = 0; ni < kNt; ++ni) {

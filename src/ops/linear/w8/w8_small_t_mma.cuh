@@ -305,11 +305,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
             if constexpr (std::is_same_v<Epilogue, W8SmallTMmaStoreEpilogue> ||
                           std::is_same_v<Epilogue, W8SmallTMmaResidualEpilogue>) {
                 const auto store = [&](int row, int col, float value) {
-                    __nv_bfloat16* destination = output_tile.at(row, col);
+                    __nv_bfloat16* destination   = output_tile.at(row, col);
+                    const __nv_bfloat16 val_bf16 = __float2bfloat16_rn(value);
                     if constexpr (std::is_same_v<Epilogue, W8SmallTMmaResidualEpilogue>) {
-                        value += __bfloat162float(*destination);
+                        *destination = __hadd(val_bf16, *destination);
+                    } else {
+                        *destination = val_bf16;
                     }
-                    *destination = __float2bfloat16_rn(value);
                 };
                 if (col0 < ActiveCols) {
                     store(cta_row0 + gid, col0, sum.x);

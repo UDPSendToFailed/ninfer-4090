@@ -438,9 +438,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                 residual.raw = load_vec<uint4>(output_tile.at(row, col));
 #pragma unroll
                 for (int pair = 0; pair < 4; ++pair) {
-                    residual.pair[pair] = __floats2bfloat162_rn(
-                        __low2float(residual.pair[pair]) + __low2float(projected.pair[pair]),
-                        __high2float(residual.pair[pair]) + __high2float(projected.pair[pair]));
+                    residual.pair[pair] = __hadd2(residual.pair[pair], projected.pair[pair]);
                 }
                 store_vec(output_tile.at(row, col), residual.raw);
             } else if (col < n && row < m) {
@@ -451,9 +449,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                     residual.raw = load_vec<uint4>(output_tile.at(row, col));
 #pragma unroll
                     for (int pair = 0; pair < 4; ++pair) {
-                        residual.pair[pair] = __floats2bfloat162_rn(
-                            __low2float(residual.pair[pair]) + __low2float(projected.pair[pair]),
-                            __high2float(residual.pair[pair]) + __high2float(projected.pair[pair]));
+                        residual.pair[pair] = __hadd2(residual.pair[pair], projected.pair[pair]);
                     }
                     store_vec(output_tile.at(row, col), residual.raw);
                 } else {
@@ -461,9 +457,9 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                     for (int i = 0; i < kRowsPerPack; ++i) {
                         if (row + i < m) {
                             __nv_bfloat16* destination = output_tile.at(row + i, col);
-                            *destination               = __float2bfloat16_rn(
-                                __bfloat162float(*destination) +
-                                __bfloat162float(projected_shared[local_col * BM + local_row + i]));
+                            *destination               = __hadd(
+                                *destination,
+                                projected_shared[local_col * BM + local_row + i]);
                         }
                     }
                 }

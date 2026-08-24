@@ -249,9 +249,13 @@ __launch_bounds__(64, 16) __global__
 
     if (part == 0 && lane < kTt) {
         const std::int64_t index = static_cast<std::int64_t>(lane) * n + row;
-        float sum                = s_part[0][lane] + s_part[1][lane];
-        if constexpr (AddResidual) { sum += __bfloat162float(out[index]); }
-        out[index] = __float2bfloat16(sum);
+        const float sum              = s_part[0][lane] + s_part[1][lane];
+        const __nv_bfloat16 sum_bf16 = __float2bfloat16_rn(sum);
+        if constexpr (AddResidual) {
+            out[index] = __hadd(sum_bf16, out[index]);
+        } else {
+            out[index] = sum_bf16;
+        }
     }
 }
 

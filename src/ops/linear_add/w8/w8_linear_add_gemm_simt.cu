@@ -67,7 +67,10 @@ __global__ __launch_bounds__(RowsPerCta * 32, 2) void w8_linear_add_decode_kerne
     }
 
     acc = warp_reduce_sum(acc);
-    if (lane == 0) { residual[row] = __float2bfloat16_rn(__bfloat162float(residual[row]) + acc); }
+    if (lane == 0) {
+        const __nv_bfloat16 acc_bf16 = __float2bfloat16_rn(acc);
+        residual[row]                = __hadd(acc_bf16, residual[row]);
+    }
 }
 
 template <int RowsPerCta>
