@@ -20,8 +20,8 @@ struct Bf16LinearAddMmaOutputTile {
                                           float accumulator) const {
         __nv_bfloat16* destination =
             residual + static_cast<std::int64_t>(token) * leading_dim + row;
-        const float residual_value = __bfloat162float(*destination);
-        *destination               = __float2bfloat16_rn(accumulator + residual_value);
+        const __nv_bfloat16 acc_bf16 = __float2bfloat16_rn(accumulator);
+        *destination                 = __hadd(acc_bf16, *destination);
     }
 };
 

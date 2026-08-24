@@ -15,8 +15,8 @@ struct Bf16LinearAddDecodeOutput {
 struct Bf16LinearAddDecodeEpilogue {
     __device__ __forceinline__ void operator()(const Bf16LinearAddDecodeOutput& output,
                                                std::int32_t row, float accumulator) const {
-        const float residual = __bfloat162float(output.residual[row]);
-        output.residual[row] = __float2bfloat16_rn(accumulator + residual);
+        const __nv_bfloat16 acc_bf16 = __float2bfloat16_rn(accumulator);
+        output.residual[row]         = __hadd(acc_bf16, output.residual[row]);
     }
 };
 

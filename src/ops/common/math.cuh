@@ -10,17 +10,25 @@
 
 namespace ninfer::ops {
 
-__device__ __forceinline__ float silu(float x) { return x / (1.0f + expf(-x)); }
-
-__device__ __forceinline__ float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
-
-__device__ __forceinline__ float softplus(float x) { return (x > 20.0f) ? x : log1pf(expf(x)); }
-
 __device__ __forceinline__ float exp2_approx(float x) {
     float y;
     asm("ex2.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
     return y;
 }
+
+__device__ __forceinline__ float silu(float x) {
+    constexpr float kNegLog2e = -1.4426950408889634f;
+    const float denom = 1.0f + exp2_approx(x * kNegLog2e);
+    return x * __frcp_rn(denom);
+}
+
+__device__ __forceinline__ float sigmoid(float x) {
+    constexpr float kNegLog2e = -1.4426950408889634f;
+    const float denom = 1.0f + exp2_approx(x * kNegLog2e);
+    return __frcp_rn(denom);
+}
+
+__device__ __forceinline__ float softplus(float x) { return (x > 20.0f) ? x : log1pf(expf(x)); }
 
 __device__ __forceinline__ std::uint32_t pack_bf16x2(float lo, float hi) {
     std::uint32_t out;
