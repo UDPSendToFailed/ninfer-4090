@@ -44,7 +44,12 @@ __device__ __forceinline__ uint8_t e8_quantize_root_8d(const float u[8], float o
     float best_type_a_score = max_pair_sum;
     int s_i_bit = (signs[best_i] > 0) ? 1 : 0;
     int s_j_bit = (signs[best_j] > 0) ? 1 : 0;
-    uint8_t type_a_code = static_cast<uint8_t>(best_pair_idx * 4 + (s_i_bit << 1) + s_j_bit);
+    uint32_t type_a_code = 0;
+    asm("bfi.b32 %0, %1, %2, 2, 6;\n"
+        "bfi.b32 %0, %3, %0, 1, 1;\n"
+        "bfi.b32 %0, %4, %0, 0, 1;"
+        : "=&r"(type_a_code)
+        : "r"(best_pair_idx), "r"(0), "r"(s_i_bit), "r"(s_j_bit));
 
     // 2. Type B Roots: 1/2 (+-1, +-1, +-1, +-1, +-1, +-1, +-1, +-1) with even parity -> 128 roots
     float sum_abs = 0.0f;
@@ -287,7 +292,12 @@ __device__ __forceinline__ void e8_encode_cylinder_8d_warp(
     int s_j_val = __shfl_sync(full_mask, sign_u, (lane & ~7) + best_j);
     int s_i_bit = (s_i_val > 0) ? 1 : 0;
     int s_j_bit = (s_j_val > 0) ? 1 : 0;
-    uint8_t type_a_code = static_cast<uint8_t>(best_pair_idx * 4 + (s_i_bit << 1) + s_j_bit);
+    uint32_t type_a_code = 0;
+    asm("bfi.b32 %0, %1, %2, 2, 6;\n"
+        "bfi.b32 %0, %3, %0, 1, 1;\n"
+        "bfi.b32 %0, %4, %0, 0, 1;"
+        : "=&r"(type_a_code)
+        : "r"(best_pair_idx), "r"(0), "r"(s_i_bit), "r"(s_j_bit));
     float best_type_a_score = top1_val + top2_val;
 
     // 5. Type B: Sum & Min reduction across 8 lanes
@@ -299,7 +309,6 @@ __device__ __forceinline__ void e8_encode_cylinder_8d_warp(
     #pragma unroll
     for (int mask = 4; mask > 0; mask >>= 1) {
         sum_abs += __shfl_xor_sync(full_mask, sum_abs, mask);
-        minus_count += __shfl_xor_sync(full_mask, minus_count, mask);
         float other_min = __shfl_xor_sync(full_mask, min_abs, mask);
         int other_idx   = __shfl_xor_sync(full_mask, min_idx, mask);
         if (other_min < min_abs || (other_min == min_abs && other_idx < min_idx)) {
@@ -307,6 +316,8 @@ __device__ __forceinline__ void e8_encode_cylinder_8d_warp(
             min_idx = other_idx;
         }
     }
+    const unsigned sub_mask = 0xffu << (lane & ~7);
+    asm("redux.sync.add.s32 %0, %1, %2;\n" : "=r"(minus_count) : "r"(minus_count), "r"(sub_mask));
 
     float best_type_b_score = 0.5f * sum_abs;
     if ((minus_count & 1) != 0) {
