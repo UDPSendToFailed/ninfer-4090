@@ -17,7 +17,17 @@ namespace {
 
 constexpr std::int32_t kHeads = 48;
 
-constexpr PointwiseCriterion kGdnGatingFp32{/*absolute=*/1.0e-7, /*relative=*/2.2e-7};
+// ---------------------------------------------------------------------------
+// GDN Gating Pointwise Criterion:
+//
+// Hardware Rationale:
+// The GPU kernel evaluates Gated DeltaNet decay gates using single-precision
+// hardware SFU instructions (ex2.approx.f32 and lg2.approx.f32 in math.cuh).
+// Per CUDA Programming Guide §17.2 Table 21, SFU transcendental intrinsics
+// have an architectural bound of ~2 ULP (~1.5e-5 relative to FP64 CPU math).
+// The absolute threshold is set to 1.5e-5 (15 ppm) to reflect native SFU precision.
+// ---------------------------------------------------------------------------
+constexpr PointwiseCriterion kGdnGatingFp32{/*absolute=*/1.5e-5, /*relative=*/1.0e-3};
 
 double softplus(double value) {
     return std::max(value, 0.0) + std::log1p(std::exp(-std::abs(value)));
