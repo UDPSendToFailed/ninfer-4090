@@ -58,7 +58,7 @@ __device__ __forceinline__ unsigned q4_small_t_bf16_pair(std::uint8_t packed) {
 
 template <class Geometry, int TileCols, int ActiveCols, class Epilogue = Q4SmallTMmaStoreEpilogue,
           class RowPolicy = Q4SmallTMmaIdentityRows>
-__launch_bounds__(256, 6) __global__
+__launch_bounds__(256, 2) __global__
     void q4_small_t_mma_kernel(const __nv_bfloat16* __restrict__ x,
                                const std::uint8_t* __restrict__ codes,
                                const std::uint8_t* __restrict__ scales,
