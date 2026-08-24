@@ -59,7 +59,7 @@ __device__ __forceinline__ void gqa_small_t_i8_store_swz(std::int8_t* tile, int 
 template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm, int KeyBlock,
           bool DynamicArena, bool PackedV, bool RotateK, bool RotateV, bool PackedK,
           bool E8Lattice = false, bool E8Root = false, bool MultiBatch = false, bool Masked = false, typename CacheInput = void*>
-__launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
+__launch_bounds__(WarpsPerCta * 32, (WarpsPerCta <= 4 ? 2 : 1)) __global__
     void gqa_attention_decode_i8_tiled_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
         std::uint8_t* cache_v_codes, __half* cache_k_scale, __half* cache_v_scale,

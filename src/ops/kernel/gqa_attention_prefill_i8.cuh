@@ -769,14 +769,16 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
         const int row_tile = warp % kGqaPrefillI8RowTiles;
         const int d_slice  = warp / kGqaPrefillI8RowTiles;
         const int row_base = row_tile * 16;
-        const float alpha0 = alpha_s[row_base + gid];
-        const float alpha1 = alpha_s[row_base + gid + 8];
+        {
+            const float alpha0 = alpha_s[row_base + gid];
+            const float alpha1 = alpha_s[row_base + gid + 8];
 #pragma unroll
-        for (int n = 0; n < PVNtPerWarp; ++n) {
-            acc[n][0] *= alpha0;
-            acc[n][1] *= alpha0;
-            acc[n][2] *= alpha1;
-            acc[n][3] *= alpha1;
+            for (int n = 0; n < PVNtPerWarp; ++n) {
+                acc[n][0] *= alpha0;
+                acc[n][1] *= alpha0;
+                acc[n][2] *= alpha1;
+                acc[n][3] *= alpha1;
+            }
         }
 
 #pragma unroll
@@ -972,14 +974,16 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
         const int row_tile = warp % kGqaPrefillI8RowTiles;
         const int d_slice  = warp / kGqaPrefillI8RowTiles;
         const int row_base = row_tile * 16;
-        const float alpha0 = alpha_s[row_base + gid];
-        const float alpha1 = alpha_s[row_base + gid + 8];
+        {
+            const float alpha0 = alpha_s[row_base + gid];
+            const float alpha1 = alpha_s[row_base + gid + 8];
 #pragma unroll
-        for (int n = 0; n < PVNtPerWarp; ++n) {
-            acc[n][0] *= alpha0;
-            acc[n][1] *= alpha0;
-            acc[n][2] *= alpha1;
-            acc[n][3] *= alpha1;
+            for (int n = 0; n < PVNtPerWarp; ++n) {
+                acc[n][0] *= alpha0;
+                acc[n][1] *= alpha0;
+                acc[n][2] *= alpha1;
+                acc[n][3] *= alpha1;
+            }
         }
 
 #pragma unroll
