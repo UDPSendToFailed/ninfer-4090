@@ -16,7 +16,7 @@ namespace {
 
 constexpr std::int32_t kHeadDim                      = 256;
 constexpr std::int32_t kQuantGroup                   = 64;
-constexpr std::int32_t kSmallTChunkTokens            = 6;
+constexpr std::int32_t kSmallTChunkTokens            = 8;
 constexpr std::int32_t kMaximumVerifyTokens          = 16;
 constexpr std::int32_t kMaximumBatchSize             = 8;
 constexpr std::uint32_t kTwoChunkPromptVisibleKeys   = 512;
@@ -348,8 +348,7 @@ GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t
     if (batch_size > 1) { return GqaAttentionRoute::ChunkedSmallT; }
     const std::uint32_t prompt_visible_keys =
         width <= 2 * kSmallTChunkTokens ? kTwoChunkPromptVisibleKeys : kThreeChunkPromptVisibleKeys;
-    if (q_heads == 16 && width <= kMaximumVerifyTokens &&
-        envelope.max_visible_keys > prompt_visible_keys) {
+    if ((q_heads == 16 || q_heads == 24) && width <= kMaximumVerifyTokens) {
         return GqaAttentionRoute::ChunkedSmallT;
     }
     return GqaAttentionRoute::Prompt;

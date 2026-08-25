@@ -155,7 +155,15 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     };
-    if constexpr (TokenTile == 6) {
+    if constexpr (TokenTile >= 7) {
+        if constexpr (Geometry::GroupSize == 6) {
+            // Three Q row tiles for the 27B group of six (RowTiles = 3 -> Wc = 6).
+            launch.template operator()<6, 1, 32, true>();
+        } else {
+            // Four Q row tiles for the 35B group of eight (RowTiles = 4 -> Wc = 8).
+            launch.template operator()<8, 1, 32, true>();
+        }
+    } else if constexpr (TokenTile == 6) {
         // Three Q row tiles for the 27B group of six (RowTiles = 3).
         if (implementation_window > 128 && implementation_window <= 160) {
             launch.template operator()<6, 1, 32, false>();
@@ -223,11 +231,11 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
 
 } // namespace
 
-bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tokens <= 6; }
+bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tokens <= 8; }
 
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                           DType cache_dtype, GqaExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > 6 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8) ||
+    if (tokens < 1 || tokens > 8 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("gqa_attention split capacity: invalid profile");
     }
@@ -323,6 +331,12 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
         break;
     case 6:
         NINFER_GQA_SMALL_T_DISPATCH(6, 4);
+        break;
+    case 7:
+        NINFER_GQA_SMALL_T_DISPATCH(7, 4);
+        break;
+    case 8:
+        NINFER_GQA_SMALL_T_DISPATCH(8, 4);
         break;
     default:
         throw std::invalid_argument("gqa_attention_small_t_launch: unsupported T");

@@ -114,7 +114,7 @@ std::string serve_usage_text(const char* argv0) {
            "  --spec <mtp|dflash>         Speculative execution backend (default: none / autoregressive):\n"
            "                                mtp        - Multi-Token Prediction draft heads\n"
            "                                dflash     - Block-parallel draft model (35B-A3B text-only)\n"
-           "  --draft-tokens <N>          Speculative draft tokens per verification round (MTP: 1..5, DFlash: 1..15)\n"
+           "  --draft-tokens <N>          Speculative draft tokens per verification round (MTP: 1..15, DFlash: 1..15)\n"
            "  --lm-head-draft             Reuse base model LM head weights for draft logits projection (requires --spec)\n\n"
            "Vision & Multimodal:\n"
            "  --vision                    Enable image/video vision encoder and load Vision GPU allocations\n"
