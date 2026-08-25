@@ -45,9 +45,15 @@ if(MSVC)
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Oi>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Ot>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/arch:AVX2>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/w14305>   # Warn on accidental double literal truncation (e.g. 1.0 vs 1.0f)
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/w14244>   # Warn on float/int precision loss
 
     # NVVM & PTXAS Device Optimizations
     $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-O3>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>           # Print exact register usage and .local stack spills
+    $<$<COMPILE_LANGUAGE:CUDA>:-ftz=true>            # Flush subnormals to zero (hardware fast path on sm_89)
+    $<$<COMPILE_LANGUAGE:CUDA>:-prec-div=false>      # Fast single-precision hardware division (__fdividef)
+    $<$<COMPILE_LANGUAGE:CUDA>:-prec-sqrt=false>     # Fuse 1.0f/sqrtf(x) into single-cycle rsqrtf(x)
   )
 
   # LINKER: prefix ensures CMake passes this strictly to link.exe via -Xlinker for CUDA targets
