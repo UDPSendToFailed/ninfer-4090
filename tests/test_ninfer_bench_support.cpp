@@ -137,7 +137,7 @@ int test_cli_contract() {
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
-                {"ninfer_bench", "--weights", "model.ninfer", "--mtp-draft-tokens", "6"});
+                {"ninfer_bench", "--weights", "model.ninfer", "--mtp-draft-tokens", "16"});
         },
         "unsupported MTP window");
     failures += expect_throws<std::invalid_argument>(
