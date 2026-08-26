@@ -16,6 +16,7 @@
 #endif
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -79,6 +80,21 @@ struct D3D12AllocationLifetime {
 // Keep lifetime references alive so WDDM residency priority is never dismantled
 static std::vector<D3D12AllocationLifetime> g_d3d12_allocations;
 
+// Upper bound on how long we wait for WDDM to make the heap resident before falling back.
+constexpr DWORD kResidencyWaitTimeoutMs = 10000;
+
+// The D3D12 residency lock and the eager page commit both assume this GPU is not also driving
+// the desktop: they pin/commit the full arena up front and rely on WDDM evicting other
+// applications. On a card shared with the desktop that oversubscribes VRAM and pushes the
+// runtime into paging, so both are opt-in via NINFER_WDDM_EVICTABLE_BUDGET=1.
+bool wddm_residency_lock_enabled() {
+    static const bool enabled = [] {
+        const char* raw = std::getenv("NINFER_WDDM_EVICTABLE_BUDGET");
+        return raw != nullptr && raw[0] == '1' && raw[1] == '\0';
+    }();
+    return enabled;
+}
+
 bool try_allocate_d3d12_residency_locked(std::size_t capacity_bytes, void*& out_ptr) {
     D3D12AllocationLifetime res;
 
@@ -137,6 +153,24 @@ bool try_allocate_d3d12_residency_locked(std::size_t capacity_bytes, void*& out_
         return false;
     }
 
+    // EnqueueMakeResident completes asynchronously and signals the fence once the heap is
+    // actually resident in device memory. Touching the heap before that point is undefined
+    // behaviour: under desktop VRAM contention the pages are not yet backed, so weights
+    // written into the mapping are silently lost and the model emits noise.
+    if (res.fence->GetCompletedValue() < 1) {
+        HANDLE residency_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (residency_event == nullptr) { return false; }
+        if (FAILED(res.fence->SetEventOnCompletion(1, residency_event))) {
+            CloseHandle(residency_event);
+            return false;
+        }
+        const DWORD wait_result = WaitForSingleObject(residency_event, kResidencyWaitTimeoutMs);
+        CloseHandle(residency_event);
+        // A timeout means WDDM could not make the heap resident without going overbudget.
+        // Fall back to cudaMalloc rather than running against non-resident memory.
+        if (wait_result != WAIT_OBJECT_0) { return false; }
+    }
+
     // 3. Create shared handle for CUDA import
     HANDLE shared_handle = nullptr;
     if (FAILED(res.device->CreateSharedHandle(res.heap.Get(), nullptr, GENERIC_ALL, nullptr, &shared_handle))) {
@@ -148,7 +182,10 @@ bool try_allocate_d3d12_residency_locked(std::size_t capacity_bytes, void*& out_
     ext_desc.type = cudaExternalMemoryHandleTypeD3D12Heap;
     ext_desc.handle.win32.handle = shared_handle;
     ext_desc.size = aligned_size;
-    ext_desc.flags = cudaExternalMemoryDedicated;
+    // cudaExternalMemoryDedicated applies to dedicated allocations (D3D12 committed resources /
+    // Vulkan dedicated allocations). A D3D12 heap is a suballocatable range, so the flag must
+    // not be set here.
+    ext_desc.flags = 0;
 
     cudaExternalMemory_t ext_mem = nullptr;
     const cudaError_t import_err = cudaImportExternalMemory(&ext_mem, &ext_desc);
@@ -268,8 +305,8 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
 
     void* ptr = nullptr;
 #if defined(_WIN32)
-    if (!try_allocate_d3d12_residency_locked(capacity_bytes, ptr)) {
-        ptr = nullptr;
+    if (wddm_residency_lock_enabled()) {
+        if (!try_allocate_d3d12_residency_locked(capacity_bytes, ptr)) { ptr = nullptr; }
     }
 #endif
 
@@ -280,11 +317,14 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
         }
 
 #if defined(_WIN32)
-        // Eagerly touch allocated pages to force WDDM to fault physical VRAM and evict background apps
-        const cudaError_t set_err = cudaMemset(ptr, 0, capacity_bytes);
-        if (set_err != cudaSuccess) {
-            free_device(ptr);
-            throw std::runtime_error(cuda_error_message("cudaMemset failed", set_err));
+        // Eagerly touch allocated pages to force WDDM to fault physical VRAM and evict
+        // background apps. Only safe when this GPU is not also driving the desktop.
+        if (wddm_residency_lock_enabled()) {
+            const cudaError_t set_err = cudaMemset(ptr, 0, capacity_bytes);
+            if (set_err != cudaSuccess) {
+                free_device(ptr);
+                throw std::runtime_error(cuda_error_message("cudaMemset failed", set_err));
+            }
         }
 #endif
     }
