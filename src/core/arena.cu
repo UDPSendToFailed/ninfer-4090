@@ -212,6 +212,38 @@ bool try_allocate_d3d12_residency_locked(std::size_t capacity_bytes, void*& out_
         return false;
     }
 
+    // Verify the mapping actually round-trips before trusting 16 GiB of weights to it.
+    // A D3D12 heap that imported cleanly can still fail to read back correctly, and the
+    // failure mode downstream is silent output corruption rather than an error.
+    {
+        constexpr std::size_t kProbeBytes = 4096;
+        const std::size_t probe = capacity_bytes < kProbeBytes ? capacity_bytes : kProbeBytes;
+        std::vector<unsigned char> pattern(probe);
+        for (std::size_t i = 0; i < probe; ++i) { pattern[i] = static_cast<unsigned char>((i * 31 + 7) & 0xFF); }
+        std::vector<unsigned char> readback(probe, 0);
+
+        bool coherent = false;
+        const std::size_t tail_offset = capacity_bytes > probe ? capacity_bytes - probe : 0;
+        if (cudaMemcpy(dev_ptr, pattern.data(), probe, cudaMemcpyHostToDevice) == cudaSuccess &&
+            cudaMemcpy(static_cast<unsigned char*>(dev_ptr) + tail_offset, pattern.data(), probe,
+                       cudaMemcpyHostToDevice) == cudaSuccess &&
+            cudaDeviceSynchronize() == cudaSuccess &&
+            cudaMemcpy(readback.data(), static_cast<unsigned char*>(dev_ptr) + tail_offset, probe,
+                       cudaMemcpyDeviceToHost) == cudaSuccess) {
+            coherent = std::memcmp(pattern.data(), readback.data(), probe) == 0;
+        }
+
+        if (!coherent) {
+            std::fprintf(stderr,
+                         "[ninfer] D3D12 residency arena failed read-back verification "
+                         "(%zu bytes); falling back to cudaMalloc\n",
+                         capacity_bytes);
+            cudaDestroyExternalMemory(ext_mem);
+            return false;
+        }
+        cudaMemset(dev_ptr, 0, capacity_bytes);
+    }
+
     out_ptr = dev_ptr;
     g_d3d12_allocations.push_back(std::move(res));
     return true;
