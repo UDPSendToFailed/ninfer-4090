@@ -95,6 +95,9 @@ ninfer_add_test(ninfer_gdn_replay_records_test
 ninfer_add_test(ninfer_disk_state_cache_test
   SOURCES test_disk_state_cache.cpp
   LIBRARIES ninfer_core ninfer_ops)
+ninfer_add_test(ninfer_chunked_kv_snapshot_restore_test
+  SOURCES test_chunked_kv_snapshot_restore.cpp
+  LIBRARIES ninfer_core ninfer_ops)
 set_tests_properties(
   ninfer_artifact_materialization_test
   ninfer_device_test
@@ -103,6 +106,7 @@ set_tests_properties(
   ninfer_request_memory_test
   ninfer_kv_cache_test
   ninfer_state_store_test
+  ninfer_chunked_kv_snapshot_restore_test
   PROPERTIES SKIP_RETURN_CODE 77)
 # Family frontend and one opt-in real-artifact prefix/MTP integration test.
 ninfer_add_test(ninfer_qwen3_6_frontend_test

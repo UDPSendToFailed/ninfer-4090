@@ -673,8 +673,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                         if (!valid_mtp_page_ids.empty()) {
                             auto& mtp_pool = decoder->mtp_cache()->pool();
                             constexpr std::uint32_t kRestoreBatchPages = 32;
-                            const std::size_t mtp_page_bytes =
-                                loaded_mtp_kv.size() / static_cast<std::size_t>(valid_mtp_page_ids.size());
+                            const std::size_t mtp_page_bytes = mtp_pool.total_page_bytes();
                             for (std::size_t b = 0; b < valid_mtp_page_ids.size(); b += kRestoreBatchPages) {
                                 const std::size_t n =
                                     std::min<std::size_t>(kRestoreBatchPages, valid_mtp_page_ids.size() - b);
@@ -2537,41 +2536,32 @@ void ProgramImplCore::snapshot_lane_to_disk(std::uint32_t lane, DiskStateCache& 
 
     std::vector<std::byte> missing_pages_data;
     std::uint32_t single_page_bytes = 0;
-    void* h_text_pinned = nullptr;
-    std::size_t missing_total_bytes = 0;
 
-        if (!missing_physical_page_ids.empty()) {
-            const auto& pool = decoder->text_kv.pool();
-            single_page_bytes = static_cast<std::uint32_t>(pool.total_page_bytes());
-            missing_total_bytes = pool.total_page_bytes() * missing_physical_page_ids.size();
+    if (!missing_physical_page_ids.empty()) {
+        const auto& pool = decoder->text_kv.pool();
+        single_page_bytes = static_cast<std::uint32_t>(pool.total_page_bytes());
+        const std::size_t missing_total_bytes =
+            static_cast<std::size_t>(single_page_bytes) * missing_physical_page_ids.size();
+        missing_pages_data.resize(missing_total_bytes);
 
-            // Chunked staging: gather page batches into bounded pinned buffers instead of one
-            // whole-snapshot allocation, so saving a large checkpoint cannot OOM device memory.
-            constexpr std::uint32_t kSaveBatchPages = 32;
-            missing_pages_data.resize(missing_total_bytes);
-            std::byte* batch_dst = missing_pages_data.data();
-            for (std::size_t b = 0; b < missing_physical_page_ids.size(); b += kSaveBatchPages) {
-                const std::size_t n =
-                    std::min<std::size_t>(kSaveBatchPages, missing_physical_page_ids.size() - b);
-                const std::size_t batch_bytes = n * single_page_bytes;
+        // Chunked staging: gather page batches into bounded pinned/async buffers instead of one
+        // whole-snapshot allocation, so saving a large checkpoint cannot OOM device memory.
+        constexpr std::uint32_t kSaveBatchPages = 32;
+        for (std::size_t b = 0; b < missing_physical_page_ids.size(); b += kSaveBatchPages) {
+            const std::size_t n =
+                std::min<std::size_t>(kSaveBatchPages, missing_physical_page_ids.size() - b);
+            const std::size_t batch_bytes = n * single_page_bytes;
 
-                void* d_batch = nullptr;
-                CUDA_CHECK(cudaMallocAsync(&d_batch, batch_bytes, device.stream));
-                pool.gather_to_contiguous_device(
-                    std::span<const std::int32_t>(missing_physical_page_ids.data() + b, n),
-                    d_batch, device.stream);
-
-                void* h_batch = nullptr;
-                CUDA_CHECK(cudaMallocHost(&h_batch, batch_bytes));
-                CUDA_CHECK(cudaMemcpyAsync(h_batch, d_batch, batch_bytes,
-                                           cudaMemcpyDeviceToHost, device.stream));
-                CUDA_CHECK(cudaFreeAsync(d_batch, device.stream));
-                CUDA_CHECK(cudaStreamSynchronize(device.stream));
-                std::memcpy(batch_dst, h_batch, batch_bytes);
-                CUDA_CHECK(cudaFreeHost(h_batch));
-                batch_dst += batch_bytes;
-            }
-        } else if (sequence.kv && sequence.kv->text.valid()) {
+            void* d_batch = nullptr;
+            CUDA_CHECK(cudaMallocAsync(&d_batch, batch_bytes, device.stream));
+            pool.gather_to_contiguous_device(
+                std::span<const std::int32_t>(missing_physical_page_ids.data() + b, n),
+                d_batch, device.stream);
+            CUDA_CHECK(cudaMemcpyAsync(missing_pages_data.data() + b * single_page_bytes, d_batch,
+                                       batch_bytes, cudaMemcpyDeviceToHost, device.stream));
+            CUDA_CHECK(cudaFreeAsync(d_batch, device.stream));
+        }
+    } else if (sequence.kv && sequence.kv->text.valid()) {
         const auto& pool = decoder->text_kv.pool();
         single_page_bytes = static_cast<std::uint32_t>(pool.total_page_bytes());
     }
@@ -2617,13 +2607,6 @@ void ProgramImplCore::snapshot_lane_to_disk(std::uint32_t lane, DiskStateCache& 
     }
 
     CUDA_CHECK(cudaStreamSynchronize(device.stream));
-
-    if (h_text_pinned && missing_total_bytes > 0) {
-        missing_pages_data.resize(missing_total_bytes);
-        std::memcpy(missing_pages_data.data(), h_text_pinned, missing_total_bytes);
-        CUDA_CHECK(cudaFreeHost(h_text_pinned));
-        h_text_pinned = nullptr;
-    }
 
     disk_cache.enqueue_save_cow(model_hash, std::move(ledger_tokens), 0, sequence.rope_delta,
                                 std::move(gdn_payload), std::move(all_page_hashes),
@@ -2695,41 +2678,32 @@ void ProgramImplCore::snapshot_turn_checkpoint_to_disk(std::uint32_t lane, DiskS
 
     std::vector<std::byte> missing_pages_data;
     std::uint32_t single_page_bytes = 0;
-    void* h_text_pinned = nullptr;
-    std::size_t missing_total_bytes = 0;
 
-        if (!missing_physical_page_ids.empty()) {
-            const auto& pool = decoder->text_kv.pool();
-            single_page_bytes = static_cast<std::uint32_t>(pool.total_page_bytes());
-            missing_total_bytes = pool.total_page_bytes() * missing_physical_page_ids.size();
+    if (!missing_physical_page_ids.empty()) {
+        const auto& pool = decoder->text_kv.pool();
+        single_page_bytes = static_cast<std::uint32_t>(pool.total_page_bytes());
+        const std::size_t missing_total_bytes =
+            static_cast<std::size_t>(single_page_bytes) * missing_physical_page_ids.size();
+        missing_pages_data.resize(missing_total_bytes);
 
-            // Chunked staging: gather page batches into bounded pinned buffers instead of one
-            // whole-snapshot allocation, so saving a large checkpoint cannot OOM device memory.
-            constexpr std::uint32_t kSaveBatchPages = 32;
-            missing_pages_data.resize(missing_total_bytes);
-            std::byte* batch_dst = missing_pages_data.data();
-            for (std::size_t b = 0; b < missing_physical_page_ids.size(); b += kSaveBatchPages) {
-                const std::size_t n =
-                    std::min<std::size_t>(kSaveBatchPages, missing_physical_page_ids.size() - b);
-                const std::size_t batch_bytes = n * single_page_bytes;
+        // Chunked staging: gather page batches into bounded pinned/async buffers instead of one
+        // whole-snapshot allocation, so saving a large checkpoint cannot OOM device memory.
+        constexpr std::uint32_t kSaveBatchPages = 32;
+        for (std::size_t b = 0; b < missing_physical_page_ids.size(); b += kSaveBatchPages) {
+            const std::size_t n =
+                std::min<std::size_t>(kSaveBatchPages, missing_physical_page_ids.size() - b);
+            const std::size_t batch_bytes = n * single_page_bytes;
 
-                void* d_batch = nullptr;
-                CUDA_CHECK(cudaMallocAsync(&d_batch, batch_bytes, device.stream));
-                pool.gather_to_contiguous_device(
-                    std::span<const std::int32_t>(missing_physical_page_ids.data() + b, n),
-                    d_batch, device.stream);
-
-                void* h_batch = nullptr;
-                CUDA_CHECK(cudaMallocHost(&h_batch, batch_bytes));
-                CUDA_CHECK(cudaMemcpyAsync(h_batch, d_batch, batch_bytes,
-                                           cudaMemcpyDeviceToHost, device.stream));
-                CUDA_CHECK(cudaFreeAsync(d_batch, device.stream));
-                CUDA_CHECK(cudaStreamSynchronize(device.stream));
-                std::memcpy(batch_dst, h_batch, batch_bytes);
-                CUDA_CHECK(cudaFreeHost(h_batch));
-                batch_dst += batch_bytes;
-            }
-        } else if (sequence.kv && sequence.kv->text.valid()) {
+            void* d_batch = nullptr;
+            CUDA_CHECK(cudaMallocAsync(&d_batch, batch_bytes, device.stream));
+            pool.gather_to_contiguous_device(
+                std::span<const std::int32_t>(missing_physical_page_ids.data() + b, n),
+                d_batch, device.stream);
+            CUDA_CHECK(cudaMemcpyAsync(missing_pages_data.data() + b * single_page_bytes, d_batch,
+                                       batch_bytes, cudaMemcpyDeviceToHost, device.stream));
+            CUDA_CHECK(cudaFreeAsync(d_batch, device.stream));
+        }
+    } else if (sequence.kv && sequence.kv->text.valid()) {
         const auto& pool = decoder->text_kv.pool();
         single_page_bytes = static_cast<std::uint32_t>(pool.total_page_bytes());
     }
@@ -2779,13 +2753,6 @@ void ProgramImplCore::snapshot_turn_checkpoint_to_disk(std::uint32_t lane, DiskS
     }
 
     CUDA_CHECK(cudaStreamSynchronize(device.stream));
-
-    if (h_text_pinned && missing_total_bytes > 0) {
-        missing_pages_data.resize(missing_total_bytes);
-        std::memcpy(missing_pages_data.data(), h_text_pinned, missing_total_bytes);
-        CUDA_CHECK(cudaFreeHost(h_text_pinned));
-        h_text_pinned = nullptr;
-    }
 
     disk_cache.enqueue_save_cow(model_hash, std::move(turn_toks), 0, sequence.rope_delta,
                                 std::move(gdn_payload), std::move(all_page_hashes),
