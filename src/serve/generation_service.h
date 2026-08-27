@@ -113,7 +113,16 @@ public:
     void warmup();
 
 private:
-    [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
+    enum class DeadlinePolicy : std::uint8_t {
+        ClientPendingTimeout,
+        UnboundedStartup,
+    };
+
+    [[nodiscard]] PreparedRequest prepare_impl(const GenerationRequest& req,
+                                               std::function<bool()> is_cancelled,
+                                               DeadlinePolicy deadline_policy) const;
+    [[nodiscard]] std::shared_ptr<RequestLifetime>
+    acquire_request_lifetime(DeadlinePolicy deadline_policy) const;
     [[nodiscard]] HostInputLease
     acquire_media_input(std::chrono::steady_clock::time_point deadline,
                         const std::function<bool()>& is_cancelled) const;

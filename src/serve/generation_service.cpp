@@ -1,7 +1,6 @@
 #include "serve/generation_service.h"
 
 #include "product/media_acquire/acquire.h"
-#include "serve/console_log.h"
 #include "serve/tool_call_parser.h"
 #include "serve/translate.h"
 
@@ -304,7 +303,8 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     media_input_capacity_ = std::make_shared<MediaInputCapacity>();
 }
 
-std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() const {
+std::shared_ptr<RequestLifetime>
+GenerationService::acquire_request_lifetime(DeadlinePolicy deadline_policy) const {
     const auto started = Clock::now();
     {
         std::lock_guard lock(request_capacity_->mutex);
@@ -315,9 +315,11 @@ std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() c
         ++request_capacity_->active;
     }
     try {
-        return std::make_shared<RequestLifetime>(
-            request_capacity_, started,
-            started + std::chrono::milliseconds(options_.pending_timeout_ms));
+        const Clock::time_point deadline =
+            deadline_policy == DeadlinePolicy::UnboundedStartup
+                ? Clock::time_point::max()
+                : started + std::chrono::milliseconds(options_.pending_timeout_ms);
+        return std::make_shared<RequestLifetime>(request_capacity_, started, deadline);
     } catch (...) {
         std::lock_guard lock(request_capacity_->mutex);
         --request_capacity_->active;
@@ -364,6 +366,12 @@ GenerationService::acquire_media_input(Clock::time_point deadline,
 
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled) const {
+    return prepare_impl(request, std::move(is_cancelled), DeadlinePolicy::ClientPendingTimeout);
+}
+
+PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request,
+                                                std::function<bool()> is_cancelled,
+                                                DeadlinePolicy deadline_policy) const {
     PreparedRequest prepared;
     prepared.include_usage        = request.include_usage;
     prepared.tool_capable         = request.uses_tools() || request.has_tool_history();
@@ -387,7 +395,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
         throw_request_error(ninfer::RequestError(RequestErrorKind::MediaBudgetExceeded,
                                                  "request exceeds the 16-item media limit"));
     }
-    prepared.lifetime = acquire_request_lifetime();
+    prepared.lifetime = acquire_request_lifetime(deadline_policy);
     HostInputLease host_input;
     if (request_has_media) {
         host_input = acquire_media_input(prepared.lifetime->deadline, is_cancelled);
@@ -512,24 +520,19 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
 }
 
 void GenerationService::warmup() {
-    try {
-        GenerationRequest request;
-        ChatTurn turn;
-        turn.role = "user";
-        ContentPart content;
-        content.kind     = ContentKind::Text;
-        content.text     = "hi";
-        content.type_raw = "text";
-        turn.content.push_back(std::move(content));
-        request.messages.push_back(std::move(turn));
-        request.max_tokens       = 4;
-        request.max_tokens_set   = true;
-        PreparedRequest prepared = prepare(request);
-        run(prepared, nullptr);
-    } catch (const std::exception& exception) {
-        write_console_log(ConsoleLogLevel::Warning,
-                          std::string("warmup failed (continuing): ") + exception.what());
-    }
+    GenerationRequest request;
+    ChatTurn turn;
+    turn.role = "user";
+    ContentPart content;
+    content.kind     = ContentKind::Text;
+    content.text     = "hi";
+    content.type_raw = "text";
+    turn.content.push_back(std::move(content));
+    request.messages.push_back(std::move(turn));
+    request.max_tokens       = 4;
+    request.max_tokens_set   = true;
+    PreparedRequest prepared = prepare_impl(request, {}, DeadlinePolicy::UnboundedStartup);
+    run(prepared, nullptr);
 }
 
 } // namespace ninfer::serve
