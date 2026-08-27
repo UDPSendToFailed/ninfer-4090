@@ -37,21 +37,19 @@ namespace ninfer::ops {
  *
  * Logical shapes:
  *   Contiguous BF16 x [K,T] and residual [N,T]. Registered weights are Q5G64_F16S RowSplit
- *   [5120,17408] or [5120,6144], W8G32_F16S RowSplit [2048,4096] or [2048,6144], and NVFP4
- *   BlockScaleK16M128x4 [5120,6144] or [5120,17408], or BF16_CTRL Contiguous [5120,6144].
+ *   [5120,17408] or [5120,6144], W8G32_F16S RowSplit [2048,4096] or [2048,6144], or BF16_CTRL Contiguous [5120,6144].
  *   T may be any positive value.
  *
  * Numeric:
  *   The oracle reads a registered BF16 weight directly or exact-decodes a registered packed
  *   weight, then evaluates `ideal` naively in FP64 from the represented inputs. The updated BF16
  *   residual is promoted and compared directly with that result; output storage rounding belongs
- *   to LinearAdd's selected A16 or A4 criterion, not the oracle. Production routes may fuse or
- *   materialize the projection and may choose their natural accumulator, activation quantization,
+ *   to LinearAdd's selected A16 criterion, not the oracle. Production routes may fuse or
+ *   materialize the projection and may choose their natural accumulator,
  *   staging, and workspace precision; those private choices are not semantic rounding boundaries.
  *
  * Compute policy:
- *   Q5, W8, and BF16_CTRL admit only A16Only. NVFP4 admits A16Only and AllowA4; AllowA4 permits
- *   the private resolver to select a qualified A16 or A4 route at every positive T.
+ *   Q5, W8, and BF16_CTRL admit only A16Only.
  *
  * Effects:
  *   Updates the full residual tensor in place; x/weight must not alias residual.

@@ -153,72 +153,6 @@ int verify_output_range_sampled(std::string_view label, const GuardedBf16Tensor&
     return compare(label, actual, expected, criterion);
 }
 
-int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPolicy policy) {
-    constexpr std::int32_t kHidden      = 5120;
-    constexpr std::int32_t kQkvRows     = 10240;
-    constexpr std::int32_t kZRows       = 6144;
-    constexpr std::int32_t kRows        = kQkvRows + kZRows;
-    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 601U + tokens);
-    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
-    DeviceBuffer device_activation                   = to_device(activation_bits);
-    GuardedBf16Tensor qkv(kQkvRows, tokens);
-    GuardedBf16Tensor z(kZRows, tokens);
-    Tensor x                   = Tensor(device_activation.p, DType::BF16, {kHidden, tokens});
-    Tensor qkv_output          = qkv.tensor();
-    Tensor z_output            = z.tensor();
-    const std::size_t capacity = ops::gdn_input_proj_workspace_capacity_bytes(
-        QType::NVFP4, kRows, kHidden, policy, tokens, tokens);
-    WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
-    ops::gdn_input_proj(x, parent.view(), qkv_output, z_output, policy, workspace, nullptr);
-    cuda_synchronize();
-
-    const bool a4                       = policy == ops::LinearPolicy::AllowA4;
-    const ReductionCriterion& criterion = a4 ? kGdnInputProjA4Tolerance : kGdnInputProjA16Tolerance;
-    const std::string suffix =
-        std::string(" NVFP4 ") + (a4 ? "A4" : "A16") + " T=" + std::to_string(tokens);
-    int failures = qkv.verify_guards("gdn qkv" + suffix);
-    failures += z.verify_guards("gdn z" + suffix);
-    failures += qkv.verify_fully_written("gdn qkv" + suffix);
-    failures += z.verify_fully_written("gdn z" + suffix);
-    failures += verify_output_range_sampled("gdn query" + suffix, qkv, kQkvRows, 0, 2048,
-                                            parent.host, 0, activation, kHidden, tokens, criterion);
-    failures +=
-        verify_output_range_sampled("gdn key" + suffix, qkv, kQkvRows, 2048, 2048, parent.host,
-                                    2048, activation, kHidden, tokens, criterion);
-    failures +=
-        verify_output_range_sampled("gdn value" + suffix, qkv, kQkvRows, 4096, 6144, parent.host,
-                                    4096, activation, kHidden, tokens, criterion);
-    failures += verify_output_range_sampled("gdn z" + suffix, z, kZRows, 0, kZRows, parent.host,
-                                            kQkvRows, activation, kHidden, tokens, criterion);
-    if (workspace.peak_used() != capacity) {
-        std::cerr << "gdn workspace" << suffix << ": query/execution high-water mismatch\n";
-        ++failures;
-    }
-    failures += verify_preserved("gdn x" + suffix, device_activation, activation_bits);
-    failures += parent.verify_preserved("gdn parent weight" + suffix);
-    return failures;
-}
-
-int run_nvfp4() {
-    constexpr std::int32_t kHidden = 5120;
-    constexpr std::int32_t kRows   = 16384;
-    quantized_weight::PatternedWeightOptions options;
-    options.weight_scale_divisor = 0.125F;
-    options.input_scale_divisor  = 3.5F;
-    DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::NVFP4, kRows, kHidden, 607U, options));
-    int failures = 0;
-    failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only);
-    failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::A16Only);
-    if (!nvfp4_a4_unavailable()) {
-        failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::AllowA4);
-        failures += run_nvfp4_case(parent, 2, ops::LinearPolicy::AllowA4);
-        failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4);
-        failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4);
-    }
-    return failures;
-}
-
 } // namespace
 
 int main() {
@@ -230,7 +164,6 @@ int main() {
     int failures = 0;
     failures += run_q4_q5();
     failures += run_w8();
-    failures += run_nvfp4();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj\n";
     return failures == 0 ? 0 : 1;
 }

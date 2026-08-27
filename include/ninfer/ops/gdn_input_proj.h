@@ -45,14 +45,12 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
 /**
  * Single-parent GDN projection. Registered parent forms are:
  *
- * - W8G32_F16S RowSplit [12288,2048], with stored row counts [2048,2048,4096,4096];
- * - NVFP4 BlockScaleK16M128x4 [16384,5120], with stored row counts [2048,2048,6144,6144].
+ * - W8G32_F16S RowSplit [12288,2048], with stored row counts [2048,2048,4096,4096].
  *
  * The first three ranges are written contiguously to qkv and the final range is written to z.
- * W8 admits A16 only. NVFP4 admits A16Only and AllowA4; AllowA4 permits private activation
- * quantization at every positive T. Every route writes the two
+ * W8 admits A16 only. Every route writes the two
  * independent final allocations directly. The complete projection is evaluated against the same
- * exact-decode/naive-FP64 oracle; activation quantization and the production reduction profile are
+ * exact-decode/naive-FP64 oracle; the production reduction profile is
  * private effects covered by the selected criterion. x, qkv, and z must be pairwise
  * non-overlapping.
  *
@@ -83,16 +81,6 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
-
-/**
- * Returns the transient capacity for the [16384,5120] NVFP4 snapshot profile. `batch_size` is exact
- * and the query covers every W in the inclusive width interval. B=1 preserves the existing fused
- * snapshot resolver. B=2..8 covers aggregate gdn_input_proj workspace plus one projected BF16
- * plane.
- */
-[[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-    QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
 
 /**
@@ -139,9 +127,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
 
 /**
  * Single-parent form of gdn_input_proj_conv_snapshot. Registered parents are W8G32_F16S RowSplit
- * [12288,2048] and NVFP4 BlockScaleK16M128x4 [16384,5120], both in q/k/value/z row order. W8
- * admits A16Only. For dense B=1, NVFP4 A16Only is registered through W=16 and AllowA4 for every
- * positive W; B>1 uses the aggregate projection policy directly over B*W columns.
+ * [12288,2048] in q/k/value/z row order. W8 admits A16Only.
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
                                   const Tensor& conv_weight, Tensor& conv_states,
@@ -151,8 +137,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
                                   cudaStream_t stream);
 
 /**
- * Applies the A16-only single-parent form. For NVFP4, dense B=1 is valid through W=16; the batched
- * domain is B=2..8 and W=1..16.
+ * Applies the A16-only single-parent form.
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
                                   const Tensor& conv_weight, Tensor& conv_states,
@@ -169,15 +154,6 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
-    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
-
-/**
- * Returns the transient capacity for the [16384,5120] NVFP4 record-producing profile. A16 and
- * fused small-T routes require no storage. AllowA4 returns only the activation-quantization
- * workspace selected by the corresponding projection route; conv_record is caller-owned.
- */
-[[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
-    QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
 
 /**
@@ -204,8 +180,7 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                                 WorkspaceArena& workspace, cudaStream_t stream);
 
 /**
- * Single-parent record-producing form. Registered parents are W8G32_F16S [12288,2048] and NVFP4
- * [16384,5120]. W8 admits A16Only. NVFP4 admits A16Only and AllowA4.
+ * Single-parent record-producing form. Registered parents are W8G32_F16S [12288,2048]. W8 admits A16Only.
  */
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,
                                 const Tensor& conv_weight, const Tensor& conv_states,

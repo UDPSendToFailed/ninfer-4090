@@ -25,9 +25,7 @@ namespace ninfer::ops {
                                                                  std::int32_t max_tokens);
 
 /**
- * Policy-bearing capacity query. Q4/W8 admit A16Only. NVFP4 admits A16Only through T=16 and
- * AllowA4 for every positive T. AllowA4 covers whichever qualified A16 or A4 route the private
- * resolver selects across the requested interval.
+ * Policy-bearing capacity query. Q4/W8 admit A16Only.
  */
 [[nodiscard]] std::size_t
 linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
@@ -44,9 +42,8 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  * Logical shapes / supported domain:
  *   T may be any positive value. The registered RowSplit profiles are:
  *   - Q4G64_F16S weight [34816,5120], x [5120,T], out [17408,T];
- *   - W8G32_F16S weight [12288,2048], x [2048,T], out [6144,T];
- *   - NVFP4 BlockScaleK16M128x4 weight [34816,5120], x [5120,T], out [17408,T].
- *   Inputs and output are contiguous BF16. Q4/W8 scales are FP16; NVFP4 scales are E4M3FN.
+ *   - W8G32_F16S weight [12288,2048], x [2048,T], out [6144,T].
+ *   Inputs and output are contiguous BF16. Q4/W8 scales are FP16.
  *
  * Numeric:
  *   The oracle exact-decodes the registered weight and evaluates `ideal` naively in FP64 from the
@@ -60,16 +57,13 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *
  * Workspace:
  *   Caller-owned transient storage reported by linear_swiglu_workspace_capacity_bytes(),
- *   scoped to the call. W8 and fused NVFP4 A16 require zero bytes; W4A4 routes use caller-owned
- *   activation and, where selected, private projection storage. There is no persistent state side
- *   effect.
+ *   scoped to the call. W8 requires zero bytes. There is no persistent state side effect.
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
                    WorkspaceArena& ws, cudaStream_t stream);
 
 /**
- * A16-only convenience form. Q4/W8 retain their complete positive-T domain. NVFP4 is admitted
- * only through T=16; larger NVFP4 extents require the policy-bearing AllowA4 form.
+ * A16-only convenience form. Q4/W8 retain their complete positive-T domain.
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
                    cudaStream_t stream);

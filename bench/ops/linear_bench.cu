@@ -224,8 +224,6 @@ const char* qtype_name(QType qtype) {
         return "W8";
     case QType::BF16_CTRL:
         return "BF16";
-    case QType::NVFP4:
-        return "NVFP4";
     default:
         break;
     }
@@ -245,7 +243,6 @@ QType parse_qtype(std::string_view text) {
     if (value == "q6" || value == "q6g64_f16s") { return QType::Q6G64_F16S; }
     if (value == "w8" || value == "w8g32" || value == "w8g32_f16s") { return QType::W8G32_F16S; }
     if (value == "bf16" || value == "bf16_ctrl") { return QType::BF16_CTRL; }
-    if (value == "nvfp4") { return QType::NVFP4; }
     throw std::invalid_argument("unknown qtype: " + std::string(text));
 }
 
@@ -312,8 +309,8 @@ void usage(const char* argv0) {
     std::fprintf(
         stderr,
         "Usage:\n"
-        "  %s --qtype Q4|Q5|Q6|W8|BF16|NVFP4 --n N --k K --t T [options]\n"
-        "  %s --qtype Q4|Q5|Q6|W8|BF16|NVFP4 --n N --k K --sweep START:END[:STEP] [options]\n"
+        "  %s --qtype Q4|Q5|Q6|W8|BF16 --n N --k K --t T [options]\n"
+        "  %s --qtype Q4|Q5|Q6|W8|BF16 --n N --k K --sweep START:END[:STEP] [options]\n"
         "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|all [options]\n\n"
         "Options:\n"
         "  --policy a16|a4    Activation-compute policy (default a16).\n"
@@ -488,11 +485,6 @@ LinearBenchWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
         bench::DirectBf16Weight direct  = bench::make_direct_bf16_weight(n, k);
         const std::uint64_t model_bytes = direct.model_weight_bytes();
         return {std::move(direct.storage), direct.weight, model_bytes};
-    }
-    if (qtype == QType::NVFP4) {
-        bench::PackedQuantizedWeight packed = bench::make_nvfp4_weight(n, k);
-        const std::uint64_t model_bytes     = packed.model_weight_bytes();
-        return {std::move(packed.storage), packed.weight, model_bytes};
     }
     const std::uint64_t padded_k_u64 = align_up(static_cast<std::uint64_t>(k), 128);
     if (padded_k_u64 > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {

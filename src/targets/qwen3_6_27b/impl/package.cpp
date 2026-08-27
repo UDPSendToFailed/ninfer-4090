@@ -89,9 +89,6 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "groupwise-int") {
         return WeightsProfile::GroupwiseIntW8Endpoints;
     }
-    if (identity.model_id == model_id && identity.weights_id == "nvfp4") {
-        return WeightsProfile::Nvfp4;
-    }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");
 }

@@ -228,14 +228,6 @@ quantized_weight::PackedWeight make_w8g32_f16s_weight(std::int32_t n, std::int32
                                                     quantized_weight::RowSplitCodePattern::Hashed});
 }
 
-quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
-                                                 std::uint32_t seed) {
-    quantized_weight::PatternedWeightOptions options;
-    options.weight_scale_divisor = 0.125F;
-    options.input_scale_divisor  = 3.5F;
-    return quantized_weight::make_patterned_weight(QType::NVFP4, n, k, seed, options);
-}
-
 void cpu_linear_gemm_fp64(const float* weight, const float* activation, double* output,
                           std::int32_t n, std::int32_t k, std::int32_t t) {
     if (weight == nullptr || activation == nullptr || output == nullptr || n <= 0 || k <= 0 ||

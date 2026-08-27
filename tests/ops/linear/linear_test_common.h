@@ -51,8 +51,6 @@ quantized_weight::PackedWeight make_q6g64_f16s_weight(std::int32_t n, std::int32
                                                       std::uint32_t seed);
 quantized_weight::PackedWeight make_w8g32_f16s_weight(std::int32_t n, std::int32_t k,
                                                       std::uint32_t seed);
-quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
-                                                 std::uint32_t seed);
 
 void cpu_linear_gemm_fp64(const float* weight, const float* activation, double* output,
                           std::int32_t n, std::int32_t k, std::int32_t t);

@@ -1,11 +1,8 @@
 #include "ninfer/ops/attn_input_proj.h"
 
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
-#include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
-#include "ops/linear/nvfp4/nvfp4_config.h"
-#include "ops/linear/nvfp4/nvfp4_format.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -57,7 +54,7 @@ void require_w8_rowsplit(const Weight& weight, std::int32_t rows, const char* la
 void require_bf16_contiguous(const Weight& weight, std::int32_t rows, std::int32_t hidden,
                              const char* label) {
     const std::uint64_t payload_bytes = static_cast<std::uint64_t>(rows) *
-                                        static_cast<std::uint64_t>(hidden) * sizeof(std::uint16_t);
+                                         static_cast<std::uint64_t>(hidden) * sizeof(std::uint16_t);
     if (weight.qtype != QType::BF16_CTRL || weight.layout != QuantLayout::Contiguous ||
         weight.payload_bytes < payload_bytes || weight.high_plane_bytes != 0 || weight.ndim != 2 ||
         weight.n != rows || weight.k != hidden || weight.shape[0] != rows ||
@@ -81,6 +78,7 @@ void validate_policy(LinearPolicy policy) {
 void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                             Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                             cudaStream_t stream) {
+    (void)workspace;
     validate_policy(policy);
     if (weight.qtype == QType::BF16_CTRL) {
         constexpr std::int32_t kHidden = 5120;
@@ -99,29 +97,6 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         require_matrix(v, kKvRows, cols, "v");
         require_bf16_contiguous(weight, kRows, kHidden, "query/key/gate/value weight");
         detail::bf16_attn_input_dispatch(x, weight, q, gate, k, v, stream);
-        return;
-    }
-
-    if (weight.qtype == QType::NVFP4) {
-        constexpr std::int32_t kHidden = 5120;
-        constexpr std::int32_t kQRows  = 6144;
-        constexpr std::int32_t kKvRows = 1024;
-        constexpr std::int32_t kRows   = 14336;
-        const std::int32_t cols        = x.ne[1];
-        if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
-        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
-            throw std::invalid_argument("NVFP4 attn_input_proj admits only A16 or A4");
-        }
-        require_matrix(x, kHidden, cols, "x");
-        require_matrix(q, kQRows, cols, "q");
-        require_matrix(gate, kQRows, cols, "gate");
-        require_matrix(k, kKvRows, cols, "k");
-        require_matrix(v, kKvRows, cols, "v");
-        detail::validate_nvfp4_weight(weight, "nvfp4 attn_input_proj");
-        if (weight.n != kRows || weight.k != kHidden) {
-            throw std::invalid_argument("nvfp4 attn_input_proj: unsupported weight shape");
-        }
-        detail::nvfp4_attn_input_dispatch(x, weight, q, gate, k, v, policy, workspace, stream);
         return;
     }
 
@@ -160,13 +135,6 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
             throw std::invalid_argument("attn_input_proj workspace: unsupported BF16 profile");
         }
         return 0;
-    case QType::NVFP4:
-        if (parent_rows != detail::Nvfp4AttnInputGeometry::kOutputRows ||
-            input_rows != detail::Nvfp4AttnInputGeometry::kInputRows ||
-            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
-            throw std::invalid_argument("attn_input_proj workspace: unsupported NVFP4 profile");
-        }
-        return detail::nvfp4_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     case QType::W8G32_F16S:
         if (parent_rows != 9216 || input_rows != 2048 || policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported W8 profile");

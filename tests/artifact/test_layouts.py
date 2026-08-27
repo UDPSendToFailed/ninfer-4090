@@ -8,13 +8,10 @@ import torch
 from tools.artifact.layouts import (
     RowPlanes,
     assemble_row_planes,
-    block_scale_geometry,
     decode_direct,
-    decode_nvfp4_words,
     decode_row_split_codes,
     dequantize_row_split,
     encode_direct,
-    encode_nvfp4,
     encode_row_split,
     encoded_size,
     gather_row_planes,
@@ -214,87 +211,3 @@ def test_consecutive_views_arbitrary_gathers_and_standalone_assembly():
     )
     assert torch.equal(tensor_scales, scales[[2, 0]])
     assert torch.equal(tensor_codes, codes[[2, 0]])
-
-
-def test_nvfp4_known_vector_geometry_swizzle_tail_and_round_trip():
-    shape = (128, 64)
-    geometry = block_scale_geometry("NVFP4", shape)
-    assert (
-        geometry.code_plane_bytes,
-        geometry.scale_plane_offset,
-        geometry.scale_plane_bytes,
-        geometry.weight_divisor_offset,
-        geometry.payload_bytes,
-    ) == (4096, 4096, 512, 4608, 4612)
-
-    packed = (
-        torch.arange(geometry.code_plane_bytes, dtype=torch.int64)
-        .remainder(256)
-        .to(torch.uint8)
-        .reshape(128, 32)
-    )
-    packed[0, 0] = 0x10
-    scales = (
-        torch.arange(128 * 4, dtype=torch.int64)
-        .remainder(0x7F)
-        .to(torch.uint8)
-        .reshape(128, 4)
-    )
-    divisor = struct.pack("<f", 2.5)
-    payload = encode_nvfp4(packed, scales, divisor, shape)
-
-    assert len(payload) == 4612
-    assert payload[0] == 0x10  # low nibble is K=0; high nibble is K=1.
-    for row, lane in ((0, 0), (31, 3), (32, 0), (127, 3)):
-        offset = (
-            geometry.scale_plane_offset
-            + (row % 32) * 16
-            + (row // 32) * 4
-            + lane
-        )
-        assert payload[offset] == int(scales[row, lane])
-    assert payload[geometry.weight_divisor_offset :] == divisor
-
-    decoded_packed, decoded_scales, decoded_divisor = decode_nvfp4_words(
-        payload, shape
-    )
-    assert torch.equal(decoded_packed, packed)
-    assert torch.equal(decoded_scales, scales)
-    assert bytes(decoded_divisor.reshape(1).view(torch.uint8).numpy()) == divisor
-
-
-@pytest.mark.parametrize(
-    ("layout", "format_name", "shape", "message"),
-    [
-        ("blockscale-k16-m128x4-v1", "NVFP4", (128,), "rank 2"),
-        (
-            "blockscale-k16-m128x4-v1",
-            "NVFP4",
-            (127, 64),
-            "N divisible by 128",
-        ),
-        (
-            "blockscale-k16-m128x4-v1",
-            "NVFP4",
-            (128, 65),
-            "K divisible by 64",
-        ),
-        (
-            "blockscale-k16-m128x4-v1",
-            "Q4G64_F16S",
-            (128, 64),
-            "does not accept",
-        ),
-        (
-            "row-split-k128-v1",
-            "NVFP4",
-            (128, 64),
-            "does not accept",
-        ),
-    ],
-)
-def test_nvfp4_layout_rejects_out_of_contract_signatures(
-    layout, format_name, shape, message
-):
-    with pytest.raises(ValueError, match=message):
-        encoded_size(layout, format_name, shape)

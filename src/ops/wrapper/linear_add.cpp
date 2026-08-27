@@ -1,9 +1,6 @@
 #include "ninfer/ops/linear_add.h"
 
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
-#include "ops/linear/nvfp4/nvfp4_config.h"
-#include "ops/linear/nvfp4/nvfp4_format.h"
-#include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_add/w8/w8_linear_add_plan.h"
 
@@ -105,17 +102,6 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         return detail::q5_linear_add_capacity_workspace_bytes(output_rows, input_rows, input_rows,
                                                               min_tokens, max_tokens);
     }
-    if (qtype == QType::NVFP4) {
-        const bool supported = (output_rows == detail::Nvfp4Residual6144Geometry::kOutputRows &&
-                                input_rows == detail::Nvfp4Residual6144Geometry::kInputRows) ||
-                               (output_rows == detail::Nvfp4Residual17408Geometry::kOutputRows &&
-                                input_rows == detail::Nvfp4Residual17408Geometry::kInputRows);
-        if (!supported || (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
-            throw std::invalid_argument("linear_add workspace: unsupported NVFP4 profile");
-        }
-        return detail::nvfp4_linear_add_workspace_capacity_bytes(output_rows, input_rows, policy,
-                                                                 min_tokens, max_tokens);
-    }
     throw std::invalid_argument("linear_add workspace: unsupported weight format");
 }
 
@@ -184,25 +170,6 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         }
         (void)ws;
         detail::w8_linear_add_dispatch(x, w, residual_out, stream);
-        return;
-    }
-
-    if (w.qtype == QType::NVFP4) {
-        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
-            throw std::invalid_argument("NVFP4 linear_add admits only A16 or A4");
-        }
-        detail::validate_nvfp4_weight(w, "nvfp4 linear_add");
-        const bool supported_shape = (w.n == detail::Nvfp4Residual6144Geometry::kOutputRows &&
-                                      w.k == detail::Nvfp4Residual6144Geometry::kInputRows) ||
-                                     (w.n == detail::Nvfp4Residual17408Geometry::kOutputRows &&
-                                      w.k == detail::Nvfp4Residual17408Geometry::kInputRows);
-        if (!supported_shape) {
-            throw std::invalid_argument("nvfp4 linear_add: unsupported weight shape");
-        }
-        if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16)) {
-            throw std::invalid_argument("linear_add: NVFP4 requires 16-byte x/residual alignment");
-        }
-        detail::nvfp4_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
         return;
     }
 

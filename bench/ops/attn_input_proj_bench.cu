@@ -32,13 +32,12 @@ namespace {
 constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
 constexpr double kRtx5090DramGBs  = 1792.0;
 
-enum class Format : std::uint8_t { Q4Q5, W8Qgkv, W8Qkv, Bf16, Nvfp4, All };
+enum class Format : std::uint8_t { Q4Q5, W8Qgkv, W8Qkv, Bf16, All };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
 
 struct Options {
     Format format                  = Format::All;
-    ops::LinearPolicy nvfp4_policy = ops::LinearPolicy::AllowA4;
     CacheMode cache                = CacheMode::Cold;
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 12, 16, 32, 64, 128, 256, 512, 1024};
     int warmup   = 5;
@@ -62,8 +61,8 @@ struct Result {
     std::fprintf(stderr,
                  "error: %s\n"
                  "usage: ninfer_attn_input_proj_bench "
-                 "[--format q4q5|w8-qgkv|w8-qkv|bf16|nvfp4|all] "
-                 "[--nvfp4-policy a16|a4] [--tokens T,...] [--cache cold|warm|both] "
+                 "[--format q4q5|w8-qgkv|w8-qkv|bf16|all] "
+                 "[--tokens T,...] [--cache cold|warm|both] "
                  "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
                  message);
     std::exit(2);
@@ -115,20 +114,10 @@ Options parse_options(int argc, char** argv) {
                 options.format = Format::W8Qkv;
             else if (value == "bf16")
                 options.format = Format::Bf16;
-            else if (value == "nvfp4")
-                options.format = Format::Nvfp4;
             else if (value == "all")
                 options.format = Format::All;
             else
-                usage("--format expects q4q5, w8-qgkv, w8-qkv, bf16, nvfp4, or all");
-        } else if (argument == "--nvfp4-policy") {
-            const std::string_view value(next("--nvfp4-policy requires a value"));
-            if (value == "a16")
-                options.nvfp4_policy = ops::LinearPolicy::A16Only;
-            else if (value == "a4")
-                options.nvfp4_policy = ops::LinearPolicy::AllowA4;
-            else
-                usage("--nvfp4-policy expects a16 or a4");
+                usage("--format expects q4q5, w8-qgkv, w8-qkv, bf16, or all");
         } else if (argument == "--tokens") {
             options.tokens = parse_list(next("--tokens requires a value"), "--tokens");
         } else if (argument == "--cache") {
@@ -410,11 +399,6 @@ int main(int argc, char** argv) {
             auto weight = bench::make_direct_bf16_weight(14336, 5120);
             run_four_output(options, "bf16", QType::BF16_CTRL, ops::LinearPolicy::A16Only, false,
                             5120, 6144, 1024, 14336, weight, flush, stream, results);
-        }
-        if (selected(options.format, Format::Nvfp4)) {
-            auto weight = bench::make_nvfp4_weight(14336, 5120);
-            run_four_output(options, "nvfp4", QType::NVFP4, options.nvfp4_policy, false, 5120, 6144,
-                            1024, 14336, weight, flush, stream, results);
         }
         write_csv(options, results);
         CUDA_CHECK(cudaStreamDestroy(stream));

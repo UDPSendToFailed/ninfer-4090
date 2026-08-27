@@ -66,9 +66,7 @@ std::vector<std::uint16_t> make_activation(const Profile& profile, std::int32_t 
     // Later tokens use exact zeros plus a rotating set of nonzeros. This keeps a full-output,
     // full-formula oracle practical at large registered T boundaries without adopting any
     // production staging or reduction behavior.
-    const float dense_scale = profile.qtype == QType::Q4G64_F16S
-                                  ? 1.25e-4F
-                                  : (profile.qtype == QType::NVFP4 ? 1.0e-3F : 1.0e-5F);
+    const float dense_scale = profile.qtype == QType::Q4G64_F16S ? 1.25e-4F : 1.0e-5F;
     for (std::int32_t column = 0; column < profile.input_rows; ++column) {
         const std::uint64_t mixed = mix64((static_cast<std::uint64_t>(profile.seed) << 32) |
                                           static_cast<std::uint32_t>(column));
@@ -79,9 +77,7 @@ std::vector<std::uint16_t> make_activation(const Profile& profile, std::int32_t 
     }
 
     constexpr std::int32_t kNonzerosPerSparseToken = 4;
-    const float sparse_scale                       = profile.qtype == QType::Q4G64_F16S
-                                                         ? 1.5e-2F
-                                                         : (profile.qtype == QType::NVFP4 ? 2.0e-2F : 1.5e-3F);
+    const float sparse_scale = profile.qtype == QType::Q4G64_F16S ? 1.5e-2F : 1.5e-3F;
     for (std::int32_t token = 1; token < tokens; ++token) {
         for (std::int32_t lane = 0; lane < kNonzerosPerSparseToken; ++lane) {
             const std::uint64_t mixed =
@@ -215,14 +211,10 @@ void validate_profile(const Profile& profile) {
                     profile.input_rows == 5120 && profile.output_rows == 17408;
     const bool w8 = profile.qtype == QType::W8G32_F16S && profile.gate_up_rows == 12288 &&
                     profile.input_rows == 2048 && profile.output_rows == 6144;
-    const bool nvfp4 = profile.qtype == QType::NVFP4 && profile.gate_up_rows == 34816 &&
-                       profile.input_rows == 5120 && profile.output_rows == 17408;
-    if ((!q4 && !w8 && !nvfp4) || profile.gate_up_rows != 2 * profile.output_rows) {
+    if ((!q4 && !w8) || profile.gate_up_rows != 2 * profile.output_rows) {
         throw std::invalid_argument("linear_swiglu test: profile is not registered");
     }
-    if ((nvfp4 && profile.activation_compute != ActivationCompute::A16 &&
-         profile.activation_compute != ActivationCompute::A4) ||
-        (!nvfp4 && profile.activation_compute != ActivationCompute::A16)) {
+    if (profile.activation_compute != ActivationCompute::A16) {
         throw std::invalid_argument("linear_swiglu test: invalid activation-compute profile");
     }
 }
@@ -248,10 +240,6 @@ int run_profile(std::string_view label, const Profile& profile,
     const std::int32_t maximum_tokens = token_cases.back();
 
     quantized_weight::PatternedWeightOptions weight_options;
-    if (profile.qtype == QType::NVFP4) {
-        weight_options.weight_scale_divisor = 0.125F;
-        weight_options.input_scale_divisor  = 3.5F;
-    }
     quantized_weight::PackedWeight host_weight = quantized_weight::make_patterned_weight(
         profile.qtype, profile.gate_up_rows, profile.input_rows, profile.seed, weight_options);
     const std::vector<std::uint16_t> host_activation = make_activation(profile, maximum_tokens);

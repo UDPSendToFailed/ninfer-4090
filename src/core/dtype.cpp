@@ -20,8 +20,6 @@ std::size_t dtype_size(DType dtype) {
         return 1;
     case DType::FP16:
         return 2;
-    case DType::FP8_E4M3FN:
-        return 1;
     }
     throw std::invalid_argument("invalid DType");
 }

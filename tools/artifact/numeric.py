@@ -28,15 +28,7 @@ class QuantFormat:
     qmax: int
 
 
-@dataclass(frozen=True, slots=True)
-class Nvfp4Format:
-    """E2M1 weights with one E4M3FN scale word per K-axis group."""
-
-    name: str
-    group_size: int
-
-
-NumericFormat: TypeAlias = DirectFormat | QuantFormat | Nvfp4Format
+NumericFormat: TypeAlias = DirectFormat | QuantFormat
 
 
 BF16 = DirectFormat("BF16", 2)
@@ -47,7 +39,6 @@ Q4G64_F16S = QuantFormat("Q4G64_F16S", 4, 64, -8, 7)
 Q5G64_F16S = QuantFormat("Q5G64_F16S", 5, 64, -16, 15)
 Q6G64_F16S = QuantFormat("Q6G64_F16S", 6, 64, -32, 31)
 W8G32_F16S = QuantFormat("W8G32_F16S", 8, 32, -127, 127)
-NVFP4 = Nvfp4Format("NVFP4", 16)
 
 
 DIRECT_FORMATS = MappingProxyType(
@@ -59,50 +50,9 @@ QUANT_FORMATS = MappingProxyType(
         for item in (Q4G64_F16S, Q5G64_F16S, Q6G64_F16S, W8G32_F16S)
     }
 )
-NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})
 NUMERIC_FORMATS = MappingProxyType(
-    {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS}
+    {**DIRECT_FORMATS, **QUANT_FORMATS}
 )
-
-
-_E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-
-
-def decode_e2m1_word(word: int) -> float:
-    """Decode one exact four-bit E2M1 word, including signed zero."""
-
-    if type(word) is not int or not 0 <= word <= 0xF:
-        raise ValueError("E2M1 word must be an integer in [0, 15]")
-    magnitude = _E2M1_MAGNITUDES[word & 0x7]
-    return math.copysign(magnitude, -1.0 if word & 0x8 else 1.0)
-
-
-def decode_e4m3fn_word(word: int) -> float:
-    """Decode one exact eight-bit E4M3FN word."""
-
-    if type(word) is not int or not 0 <= word <= 0xFF:
-        raise ValueError("E4M3FN word must be an integer in [0, 255]")
-    sign = -1.0 if word & 0x80 else 1.0
-    exponent = (word >> 3) & 0xF
-    fraction = word & 0x7
-    if exponent == 0:
-        if fraction == 0:
-            return math.copysign(0.0, sign)
-        return sign * fraction * (2.0**-9)
-    if exponent == 0xF and fraction == 0x7:
-        return math.copysign(math.nan, sign)
-    return sign * (1.0 + fraction / 8.0) * (2.0 ** (exponent - 7))
-
-
-def valid_nvfp4_scale_word(word: int) -> bool:
-    """Return whether *word* is an admitted nonnegative finite E4M3FN scale."""
-
-    return (
-        type(word) is int
-        and 0 <= word <= 0xFF
-        and word & 0x80 == 0
-        and word != 0x7F
-    )
 
 
 def valid_positive_fp32_word(word: int) -> bool:
@@ -130,9 +80,6 @@ __all__ = [
     "FP32",
     "I32",
     "NUMERIC_FORMATS",
-    "NVFP4",
-    "NVFP4_FORMATS",
-    "Nvfp4Format",
     "NumericFormat",
     "Q4G64_F16S",
     "Q5G64_F16S",
@@ -140,9 +87,6 @@ __all__ = [
     "QUANT_FORMATS",
     "QuantFormat",
     "W8G32_F16S",
-    "decode_e2m1_word",
-    "decode_e4m3fn_word",
     "get_format",
-    "valid_nvfp4_scale_word",
     "valid_positive_fp32_word",
 ]

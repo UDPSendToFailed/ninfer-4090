@@ -20,7 +20,6 @@ import torch
 
 from .numeric import (
     DirectFormat,
-    Nvfp4Format,
     NumericFormat,
     QuantFormat,
     valid_positive_fp32_word,
@@ -60,19 +59,6 @@ class RowSplitGeometry:
     payload_bytes: int
 
 
-@dataclass(frozen=True, slots=True)
-class BlockScaleGeometry:
-    n: int
-    k: int
-    groups_per_row: int
-    k_tiles: int
-    code_plane_bytes: int
-    scale_plane_offset: int
-    scale_plane_bytes: int
-    weight_divisor_offset: int
-    payload_bytes: int
-
-
 Plane: TypeAlias = bytes | bytearray | memoryview | torch.Tensor
 Payload: TypeAlias = bytes | bytearray | memoryview | torch.Tensor
 
@@ -95,11 +81,6 @@ ROW_SPLIT_K128_V1 = Layout(
     256,
     frozenset(("Q4G64_F16S", "Q5G64_F16S", "Q6G64_F16S", "W8G32_F16S")),
 )
-BLOCKSCALE_K16_M128X4_V1 = Layout(
-    "blockscale-k16-m128x4-v1",
-    256,
-    frozenset(("NVFP4",)),
-)
 
 LAYOUTS = MappingProxyType(
     {
@@ -107,7 +88,6 @@ LAYOUTS = MappingProxyType(
         for layout in (
             CONTIGUOUS_LE_V1,
             ROW_SPLIT_K128_V1,
-            BLOCKSCALE_K16_M128X4_V1,
         )
     }
 )
@@ -203,35 +183,6 @@ def row_split_geometry(
     )
 
 
-def block_scale_geometry(
-    format: str | Nvfp4Format, shape: Sequence[int]
-) -> BlockScaleGeometry:
-    spec = _format(format)
-    if not isinstance(spec, Nvfp4Format):
-        raise ValueError("blockscale-k16-m128x4-v1 requires NVFP4")
-    n, k = _shape(shape, rank=2)
-    if n % 128 != 0 or k % 64 != 0:
-        raise ValueError(
-            "blockscale-k16-m128x4-v1 requires N divisible by 128 "
-            "and K divisible by 64"
-        )
-    code_plane_bytes = n * k // 2
-    scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
-    scale_plane_bytes = n * k // spec.group_size
-    weight_divisor_offset = scale_plane_offset + scale_plane_bytes
-    return BlockScaleGeometry(
-        n=n,
-        k=k,
-        groups_per_row=k // spec.group_size,
-        k_tiles=k // 64,
-        code_plane_bytes=code_plane_bytes,
-        scale_plane_offset=scale_plane_offset,
-        scale_plane_bytes=scale_plane_bytes,
-        weight_divisor_offset=weight_divisor_offset,
-        payload_bytes=weight_divisor_offset + 4,
-    )
-
-
 def encoded_size(
     layout: str | Layout,
     format: str | NumericFormat,
@@ -254,10 +205,6 @@ def encoded_size(
         if not isinstance(numeric_spec, QuantFormat):
             raise ValueError("row-split-k128-v1 requires a grouped quantized format")
         return row_split_geometry(numeric_spec, shape).payload_bytes
-    if layout_spec is BLOCKSCALE_K16_M128X4_V1:
-        if not isinstance(numeric_spec, Nvfp4Format):
-            raise ValueError("blockscale-k16-m128x4-v1 requires NVFP4")
-        return block_scale_geometry(numeric_spec, shape).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")
 
 
@@ -337,130 +284,6 @@ def _exact_uint8_matrix(
     if tensor.dtype != torch.uint8 or tuple(tensor.shape) != shape:
         raise TypeError(f"{label} must be uint8 with shape {shape}")
     return tensor.detach().contiguous().cpu()
-
-
-def swizzle_nvfp4_scales(
-    natural_scales: torch.Tensor, shape: Sequence[int]
-) -> torch.Tensor:
-    """Map natural ``[N,K/16]`` E4M3FN words to the registered scale layout."""
-
-    geometry = block_scale_geometry("NVFP4", shape)
-    source = _exact_uint8_matrix(
-        natural_scales,
-        (geometry.n, geometry.groups_per_row),
-        "NVFP4 scales",
-    )
-    return (
-        source.reshape(geometry.n // 128, 4, 32, geometry.k_tiles, 4)
-        .permute(0, 3, 2, 1, 4)
-        .contiguous()
-        .reshape(-1)
-    )
-
-
-def unswizzle_nvfp4_scales(
-    stored_scales: torch.Tensor, shape: Sequence[int]
-) -> torch.Tensor:
-    """Recover natural ``[N,K/16]`` E4M3FN words from registered layout bytes."""
-
-    geometry = block_scale_geometry("NVFP4", shape)
-    if (
-        stored_scales.dtype != torch.uint8
-        or stored_scales.dim() != 1
-        or stored_scales.numel() != geometry.scale_plane_bytes
-    ):
-        raise TypeError(
-            "stored NVFP4 scales must be one-dimensional uint8 with "
-            f"{geometry.scale_plane_bytes} elements"
-        )
-    source = stored_scales.detach().contiguous().cpu()
-    return (
-        source.reshape(geometry.n // 128, geometry.k_tiles, 32, 4, 4)
-        .permute(0, 3, 2, 1, 4)
-        .contiguous()
-        .reshape(geometry.n, geometry.groups_per_row)
-    )
-
-
-def _positive_fp32_word(value: torch.Tensor | bytes | bytearray | memoryview) -> bytes:
-    if isinstance(value, torch.Tensor):
-        if value.dtype != torch.float32 or value.numel() != 1:
-            raise TypeError("NVFP4 weight divisor must be one FP32 word")
-        raw = encode_direct(value.reshape(()), "FP32")
-    else:
-        raw = bytes(value)
-        if len(raw) != 4:
-            raise TypeError("NVFP4 weight divisor must contain exactly four bytes")
-    word = struct.unpack("<I", raw)[0]
-    if not valid_positive_fp32_word(word):
-        raise ValueError("NVFP4 weight divisor must be finite and positive")
-    return raw
-
-
-def encode_nvfp4(
-    packed_codes: torch.Tensor,
-    natural_scales: torch.Tensor,
-    weight_divisor: torch.Tensor | bytes | bytearray | memoryview,
-    shape: Sequence[int],
-) -> bytes:
-    """Encode exact source NVFP4 words without numerical conversion."""
-
-    geometry = block_scale_geometry("NVFP4", shape)
-    codes = _exact_uint8_matrix(
-        packed_codes,
-        (geometry.n, geometry.k // 2),
-        "NVFP4 packed codes",
-    )
-    scales = _exact_uint8_matrix(
-        natural_scales,
-        (geometry.n, geometry.groups_per_row),
-        "NVFP4 scales",
-    )
-    invalid = ((scales & 0x80) != 0) | (scales == 0x7F)
-    if bool(invalid.any()):
-        raise ValueError("NVFP4 scales must be nonnegative finite E4M3FN words")
-    divisor = _positive_fp32_word(weight_divisor)
-    swizzled = swizzle_nvfp4_scales(scales, shape)
-    payload = bytearray(geometry.payload_bytes)
-    payload[: geometry.code_plane_bytes] = codes.numpy().tobytes()
-    payload[
-        geometry.scale_plane_offset :
-        geometry.scale_plane_offset + geometry.scale_plane_bytes
-    ] = swizzled.numpy().tobytes()
-    payload[geometry.weight_divisor_offset :] = divisor
-    return bytes(payload)
-
-
-def decode_nvfp4_words(
-    payload: Payload,
-    shape: Sequence[int],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Decode exact packed code, natural scale, and divisor words."""
-
-    geometry = block_scale_geometry("NVFP4", shape)
-    if _payload_length(payload) != geometry.payload_bytes:
-        raise ValueError(
-            f"NVFP4 payload has {_payload_length(payload)} bytes, "
-            f"expected {geometry.payload_bytes}"
-        )
-    raw = _payload_tensor(payload, torch.device("cpu"))
-    codes = raw[: geometry.code_plane_bytes].clone().reshape(
-        geometry.n, geometry.k // 2
-    )
-    stored_scales = raw[
-        geometry.scale_plane_offset :
-        geometry.scale_plane_offset + geometry.scale_plane_bytes
-    ]
-    scales = unswizzle_nvfp4_scales(stored_scales, shape)
-    invalid = ((scales & 0x80) != 0) | (scales == 0x7F)
-    if bool(invalid.any()):
-        raise ValueError("NVFP4 scales must be nonnegative finite E4M3FN words")
-    divisor_bytes = bytes(raw[geometry.weight_divisor_offset :].numpy())
-    divisor_word = struct.unpack("<I", divisor_bytes)[0]
-    if not valid_positive_fp32_word(divisor_word):
-        raise ValueError("NVFP4 weight divisor must be finite and positive")
-    divisor = torch.frombuffer(bytearray(divisor_bytes), dtype=torch.float32).reshape(())
-    return codes, scales, divisor
 
 
 def _pack_low_nibbles(codes: torch.Tensor) -> torch.Tensor:
@@ -946,8 +769,6 @@ def dequantize_row_split(
 
 
 __all__ = [
-    "BLOCKSCALE_K16_M128X4_V1",
-    "BlockScaleGeometry",
     "CONTIGUOUS_LE_V1",
     "K_ALIGNMENT",
     "LAYOUTS",
@@ -958,19 +779,14 @@ __all__ = [
     "RowSplitGeometry",
     "align_up",
     "assemble_row_planes",
-    "block_scale_geometry",
     "decode_direct",
-    "decode_nvfp4_words",
     "decode_row_split_codes",
     "dequantize_row_split",
     "encode_direct",
-    "encode_nvfp4",
     "encode_row_split",
     "encoded_size",
     "gather_row_planes",
     "get_layout",
     "row_split_geometry",
     "split_row_planes",
-    "swizzle_nvfp4_scales",
-    "unswizzle_nvfp4_scales",
 ]

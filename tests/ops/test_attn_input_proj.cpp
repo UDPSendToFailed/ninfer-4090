@@ -239,75 +239,6 @@ int run_bf16_target() {
     return failures;
 }
 
-int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
-                          ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
-    constexpr std::int32_t kHidden = 5120;
-    constexpr std::int32_t kQRows  = 6144;
-    constexpr std::int32_t kKvRows = 1024;
-    const std::vector<float> activation =
-        make_bf16_activation(kHidden, tokens, 337U + static_cast<std::uint32_t>(tokens));
-    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
-    DeviceBuffer device_activation                   = to_device(activation_bits);
-
-    GuardedBf16Tensor query(kQRows, tokens);
-    GuardedBf16Tensor gate(kQRows, tokens);
-    GuardedBf16Tensor key(kKvRows, tokens);
-    GuardedBf16Tensor value(kKvRows, tokens);
-    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
-    Tensor q                   = query.tensor();
-    Tensor g                   = gate.tensor();
-    Tensor k                   = key.tensor();
-    Tensor v                   = value.tensor();
-    const std::size_t capacity = ops::attn_input_proj_workspace_capacity_bytes(
-        QType::NVFP4, 14336, kHidden, policy, tokens, tokens);
-    DeviceArena workspace(std::max<std::size_t>(capacity, 256));
-    ops::attn_input_proj(x, parent.view(), q, g, k, v, policy, workspace, nullptr);
-    cuda_synchronize();
-
-    constexpr std::int32_t kKeyBegin   = kQRows;
-    constexpr std::int32_t kGateBegin  = kKeyBegin + kKvRows;
-    constexpr std::int32_t kValueBegin = kGateBegin + kQRows;
-    int failures                       = 0;
-    const bool a4                      = policy == ops::LinearPolicy::AllowA4;
-    const ReductionCriterion& criterion =
-        a4 ? kAttnInputProjA4Tolerance : kAttnInputProjA16Tolerance;
-    const std::int32_t sample_count = a4 ? kA4SampleRows : 7;
-    const std::string suffix =
-        std::string(" NVFP4 ") + (a4 ? "A4" : "A16") + " T=" + std::to_string(tokens);
-    failures += verify_output("attn q" + suffix, query, parent.host, 0, kQRows, activation, kHidden,
-                              tokens, criterion, sample_count);
-    failures += verify_output("attn k" + suffix, key, parent.host, kKeyBegin, kKvRows, activation,
-                              kHidden, tokens, criterion, sample_count);
-    failures += verify_output("attn gate" + suffix, gate, parent.host, kGateBegin, kQRows,
-                              activation, kHidden, tokens, criterion, sample_count);
-    failures += verify_output("attn value" + suffix, value, parent.host, kValueBegin, kKvRows,
-                              activation, kHidden, tokens, criterion, sample_count);
-    failures += verify_preserved("attn x" + suffix, device_activation, activation_bits);
-    failures += parent.verify_preserved("attn parent" + suffix);
-    return failures;
-}
-
-int run_nvfp4_target() {
-    constexpr std::int32_t kHidden     = 5120;
-    constexpr std::int32_t kParentRows = 14336;
-    quantized_weight::PatternedWeightOptions options;
-    options.weight_scale_divisor = 0.125F;
-    options.input_scale_divisor  = 3.5F;
-    DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::NVFP4, kParentRows, kHidden, 331U, options));
-
-    int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 4, 8, 16, 20, 32, 33}) {
-        failures += run_nvfp4_target_case(parent, tokens);
-    }
-    if (!nvfp4_a4_unavailable()) {
-        failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA4);
-        failures += run_nvfp4_target_case(parent, 17, ops::LinearPolicy::AllowA4);
-        failures += run_nvfp4_target_case(parent, 1024, ops::LinearPolicy::AllowA4);
-    }
-    return failures;
-}
-
 int run_w8_target_case(DevicePackedWeight& parent, std::int32_t tokens) {
     constexpr std::int32_t kHidden      = 2048;
     constexpr std::int32_t kQRows       = 4096;
@@ -408,7 +339,6 @@ int main() {
     int failures = 0;
     failures += run_q4_q5();
     failures += run_bf16_target();
-    failures += run_nvfp4_target();
     failures += run_w8_target();
     failures += run_w8_companion();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " attn_input_proj\n";

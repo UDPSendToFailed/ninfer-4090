@@ -24,9 +24,7 @@ inline constexpr std::size_t kGdnLayers           = 48;
 
 struct WeightPlan {
     artifact::ObjectHandle object;
-    artifact::NumericFormat format          = artifact::NumericFormat::BF16;
-    std::uint32_t weight_scale_divisor_bits = 0;
-    std::uint32_t input_scale_divisor_bits  = 0;
+    artifact::NumericFormat format = artifact::NumericFormat::BF16;
 };
 
 struct MlpPlan {

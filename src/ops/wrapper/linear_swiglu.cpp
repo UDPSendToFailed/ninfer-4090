@@ -1,7 +1,5 @@
 #include "ninfer/ops/linear_swiglu.h"
 
-#include "ops/linear/nvfp4/nvfp4_format.h"
-#include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_plan.h"
 
@@ -52,9 +50,6 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
         return detail::q4_linear_swiglu_capacity_workspace_bytes(
             gate_up_rows, gate_up_rows / 2, input_rows, input_rows, min_tokens, max_tokens);
     }
-    if (qtype == QType::NVFP4 && gate_up_rows == 34816 && input_rows == 5120) {
-        return detail::nvfp4_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
-    }
     throw std::invalid_argument("linear_swiglu workspace: unsupported weight format");
 }
 
@@ -102,15 +97,8 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
                            gate_up_weight.group_size == 32 && gate_up_weight.group == 32 &&
                            gate_up_weight.qhigh == nullptr &&
                            gate_up_weight.high_plane_bytes == 0 && common_row_split;
-    const bool nvfp4_weight = large_shape && gate_up_weight.qtype == QType::NVFP4;
-    if (!q4_weight && !w8_weight && !nvfp4_weight) {
+    if (!q4_weight && !w8_weight) {
         throw std::invalid_argument("linear_swiglu: unsupported weight");
-    }
-
-    if (nvfp4_weight) {
-        (void)detail::validate_nvfp4_weight(gate_up_weight, "nvfp4 linear_swiglu");
-        detail::nvfp4_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream);
-        return;
     }
 
     if (policy != LinearPolicy::A16Only) {

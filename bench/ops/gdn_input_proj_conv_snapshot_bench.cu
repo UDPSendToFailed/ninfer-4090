@@ -60,7 +60,6 @@ enum class CacheState : std::uint8_t {
 
 enum class Format : std::uint8_t {
     Q4Q5,
-    Nvfp4,
     W8,
     All,
 };
@@ -91,7 +90,6 @@ struct Options {
     TokenSweep tokens;
     Format format                  = Format::Q4Q5;
     Form form                      = Form::Snapshot;
-    ops::LinearPolicy nvfp4_policy = ops::LinearPolicy::AllowA4;
     Execution execution            = Execution::Graph;
     CacheMode cache                = CacheMode::Both;
     int warmup                     = 10;
@@ -188,10 +186,9 @@ CacheMode parse_cache(std::string_view value) {
 
 Format parse_format(std::string_view value) {
     if (value == "q4q5") return Format::Q4Q5;
-    if (value == "nvfp4") return Format::Nvfp4;
     if (value == "w8") return Format::W8;
     if (value == "all") return Format::All;
-    throw std::invalid_argument("--format must be q4q5, nvfp4, w8, or all");
+    throw std::invalid_argument("--format must be q4q5, w8, or all");
 }
 
 Form parse_form(std::string_view value) {
@@ -212,19 +209,12 @@ std::vector<std::int32_t> parse_valid_columns(std::string_view text) {
     return values;
 }
 
-ops::LinearPolicy parse_nvfp4_policy(std::string_view value) {
-    if (value == "a16") return ops::LinearPolicy::A16Only;
-    if (value == "a4") return ops::LinearPolicy::AllowA4;
-    throw std::invalid_argument("--nvfp4-policy must be a16 or a4");
-}
-
 void usage(const char* argv0) {
     std::fprintf(stderr,
                  "Usage: %s [options]\n\n"
                  "Public workload:\n"
-                 "  --format q4q5|nvfp4|w8|all   Default q4q5.\n"
+                 "  --format q4q5|w8|all         Default q4q5.\n"
                  "  --form snapshot|record|both  Default snapshot.\n"
-                 "  --nvfp4-policy a16|a4        Default a4.\n"
                  "  --tokens T                    Exact token extent.\n"
                  "  --sweep START:END[:STEP]      Token sweep (default 1:6).\n\n"
                  "  --batch B                     Exact batch in [1,8] (default 1).\n"
@@ -254,8 +244,6 @@ Options parse_options(int argc, char** argv) {
             options.format = parse_format(next("format"));
         } else if (argument == "--form") {
             options.form = parse_form(next("form"));
-        } else if (argument == "--nvfp4-policy") {
-            options.nvfp4_policy = parse_nvfp4_policy(next("NVFP4 policy"));
         } else if (argument == "--tokens") {
             const std::int32_t tokens = parse_positive_i32(next("tokens"), "tokens");
             options.tokens            = {tokens, tokens, 1};
@@ -428,65 +416,6 @@ private:
     bench::PackedQuantizedWeight value_z_;
     DeviceBuffer conv_weight_;
     DeviceBuffer flush_;
-};
-
-class Nvfp4Fixture {
-public:
-    Nvfp4Fixture(std::size_t flush_bytes, ops::LinearPolicy policy)
-        : parent_(bench::make_nvfp4_weight(kChannels + kZRows, kHidden)),
-          conv_weight_(bench::make_bf16(static_cast<std::size_t>(kChannels) * 4)),
-          flush_(flush_bytes), policy_(policy) {
-        CUDA_CHECK(cudaMemset(flush_.p, 0xa5, flush_.bytes));
-        CUDA_CHECK(cudaDeviceSynchronize());
-    }
-
-    [[nodiscard]] Tensor conv_weight() const {
-        return Tensor(conv_weight_.p, DType::BF16, {kChannels, 4});
-    }
-
-    [[nodiscard]] const char* profile() const noexcept {
-        return policy_ == ops::LinearPolicy::AllowA4 ? "nvfp4-a4" : "nvfp4-a16";
-    }
-
-    [[nodiscard]] GdnGeometry geometry() const noexcept {
-        return {kHidden, kQueryRows, kKeyRows, kValueRows, kZRows};
-    }
-
-    [[nodiscard]] std::size_t workspace_capacity(Form form, std::int32_t batch,
-                                                 std::int32_t tokens) const {
-        if (form == Form::Record) {
-            return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-                QType::NVFP4, kChannels + kZRows, kHidden, policy_, batch, tokens, tokens);
-        }
-        return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, kChannels + kZRows, kHidden, policy_, batch, tokens, tokens);
-    }
-
-    void launch(Form form, const Tensor& x, Tensor& conv_states, const Tensor& initial,
-                const Tensor& snapshot_base, const Tensor& valid_columns, Tensor& conv_record,
-                Tensor& query, Tensor& key, Tensor& value, Tensor& z, WorkspaceArena& workspace,
-                cudaStream_t stream) {
-        Tensor convolution_weight = conv_weight();
-        if (form == Form::Record) {
-            ops::gdn_input_proj_conv_record(x, parent_.weight, convolution_weight, conv_states,
-                                            valid_columns, initial, conv_record, query, key, value,
-                                            z, policy_, workspace, stream);
-        } else {
-            ops::gdn_input_proj_conv_snapshot(x, parent_.weight, convolution_weight, conv_states,
-                                              valid_columns, initial, snapshot_base, query, key,
-                                              value, z, policy_, workspace, stream);
-        }
-    }
-
-    void flush(cudaStream_t stream) {
-        CUDA_CHECK(cudaMemsetAsync(flush_.p, 0xa5, flush_.bytes, stream));
-    }
-
-private:
-    bench::PackedQuantizedWeight parent_;
-    DeviceBuffer conv_weight_;
-    DeviceBuffer flush_;
-    ops::LinearPolicy policy_;
 };
 
 class W8Fixture {
@@ -834,27 +763,21 @@ int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
         DeviceContext context;
-        const char* configured_format = options.format == Format::Q4Q5    ? "q4q5"
-                                        : options.format == Format::Nvfp4 ? "nvfp4"
-                                        : options.format == Format::W8    ? "w8"
-                                                                          : "all";
+        const char* configured_format = options.format == Format::Q4Q5 ? "q4q5"
+                                        : options.format == Format::W8 ? "w8"
+                                                                       : "all";
         std::printf(
-            "# op=gdn_input_proj_conv form=%s format=%s nvfp4_policy=%s gpu=%s sm=%d "
+            "# op=gdn_input_proj_conv form=%s format=%s gpu=%s sm=%d "
             "batch=%d execution=%s "
             "timed_scope=full_public_op_device_body cold_flush_mib=%llu\n",
             options.form == Form::Both ? "both" : form_name(options.form), configured_format,
-            policy_name(options.nvfp4_policy), context.props.name, context.sm(), options.batch,
+            context.props.name, context.sm(), options.batch,
             options.execution == Execution::Both ? "both" : execution_name(options.execution),
             static_cast<unsigned long long>(options.flush_bytes >> 20));
 
         std::vector<Result> results;
         if (options.format == Format::Q4Q5 || options.format == Format::All) {
             Q4Q5Fixture fixture(static_cast<std::size_t>(options.flush_bytes));
-            run_fixture(fixture, options, context.stream, results);
-        }
-        if (options.format == Format::Nvfp4 || options.format == Format::All) {
-            Nvfp4Fixture fixture(static_cast<std::size_t>(options.flush_bytes),
-                                 options.nvfp4_policy);
             run_fixture(fixture, options, context.stream, results);
         }
         if (options.format == Format::W8 || options.format == Format::All) {

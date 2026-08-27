@@ -23,7 +23,7 @@ def test_request_log_v8_identity_is_accepted() -> None:
 
 
 def test_summary_retains_one_canonical_weights_id() -> None:
-    records = [{"weights_id": "nvfp4", "metrics": {}}]
+    records = [{"weights_id": "groupwise-int", "metrics": {}}]
     row = summary_row(
         "context_profile",
         "qwen3_6_27b",
@@ -33,7 +33,7 @@ def test_summary_retains_one_canonical_weights_id() -> None:
         "greedy",
         records,
     )
-    assert row["weights_id"] == "nvfp4"
+    assert row["weights_id"] == "groupwise-int"
 
     with pytest.raises(CampaignError):
         summary_row(
@@ -43,5 +43,5 @@ def test_summary_retains_one_canonical_weights_id() -> None:
             "fixture",
             "mtp0",
             "greedy",
-            [*records, {"weights_id": "groupwise-int", "metrics": {}}],
+            [*records, {"weights_id": "groupwise-int-w8-endpoints", "metrics": {}}],
         )

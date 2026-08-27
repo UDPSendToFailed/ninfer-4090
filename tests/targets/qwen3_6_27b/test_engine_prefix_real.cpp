@@ -333,8 +333,7 @@ int exercise_vision(ninfer::Engine& engine) {
 
 int verify_loaded_product(const ninfer::Engine& engine) {
     const ninfer::LoadSummary load = engine.load_summary();
-    if (load.target != "qwen3_6_27b" ||
-        (load.weights_id != "groupwise-int" && load.weights_id != "nvfp4") ||
+    if (load.target != "qwen3_6_27b" || load.weights_id != "groupwise-int" ||
         load.host_to_device_bytes == 0 || load.artifact_bytes_read < load.host_to_device_bytes) {
         std::cerr << "Engine construction has an invalid load summary: target=" << load.target
                   << " weights=" << load.weights_id << '\n';
@@ -367,18 +366,11 @@ int exercise_artifact(const char* artifact) {
 
 int main() {
     const char* groupwise = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
-    const char* nvfp4     = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
-    if ((groupwise == nullptr || *groupwise == '\0') && (nvfp4 == nullptr || *nvfp4 == '\0')) {
-        std::cout << "skip: neither NINFER_QWEN3_6_27B_WEIGHTS nor "
-                     "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS is set\n";
+    if (groupwise == nullptr || *groupwise == '\0') {
+        std::cout << "skip: NINFER_QWEN3_6_27B_WEIGHTS is not set\n";
         return 77;
     }
-    if (groupwise != nullptr && *groupwise != '\0') {
-        if (const int result = exercise_artifact(groupwise); result != 0) { return result; }
-    }
-    if (nvfp4 != nullptr && *nvfp4 != '\0') {
-        if (const int result = exercise_artifact(nvfp4); result != 0) { return result; }
-    }
+    if (const int result = exercise_artifact(groupwise); result != 0) { return result; }
     std::cout << "ok\n";
     return 0;
 }

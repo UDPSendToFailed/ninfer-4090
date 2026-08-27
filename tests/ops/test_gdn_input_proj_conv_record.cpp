@@ -282,58 +282,6 @@ int run_w8() {
     return failures;
 }
 
-int run_nvfp4() {
-    constexpr std::int32_t kHidden    = 5120;
-    constexpr std::int32_t kValueRows = 6144;
-    constexpr std::int32_t kZRows     = 6144;
-    constexpr std::int32_t kRows      = 16384;
-    quantized_weight::PatternedWeightOptions options;
-    options.weight_scale_divisor = 0.125F;
-    options.input_scale_divisor  = 3.5F;
-    DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::NVFP4, kRows, kHidden, 1601U, options));
-
-    int failures   = 0;
-    const auto run = [&](std::int32_t width, std::int32_t batch, std::vector<std::int32_t> valid,
-                         ops::LinearPolicy policy, std::uint32_t seed) {
-        const std::size_t snapshot_bytes =
-            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(QType::NVFP4, kRows, kHidden,
-                                                                       policy, batch, width, width);
-        const std::size_t record_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-            QType::NVFP4, kRows, kHidden, policy, batch, width, width);
-        return run_case(
-            std::string("NVFP4 ") + (policy == ops::LinearPolicy::AllowA4 ? "A4" : "A16") +
-                " B=" + std::to_string(batch) + " T=" + std::to_string(width),
-            kHidden, kValueRows, kZRows, width, batch, std::move(valid), snapshot_bytes,
-            record_bytes,
-            [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
-                const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
-                Tensor& z, WorkspaceArena& workspace) {
-                ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid_columns,
-                                                  initial, snapshot_base, q, k, v, z, policy,
-                                                  workspace, nullptr);
-            },
-            [&](const Tensor& x, const Tensor& conv, const Tensor& state,
-                const Tensor& valid_columns, const Tensor& initial, Tensor& record, Tensor& q,
-                Tensor& k, Tensor& v, Tensor& z, WorkspaceArena& workspace) {
-                ops::gdn_input_proj_conv_record(x, parent.view(), conv, state, valid_columns,
-                                                initial, record, q, k, v, z, policy, workspace,
-                                                nullptr);
-            },
-            seed);
-    };
-    failures += run(2, 1, {}, ops::LinearPolicy::A16Only, 1611U);
-    failures += run(16, 1, {11}, ops::LinearPolicy::A16Only, 1621U);
-    failures += run(3, 1, {2}, ops::LinearPolicy::AllowA4, 1631U);
-    if (!nvfp4_a4_unavailable()) {
-        failures += run(4, 1, {}, ops::LinearPolicy::AllowA4, 1641U);
-        failures += run(16, 1, {13}, ops::LinearPolicy::AllowA4, 1651U);
-        failures += run(6, 3, {6, 4, 1}, ops::LinearPolicy::AllowA4, 1661U);
-    }
-    failures += parent.verify_preserved("NVFP4 record parent weight");
-    return failures;
-}
-
 } // namespace
 
 int main() {
@@ -345,7 +293,6 @@ int main() {
     int failures = 0;
     failures += run_q4_q5();
     failures += run_w8();
-    failures += run_nvfp4();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_record\n";
     return failures == 0 ? 0 : 1;
 }

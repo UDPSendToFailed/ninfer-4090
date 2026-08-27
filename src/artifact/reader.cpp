@@ -102,14 +102,12 @@ NumericFormat parse_format(std::string_view name) {
     if (name == "Q5G64_F16S") { return NumericFormat::Q5G64_F16S; }
     if (name == "Q6G64_F16S") { return NumericFormat::Q6G64_F16S; }
     if (name == "W8G32_F16S") { return NumericFormat::W8G32_F16S; }
-    if (name == "NVFP4") { return NumericFormat::NVFP4; }
     throw ArtifactError("unknown tensor format: " + std::string(name));
 }
 
 StorageLayout parse_layout(std::string_view name) {
     if (name == "contiguous-le-v1") { return StorageLayout::ContiguousLeV1; }
     if (name == "row-split-k128-v1") { return StorageLayout::RowSplitK128V1; }
-    if (name == "blockscale-k16-m128x4-v1") { return StorageLayout::BlockScaleK16M128x4V1; }
     throw ArtifactError("unknown tensor layout: " + std::string(name));
 }
 

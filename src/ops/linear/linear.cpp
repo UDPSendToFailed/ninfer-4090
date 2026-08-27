@@ -2,8 +2,6 @@
 
 #include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
-#include "ops/linear/nvfp4/nvfp4_config.h"
-#include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
@@ -76,6 +74,7 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
 
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
+    (void)workspace;
     switch (w.qtype) {
     case QType::Q4G64_F16S:
         detail::q4_dispatch(x, w, out, policy, stream);
@@ -91,9 +90,6 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         return;
     case QType::BF16_CTRL:
         detail::bf16_dispatch(x, w, out, policy, stream);
-        return;
-    case QType::NVFP4:
-        detail::nvfp4_dispatch(x, w, out, policy, workspace, stream);
         return;
     case QType::FP32_CTRL:
     case QType::I32_CTRL:
@@ -133,13 +129,6 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         (void)detail::select_bf16_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_bf16_launch(output_rows, input_rows, max_tokens, policy);
         return 0;
-    case QType::NVFP4:
-        if (!detail::is_nvfp4_linear_problem(output_rows, input_rows) ||
-            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
-            throw std::invalid_argument("linear workspace: unsupported NVFP4 profile");
-        }
-        return detail::nvfp4_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
-                                                             min_tokens, max_tokens);
     case QType::FP32_CTRL:
     case QType::I32_CTRL:
         break;
