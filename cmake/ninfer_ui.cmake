@@ -1,7 +1,15 @@
 # WebUI asset downloading and C++ embedding for ninfer-serve
 
 option(NINFER_ENABLE_UI "Download and embed the WebUI into ninfer-serve" ON)
-set(NINFER_UI_RELEASE_TAG "b10587" CACHE STRING "llama.cpp release tag for prebuilt WebUI")
+set(NINFER_UI_DEFAULT_TAG "b10655")
+
+# Automatically sync cached release tag if NINFER_UI_DEFAULT_TAG was updated in ninfer_ui.cmake
+if(NOT DEFINED NINFER_UI_RELEASE_TAG)
+  set(NINFER_UI_RELEASE_TAG "${NINFER_UI_DEFAULT_TAG}" CACHE STRING "llama.cpp release tag for prebuilt WebUI")
+elseif(NOT "${_NINFER_UI_CACHED_DEFAULT_TAG}" STREQUAL "${NINFER_UI_DEFAULT_TAG}")
+  set(NINFER_UI_RELEASE_TAG "${NINFER_UI_DEFAULT_TAG}" CACHE STRING "llama.cpp release tag for prebuilt WebUI" FORCE)
+endif()
+set(_NINFER_UI_CACHED_DEFAULT_TAG "${NINFER_UI_DEFAULT_TAG}" CACHE INTERNAL "Track last in-tree default tag")
 
 set(NINFER_UI_GEN_DIR "${CMAKE_BINARY_DIR}/generated/ninfer_ui")
 set(NINFER_UI_CPP "${NINFER_UI_GEN_DIR}/ui.cpp")
@@ -14,6 +22,7 @@ add_executable(ninfer_ui_embed "${PROJECT_SOURCE_DIR}/tools/ui/embed.cpp")
 target_compile_features(ninfer_ui_embed PRIVATE cxx_std_17)
 
 set(UI_ASSET_DIR "")
+set(UI_DEP_STAMP "")
 
 if(NINFER_ENABLE_UI)
   set(LOCAL_SRC_DIST "${PROJECT_SOURCE_DIR}/tools/ui/dist")
@@ -50,6 +59,9 @@ if(NINFER_ENABLE_UI)
 
     if(EXISTS "${UI_DOWNLOAD_DIR}")
       set(UI_ASSET_DIR "${UI_DOWNLOAD_DIR}")
+      if(EXISTS "${UI_STAMP}")
+        set(UI_DEP_STAMP "${UI_STAMP}")
+      endif()
     endif()
   endif()
 endif()
@@ -59,7 +71,7 @@ if(NOT "${UI_ASSET_DIR}" STREQUAL "")
   add_custom_command(
     OUTPUT "${NINFER_UI_CPP}" "${NINFER_UI_H}"
     COMMAND ninfer_ui_embed "${NINFER_UI_CPP}" "${NINFER_UI_H}" "${UI_ASSET_DIR}"
-    DEPENDS ninfer_ui_embed
+    DEPENDS ninfer_ui_embed ${UI_DEP_STAMP}
     COMMENT "Generating ninfer-serve WebUI embedded asset source"
     VERBATIM
   )
