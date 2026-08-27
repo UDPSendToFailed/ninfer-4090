@@ -300,7 +300,10 @@ void HttpServer::register_routes() {
 
         nlohmann::json default_gen = {
             {"n_ctx", options_.max_context},
+            {"n_predict", -1},
             {"params", {
+                {"n_predict", -1},
+                {"max_tokens", options_.default_max_tokens},
                 {"temp", temp},
                 {"top_p", top_p},
                 {"top_k", top_k},

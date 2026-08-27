@@ -510,9 +510,13 @@ GenerationRequest parse_messages_request(const Json& body, const RequestLimits& 
 
     const std::optional<int> max_tokens = get_int(body, "max_tokens");
     if (max_tokens) {
-        if (*max_tokens <= 0) { bad_request("max_tokens must be positive", "max_tokens"); }
-        out.max_tokens     = *max_tokens;
-        out.max_tokens_set = true;
+        if (*max_tokens <= 0) {
+            out.max_tokens     = limits.default_max_tokens;
+            out.max_tokens_set = false;
+        } else {
+            out.max_tokens     = *max_tokens;
+            out.max_tokens_set = true;
+        }
     } else {
         out.max_tokens     = limits.default_max_tokens;
         out.max_tokens_set = false;

@@ -205,17 +205,23 @@ int test_missing_and_bad_fields() {
         check(throws_api([&] { (void)parse_messages_request(empty_msgs, default_limits()); }),
               "empty messages rejected");
 
-    const Json bad_max = {{"model", "m"},
-                          {"max_tokens", 0},
-                          {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
-    failures += check(throws_api([&] { (void)parse_messages_request(bad_max, default_limits()); }),
-                      "non-positive max_tokens rejected");
+    // Non-positive max_tokens (e.g. 0, -1) and omitted max_tokens fall back to the server default
+    const Json zero_max         = {{"model", "m"},
+                                   {"max_tokens", 0},
+                                   {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
+    const GenerationRequest req0 = parse_messages_request(zero_max, default_limits());
+    failures += check(req0.max_tokens == 512 && !req0.max_tokens_set, "max_tokens 0 default applied");
 
-    // Omitting max_tokens falls back to the server default (lenient vs the API).
+    const Json neg_max          = {{"model", "m"},
+                                   {"max_tokens", -1},
+                                   {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
+    const GenerationRequest req_neg = parse_messages_request(neg_max, default_limits());
+    failures += check(req_neg.max_tokens == 512 && !req_neg.max_tokens_set, "max_tokens -1 default applied");
+
     const Json no_max           = {{"model", "m"},
                                    {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
     const GenerationRequest req = parse_messages_request(no_max, default_limits());
-    failures += check(req.max_tokens == 512 && !req.max_tokens_set, "max_tokens default applied");
+    failures += check(req.max_tokens == 512 && !req.max_tokens_set, "max_tokens omitted default applied");
     return failures;
 }
 

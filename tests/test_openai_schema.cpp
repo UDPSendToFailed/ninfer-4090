@@ -553,6 +553,30 @@ int test_parse_stop_and_max_tokens() {
     req         = parse_chat_completion_request(single, default_limits());
     failures +=
         check(req.stop_strings.size() == 1 && req.stop_strings[0] == "END", "single stop string");
+
+    Json unconstrained_neg = {{"model", "m"},
+                              {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
+                              {"max_tokens", -1}};
+    req                    = parse_chat_completion_request(unconstrained_neg, default_limits());
+    failures += check(req.max_tokens == 512 && !req.max_tokens_set, "max_tokens -1 resolves to default limit");
+
+    Json unconstrained_zero = {{"model", "m"},
+                               {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
+                               {"max_tokens", 0}};
+    req                     = parse_chat_completion_request(unconstrained_zero, default_limits());
+    failures += check(req.max_tokens == 512 && !req.max_tokens_set, "max_tokens 0 resolves to default limit");
+
+    Json npredict_neg = {{"model", "m"},
+                         {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
+                         {"n_predict", -1}};
+    req               = parse_chat_completion_request(npredict_neg, default_limits());
+    failures += check(req.max_tokens == 512 && !req.max_tokens_set, "n_predict -1 resolves to default limit");
+
+    Json npredict_pos = {{"model", "m"},
+                         {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
+                         {"n_predict", 128}};
+    req               = parse_chat_completion_request(npredict_pos, default_limits());
+    failures += check(req.max_tokens == 128 && req.max_tokens_set, "n_predict 128 parsed as max_tokens");
     return failures;
 }
 
@@ -785,6 +809,7 @@ int test_models_and_error() {
     failures += check(list.at("data").at(0).at("object") == "model", "models list entry object");
     failures += check(list.at("data").at(0).at("owned_by") == "ninfer", "models list owner");
     failures += check(list.at("data").at(0).at("context_window") == 65536, "models list context");
+    failures += check(list.at("data").at(0).at("max_model_len") == 65536, "models list max_model_len");
     failures += check(list.at("data").at(0).at("max_output_tokens") == 65536, "models list max_output_tokens");
     failures += check(list.at("data").at(0).at("modalities").at("vision") == true,
                       "models list vision modality");
@@ -794,6 +819,7 @@ int test_models_and_error() {
     failures += check(one.at("name") == "qwen3.6-27b", "model name");
     failures += check(one.at("owned_by") == "ninfer", "model owner");
     failures += check(one.at("context_window") == 65536, "model object context");
+    failures += check(one.at("max_model_len") == 65536, "model object max_model_len");
     failures += check(one.at("max_output_tokens") == 65536, "model object max_output_tokens");
     failures += check(one.at("modalities").at("vision") == false, "model object vision modality");
 

@@ -65,7 +65,10 @@ int main() {
 
     nlohmann::json default_gen = {
         {"n_ctx", options.max_context},
+        {"n_predict", -1},
         {"params", {
+            {"n_predict", -1},
+            {"max_tokens", options.default_max_tokens},
             {"temp", sampling.temperature},
             {"top_p", sampling.top_p},
             {"top_k", sampling.top_k},
@@ -90,6 +93,9 @@ int main() {
 
     failures += check(props.contains("default_generation_settings"), "props missing default_generation_settings");
     failures += check(props["default_generation_settings"]["n_ctx"] == 65536, "props n_ctx mismatch");
+    failures += check(props["default_generation_settings"]["n_predict"] == -1, "props n_predict mismatch");
+    failures += check(props["default_generation_settings"]["params"]["n_predict"] == -1, "props params.n_predict mismatch");
+    failures += check(props["default_generation_settings"]["params"]["max_tokens"] == options.default_max_tokens, "props max_tokens mismatch");
     failures += check(props["default_generation_settings"]["params"]["temp"] == 0.7f, "props temp mismatch");
     failures += check(props["default_generation_settings"]["params"]["top_p"] == 0.95f, "props top_p mismatch");
     failures += check(props["default_generation_settings"]["params"]["top_k"] == 40, "props top_k mismatch");

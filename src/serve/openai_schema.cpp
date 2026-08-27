@@ -584,10 +584,16 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
 
     std::optional<int> max_tokens = get_int(body, "max_completion_tokens");
     if (!max_tokens) { max_tokens = get_int(body, "max_tokens"); }
+    if (!max_tokens) { max_tokens = get_int(body, "n_predict"); }
     if (max_tokens) {
-        if (*max_tokens <= 0) { bad_request("max_tokens must be positive", "max_tokens"); }
-        out.max_tokens     = *max_tokens;
-        out.max_tokens_set = true;
+        if (*max_tokens <= 0) {
+            // Non-positive values (e.g. -1, 0) indicate unconstrained output / full context budget
+            out.max_tokens     = limits.default_max_tokens;
+            out.max_tokens_set = false;
+        } else {
+            out.max_tokens     = *max_tokens;
+            out.max_tokens_set = true;
+        }
     } else {
         out.max_tokens     = limits.default_max_tokens;
         out.max_tokens_set = false;
@@ -720,6 +726,7 @@ std::string make_models_list(const std::string& model_id, std::int64_t created,
                                                      {"created", created},
                                                      {"owned_by", "ninfer"},
                                                      {"context_window", context_window},
+                                                     {"max_model_len", context_window},
                                                      {"max_output_tokens", context_window},
                                                      {"modalities", Json{{"vision", vision}}}}})}};
     return payload.dump();
@@ -733,6 +740,7 @@ std::string make_model_object(const std::string& model_id, std::int64_t created,
                           {"created", created},
                           {"owned_by", "ninfer"},
                           {"context_window", context_window},
+                          {"max_model_len", context_window},
                           {"max_output_tokens", context_window},
                           {"modalities", Json{{"vision", vision}}}};
     return payload.dump();

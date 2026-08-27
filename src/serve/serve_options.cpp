@@ -338,6 +338,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (options.default_max_tokens <= 0) {
             throw std::invalid_argument("--default-max-tokens must be positive");
         }
+    } else {
+        options.default_max_tokens = static_cast<int>(options.max_context);
     }
     return options;
 }

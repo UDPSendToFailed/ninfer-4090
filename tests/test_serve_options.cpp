@@ -266,11 +266,21 @@ int main() {
         check(serve_usage_text("ninfer-serve").find("identity.model_id") != std::string::npos,
               "serve help omits the artifact-derived model id default");
 
+    failures += check(defaults.default_max_tokens == static_cast<int>(defaults.max_context),
+                      "default_max_tokens did not default to max_context");
+
     const ServeOptions inherited =
         parse({"ninfer-serve", "model.ninfer", "--max-context", "16384"});
     failures += check(inherited.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
                           inherited.kv_capacity.explicit_tokens == 16384,
                       "omitted --kv-capacity did not follow --max-context");
+    failures += check(inherited.default_max_tokens == 16384,
+                      "omitted --default-max-tokens did not follow --max-context");
+
+    const ServeOptions explicit_max_tokens =
+        parse({"ninfer-serve", "model.ninfer", "--max-context", "16384", "--default-max-tokens", "2048"});
+    failures += check(explicit_max_tokens.default_max_tokens == 2048,
+                      "explicit --default-max-tokens was overridden by --max-context");
 
     const ServeOptions automatic = parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "auto"});
     failures += check(automatic.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
