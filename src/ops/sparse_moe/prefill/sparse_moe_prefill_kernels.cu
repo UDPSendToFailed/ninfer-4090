@@ -231,7 +231,8 @@ __global__ void sparse_moe_prefill_scan_kernel(const int* __restrict__ tile_coun
 template <bool Adaptive>
 __global__ void
 sparse_moe_prefill_gather_kernel(const __nv_bfloat16* __restrict__ x, const int* __restrict__ ids,
-                                 int* __restrict__ packed_index, const int* __restrict__ tile_bases,
+                                 const int* __restrict__ local_rank, int* __restrict__ packed_index,
+                                 const int* __restrict__ tile_bases,
                                  __nv_bfloat16* __restrict__ gathered,
                                  const int* __restrict__ route_job_count) {
     if constexpr (Adaptive) {
@@ -242,7 +243,7 @@ sparse_moe_prefill_gather_kernel(const __nv_bfloat16* __restrict__ x, const int*
     const int expert     = ids[assignment];
     const int tile       = token / kSparseMoeRouteTileTokens;
     const int packed =
-        tile_bases[static_cast<std::int64_t>(tile) * kExperts + expert] + packed_index[assignment];
+        tile_bases[static_cast<std::int64_t>(tile) * kExperts + expert] + local_rank[assignment];
     const int k       = static_cast<int>(threadIdx.x) * 8;
     const uint4 value = load_vec<uint4>(x + static_cast<std::int64_t>(token) * kHidden + k);
     store_vec(gathered + static_cast<std::int64_t>(packed) * kHidden + k, value);
@@ -1107,6 +1108,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
 
     auto* ids               = static_cast<int*>(workspace.token_ids.data);
     auto* alpha             = static_cast<float*>(workspace.token_alpha.data);
+    auto* local_rank        = static_cast<int*>(workspace.local_rank.data);
     auto* packed_index      = static_cast<int*>(workspace.packed_index.data);
     auto* shared_scale      = static_cast<float*>(workspace.shared_scale.data);
     auto* tile_counts       = static_cast<int*>(workspace.tile_counts.data);
@@ -1143,7 +1145,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         CUDA_CHECK(cudaGetLastError());
 
         sparse_moe_prefill_select_count_kernel<<<route_tiles, kRouterThreads, 0, stream>>>(
-            scores, ids, alpha, shared_scale, packed_index, tile_counts, tokens);
+            scores, ids, alpha, shared_scale, local_rank, tile_counts, tokens);
         CUDA_CHECK(cudaGetLastError());
 
         const bool wide_plan   = tokens >= kSparseMoePrefillWideMin;
@@ -1162,10 +1164,10 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                 weights, output_slice, ids, alpha, shared_scale, adaptive_activations, tokens,
                 SparseMoeSmallTD4Schedule::Rows4, stream, route_job_count);
             sparse_moe_prefill_gather_kernel<true><<<assignments, kExpertThreads, 0, stream>>>(
-                input, ids, packed_index, tile_bases, grouped_io, route_job_count);
+                input, ids, local_rank, packed_index, tile_bases, grouped_io, route_job_count);
         } else {
             sparse_moe_prefill_gather_kernel<false><<<assignments, kExpertThreads, 0, stream>>>(
-                input, ids, packed_index, tile_bases, grouped_io, nullptr);
+                input, ids, local_rank, packed_index, tile_bases, grouped_io, nullptr);
         }
         CUDA_CHECK(cudaGetLastError());
 
