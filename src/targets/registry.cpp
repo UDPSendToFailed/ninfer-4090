@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -59,19 +60,41 @@ artifact::LoadProgress artifact_progress(const LoadProgress& progress) {
     return artifact::LoadProgress{.callback = progress.callback};
 }
 
+#if defined(_WIN32)
+// Budgeting against total VRAM assumes WDDM will evict every other allocation on the adapter.
+// That only holds when the GPU is not also driving the desktop, so it must be requested
+// explicitly via NINFER_WDDM_EVICTABLE_BUDGET=1.
+bool wddm_evictable_budget_enabled() {
+    static const bool enabled = [] {
+        const char* raw = std::getenv("NINFER_WDDM_EVICTABLE_BUDGET");
+        return raw != nullptr && raw[0] == '1' && raw[1] == '\0';
+    }();
+    return enabled;
+}
+#endif
+
+// Runtime budget computed by the pre-flight gate, before weights were resident. The device
+// arena is sized from this value and then owns the memory, so cudaMemGetInfo reports ~0 free
+// afterwards; KV capacity resolution must be told the same budget rather than re-measuring.
+std::size_t g_planned_runtime_bytes = 0;
+
 std::size_t runtime_bytes_after_planned_weights(std::uint64_t weight_bytes) {
     std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
 #if defined(_WIN32)
-    // Allow WDDM to evict background apps down to a 512 MiB non-evictable DWM display floor
+    // Allow WDDM to evict background apps down to a 512 MiB non-evictable DWM display floor.
+    // Opt-in only: on a card that is also driving the desktop the background allocations are
+    // frequently not evictable, so budgeting against total VRAM oversubscribes the device and
+    // pushes the runtime into WDDM paging.
     constexpr std::size_t kMinDwmHeadroom = 512ULL * 1024ULL * 1024ULL;
-    if (total_bytes > weight_bytes + kMinDwmHeadroom) {
+    if (wddm_evictable_budget_enabled() && total_bytes > weight_bytes + kMinDwmHeadroom) {
         const std::size_t evictable_capacity =
             total_bytes - static_cast<std::size_t>(weight_bytes) - kMinDwmHeadroom;
         const std::size_t free_after_weights =
             free_bytes > weight_bytes ? free_bytes - static_cast<std::size_t>(weight_bytes) : 0;
-        return std::max(free_after_weights, evictable_capacity);
+        g_planned_runtime_bytes = std::max(free_after_weights, evictable_capacity);
+        return g_planned_runtime_bytes;
     }
 #endif
     if (weight_bytes > free_bytes) {
@@ -80,7 +103,8 @@ std::size_t runtime_bytes_after_planned_weights(std::uint64_t weight_bytes) {
                                     std::to_string(free_bytes) +
                                     " bytes are free before loading weights");
     }
-    return free_bytes - static_cast<std::size_t>(weight_bytes);
+    g_planned_runtime_bytes = free_bytes - static_cast<std::size_t>(weight_bytes);
+    return g_planned_runtime_bytes;
 }
 
 std::size_t current_free_device_bytes(std::size_t weights_bytes = 0) {
@@ -88,7 +112,7 @@ std::size_t current_free_device_bytes(std::size_t weights_bytes = 0) {
     std::size_t total_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
 #if defined(_WIN32)
-    if (weights_bytes > 0) {
+    if (wddm_evictable_budget_enabled() && weights_bytes > 0) {
         // Allow WDDM to evict background apps down to a 512 MiB non-evictable DWM display floor
         constexpr std::size_t kMinDwmHeadroom = 512ULL * 1024ULL * 1024ULL;
         if (total_bytes > weights_bytes + kMinDwmHeadroom) {
@@ -96,6 +120,9 @@ std::size_t current_free_device_bytes(std::size_t weights_bytes = 0) {
             return std::max(free_bytes, evictable_free);
         }
     }
+    // The arena already owns the pre-flight budget, so free_bytes understates what the runtime
+    // may still place. Report the budget the arena was actually sized from.
+    if (weights_bytes > 0) { return std::max(free_bytes, g_planned_runtime_bytes); }
 #endif
     return free_bytes;
 }
