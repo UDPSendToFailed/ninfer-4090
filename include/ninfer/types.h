@@ -88,6 +88,7 @@ struct EngineOptions {
     bool enable_prompt_cache               = false;
     std::filesystem::path prompt_cache_dir = "";          // empty resolves to default user cache dir
     std::size_t prompt_cache_max_bytes     = 30ULL << 30; // 30 GiB LRU ceiling
+    bool wddm_evictable_budget             = false;       // Opt-in aggressive WDDM memory budgeting against total VRAM
     LoadProgress load_progress;
 };
 

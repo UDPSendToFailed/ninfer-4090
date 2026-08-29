@@ -15,6 +15,7 @@
 #include <wrl/client.h>
 #endif
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -83,17 +84,9 @@ static std::vector<D3D12AllocationLifetime> g_d3d12_allocations;
 // Upper bound on how long we wait for WDDM to make the heap resident before falling back.
 constexpr DWORD kResidencyWaitTimeoutMs = 10000;
 
-// The D3D12 residency lock and the eager page commit both assume this GPU is not also driving
-// the desktop: they pin/commit the full arena up front and rely on WDDM evicting other
-// applications. On a card shared with the desktop that oversubscribes VRAM and pushes the
-// runtime into paging, so both are opt-in via NINFER_WDDM_EVICTABLE_BUDGET=1.
-bool wddm_residency_lock_enabled() {
-    static const bool enabled = [] {
-        const char* raw = std::getenv("NINFER_WDDM_EVICTABLE_BUDGET");
-        return raw != nullptr && raw[0] == '1' && raw[1] == '\0';
-    }();
-    return enabled;
-}
+#if defined(_WIN32)
+static std::atomic<bool> g_wddm_residency_lock_enabled{false};
+#endif
 
 bool try_allocate_d3d12_residency_locked(std::size_t capacity_bytes, void*& out_ptr) {
     D3D12AllocationLifetime res;
@@ -252,6 +245,18 @@ bool try_allocate_d3d12_residency_locked(std::size_t capacity_bytes, void*& out_
 
 } // namespace
 
+#if defined(_WIN32)
+namespace core {
+void set_wddm_residency_lock_enabled(bool enabled) noexcept {
+    g_wddm_residency_lock_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool wddm_residency_lock_enabled() noexcept {
+    return g_wddm_residency_lock_enabled.load(std::memory_order_relaxed);
+}
+} // namespace core
+#endif
+
 DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
     if (bytes == 0) { return; }
 
@@ -337,7 +342,7 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
 
     void* ptr = nullptr;
 #if defined(_WIN32)
-    if (wddm_residency_lock_enabled()) {
+    if (core::wddm_residency_lock_enabled()) {
         if (!try_allocate_d3d12_residency_locked(capacity_bytes, ptr)) { ptr = nullptr; }
     }
 #endif
@@ -351,7 +356,7 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
 #if defined(_WIN32)
         // Eagerly touch allocated pages to force WDDM to fault physical VRAM and evict
         // background apps. Only safe when this GPU is not also driving the desktop.
-        if (wddm_residency_lock_enabled()) {
+        if (core::wddm_residency_lock_enabled()) {
             const cudaError_t set_err = cudaMemset(ptr, 0, capacity_bytes);
             if (set_err != cudaSuccess) {
                 free_device(ptr);

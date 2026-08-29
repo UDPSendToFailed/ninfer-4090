@@ -43,6 +43,12 @@ int expect_ptr(void* actual, void* expected, const char* label) {
     return 1;
 }
 
+int expect(bool condition, const char* label) {
+    if (condition) { return 0; }
+    std::cerr << label << " condition failed\n";
+    return 1;
+}
+
 } // namespace
 
 int main() {
@@ -190,6 +196,17 @@ int main() {
     }
     failures += expect_size(pinned.size(), 128, "pinned.size");
     std::memset(pinned.data(), 0x5a, pinned.size());
+
+#if defined(_WIN32)
+    const bool initial_residency = ninfer::core::wddm_residency_lock_enabled();
+    failures += expect(!initial_residency, "wddm_residency_lock_enabled should default to false");
+    ninfer::core::set_wddm_residency_lock_enabled(true);
+    failures += expect(ninfer::core::wddm_residency_lock_enabled(),
+                       "wddm_residency_lock_enabled should be true after set(true)");
+    ninfer::core::set_wddm_residency_lock_enabled(false);
+    failures += expect(!ninfer::core::wddm_residency_lock_enabled(),
+                       "wddm_residency_lock_enabled should be false after set(false)");
+#endif
 
     return failures == 0 ? 0 : fail("arena test failed");
 }

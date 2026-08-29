@@ -119,6 +119,11 @@ int test_cli_contract() {
         parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "rk2v4-e8"});
     failures += expect(k2_parsed.kv_cache == ninfer::KvCacheStorage::RK2V4E8, "rk2v4-e8 KV");
 
+    const qb::BenchOptions wddm_parsed =
+        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--wddm-evictable-budget"});
+    failures += expect(wddm_parsed.wddm_evictable_budget, "wddm_evictable_budget flag");
+    failures += expect(!k2_parsed.wddm_evictable_budget, "wddm_evictable_budget default");
+
     const auto defaults = qb::expand_tests(qb::BenchOptions{});
     failures +=
         expect(defaults.size() == 2 && defaults[0].label == "pp512" && defaults[1].label == "tg128",

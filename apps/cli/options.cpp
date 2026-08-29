@@ -93,7 +93,8 @@ std::string usage_text(const char* argv0) {
            "                              reserving " + headroom_mib + " MiB headroom; default: matches --max-context)\n"
            "  --prefill-chunk <N>         Prefill chunk size in tokens (multiple of 128, default: 1024)\n"
            "  --max-new <N>               Maximum number of new tokens to generate (default: 128)\n"
-           "  --no-cuda-graph             Disable CUDA Graph capture/replay (executes via standard CUDA streams)\n\n"
+           "  --no-cuda-graph             Disable CUDA Graph capture/replay (executes via standard CUDA streams)\n"
+           "  --wddm-evictable-budget     Allow aggressive WDDM memory budgeting against total VRAM on dedicated GPUs (Windows only)\n\n"
            "Quantization & Storage Layouts:\n"
            "  --kv-dtype <dtype>          KV cache storage data type and quantization layout:\n"
            "                                bf16       - 16-bit brain floating-point\n"
@@ -185,6 +186,8 @@ Options parse_options(int argc, char** argv) {
             options.enable_vision     = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--wddm-evictable-budget") {
+            options.wddm_evictable_budget = true;
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {

@@ -108,4 +108,11 @@ private:
 
 using WorkspaceArena = DeviceArena;
 
+namespace core {
+#if defined(_WIN32)
+void set_wddm_residency_lock_enabled(bool enabled) noexcept;
+[[nodiscard]] bool wddm_residency_lock_enabled() noexcept;
+#endif
+} // namespace core
+
 } // namespace ninfer

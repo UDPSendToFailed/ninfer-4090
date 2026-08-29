@@ -54,9 +54,15 @@ int main() {
             !defaults.sampling_overrides.top_k && !defaults.sampling_overrides.presence_penalty &&
             !defaults.sampling_overrides.frequency_penalty,
         "server defaults unexpectedly override registered model sampling");
-    failures += check(defaults.enable_ui, "WebUI is unexpectedly disabled by default");
+    failures += check(!defaults.wddm_evictable_budget,
+                      "wddm_evictable_budget is unexpectedly enabled by default");
     failures += check(resolve_public_model_id(defaults, "artifact-model") == "artifact-model",
                       "artifact model id was not selected by default");
+
+    const ServeOptions wddm_opt_in =
+        parse({"ninfer-serve", "model.ninfer", "--wddm-evictable-budget"});
+    failures += check(wddm_opt_in.wddm_evictable_budget,
+                      "--wddm-evictable-budget was not parsed correctly");
 
     const ServeOptions ui_disabled =
         parse({"ninfer-serve", "model.ninfer", "--no-ui"});

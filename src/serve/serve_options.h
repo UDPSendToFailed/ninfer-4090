@@ -47,6 +47,7 @@ struct ServeOptions {
     bool enable_prompt_cache               = false;
     std::string prompt_cache_dir           = "";
     std::size_t prompt_cache_max_bytes     = 30ULL << 30; // 30 GiB default
+    bool wddm_evictable_budget             = false;       // Opt-in aggressive WDDM memory budgeting against total VRAM
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;
