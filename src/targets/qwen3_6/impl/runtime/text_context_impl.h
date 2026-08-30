@@ -1204,24 +1204,19 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     multimodal != nullptr     ? multimodal->token_ids
                     : text_prefill != nullptr ? text_prefill->token_ids
                                               : ids;
-                std::vector<int> mtp_ids_host(static_cast<std::size_t>(len));
                 const int prompt_columns =
                     len - static_cast<int>(mtp_window.final_column_uses_generated_token);
-                for (int j = 0; j < prompt_columns; ++j) {
-                    mtp_ids_host[static_cast<std::size_t>(j)] =
-                        alignment_ids[static_cast<std::size_t>(mtp_window.shifted_embedding_begin) +
-                                      static_cast<std::size_t>(j)];
+                Tensor mtp_ids = work_.alloc(DType::I32, {len});
+                if (prompt_columns != 0) {
+                    Tensor prompt_mtp_ids = mtp_ids.slice(0, 0, prompt_columns);
+                    copy_i32(alignment_ids.data() + mtp_window.shifted_embedding_begin,
+                             prompt_mtp_ids, s);
                 }
                 if (mtp_window.final_column_uses_generated_token) {
-                    int next_token = 0;
-                    CUDA_CHECK(cudaStreamSynchronize(s));
-                    CUDA_CHECK(cudaMemcpy(&next_token, io_.token.data, sizeof(next_token),
-                                          cudaMemcpyDeviceToHost));
-                    mtp_ids_host[static_cast<std::size_t>(len - 1)] = next_token;
+                    Tensor generated_mtp_id = mtp_ids.slice(0, len - 1, 1);
+                    CUDA_CHECK(cudaMemcpyAsync(generated_mtp_id.data, io_.token.data,
+                                               sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
                 }
-
-                Tensor mtp_ids = work_.alloc(DType::I32, {len});
-                copy_i32(mtp_ids_host.data(), mtp_ids, s);
                 Tensor mtp_input_embeddings;
                 const Tensor* mtp_input_embeddings_ptr = nullptr;
                 if (multimodal != nullptr) {
