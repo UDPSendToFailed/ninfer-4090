@@ -102,36 +102,6 @@ void causal_conv1d_smallt_launch(const Tensor& x, const Tensor& weight, const Te
     CUDA_CHECK(cudaGetLastError());
 }
 
-void causal_conv1d_sequence_launch(const Tensor& x, const Tensor& weight,
-                                   const Tensor& conv_state_in, Tensor& conv_state_out, Tensor& out,
-                                   cudaStream_t stream) {
-    const std::int32_t C        = x.ne[0];
-    const std::int32_t T        = x.ne[1];
-    const int block             = T == 1 ? 256 : 32;
-    const auto x_addr           = reinterpret_cast<std::uintptr_t>(x.data);
-    const auto w_addr           = reinterpret_cast<std::uintptr_t>(weight.data);
-    const auto in_addr          = reinterpret_cast<std::uintptr_t>(conv_state_in.data);
-    const auto out_state_addr   = reinterpret_cast<std::uintptr_t>(conv_state_out.data);
-    const auto out_addr         = reinterpret_cast<std::uintptr_t>(out.data);
-
-    if (((x_addr | w_addr | in_addr | out_state_addr | out_addr) & (alignof(__nv_bfloat162) - 1)) ==
-            0 &&
-        (C & 1) == 0) {
-        causal_conv1d_sequence_pairs_kernel<<<grid_for(C / 2, block, "sequence"), block, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
-            static_cast<const __nv_bfloat16*>(conv_state_in.data),
-            static_cast<__nv_bfloat16*>(conv_state_out.data), static_cast<__nv_bfloat16*>(out.data), C,
-            T);
-    } else {
-        causal_conv1d_sequence_kernel<<<grid_for(C, block, "sequence"), block, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
-            static_cast<const __nv_bfloat16*>(conv_state_in.data),
-            static_cast<__nv_bfloat16*>(conv_state_out.data), static_cast<__nv_bfloat16*>(out.data), C,
-            T);
-    }
-    CUDA_CHECK(cudaGetLastError());
-}
-
 void causal_conv1d_decode_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                                  Tensor& conv_state_out, Tensor& out, cudaStream_t stream) {
     constexpr int kBlock      = 256;

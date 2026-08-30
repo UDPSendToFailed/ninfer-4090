@@ -474,8 +474,10 @@ int main() {
 
     int failures = 0;
 
-    // The 27B geometry exercises every ordinary positive-T route boundary and one interior point
-    // per route. Every case is compared directly with the same complete oracle.
+    // The 27B geometry exercises both ordinary positive-T route boundaries - decode to small-T
+    // across 1/2, small-T to prefill across 16/17 - and interior points of each route. 63, 64 and
+    // 65 no longer straddle a boundary but are retained as prefill interior coverage. Every case
+    // is compared directly with the same complete oracle.
     constexpr std::int32_t kQwen27Channels = 10240;
     for (const std::int32_t T : {1, 2, 7, 15, 16, 17, 32, 63, 64, 65, 257}) {
         failures += ordinary_case(kQwen27Channels, T, StateCall::InPlaceEntry,

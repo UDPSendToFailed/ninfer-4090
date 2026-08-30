@@ -161,9 +161,6 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& con
         detail::causal_conv1d_decode_launch(x, weight, conv_state_in, conv_state_out, out, stream);
     } else if (x.ne[1] <= detail::kCausalConvParallelMaxTokens) {
         detail::causal_conv1d_smallt_launch(x, weight, conv_state_in, conv_state_out, out, stream);
-    } else if (x.ne[1] <= detail::kCausalConvSequenceMaxTokens) {
-        detail::causal_conv1d_sequence_launch(x, weight, conv_state_in, conv_state_out, out,
-                                              stream);
     } else {
         detail::causal_conv1d_prefill_launch(x, weight, conv_state_in, conv_state_out, out, stream);
     }
@@ -179,8 +176,6 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, Tensor& conv_stat
         detail::causal_conv1d_decode_launch(x, weight, conv_state, conv_state, out, stream);
     } else if (x.ne[1] <= detail::kCausalConvParallelMaxTokens) {
         detail::causal_conv1d_smallt_launch(x, weight, conv_state, conv_state, out, stream);
-    } else if (x.ne[1] <= detail::kCausalConvSequenceMaxTokens) {
-        detail::causal_conv1d_sequence_launch(x, weight, conv_state, conv_state, out, stream);
     } else {
         detail::causal_conv1d_prefill_launch(x, weight, conv_state, conv_state, out, stream);
     }
