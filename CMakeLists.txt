@@ -50,7 +50,6 @@ if(MSVC)
 
     # NVVM & PTXAS Device Optimizations
     $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-O3>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>           # Print exact register usage and .local stack spills
     $<$<COMPILE_LANGUAGE:CUDA>:-ftz=true>            # Flush subnormals to zero (hardware fast path on sm_89)
     $<$<COMPILE_LANGUAGE:CUDA>:-prec-div=false>      # Fast single-precision hardware division (__fdividef)
     $<$<COMPILE_LANGUAGE:CUDA>:-prec-sqrt=false>     # Fuse 1.0f/sqrtf(x) into single-cycle rsqrtf(x)
@@ -59,6 +58,13 @@ if(MSVC)
   # LINKER: prefix ensures CMake passes this strictly to link.exe via -Xlinker for CUDA targets
   add_link_options("LINKER:/NODEFAULTLIB:LIBCMT")
 endif()
+
+# ptxas resource reporting: host-toolchain independent and has no codegen effect, so it applies
+# on every platform. The fast-math device flags above stay MSVC-gated -- on sm_89/Linux they
+# measured as no gain (<0.25%, within run-to-run noise) and they alter floating-point results.
+add_compile_options(
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>           # Print exact register usage and .local stack spills
+)
 
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "86")
   add_compile_definitions(NINFER_SM86=1)
