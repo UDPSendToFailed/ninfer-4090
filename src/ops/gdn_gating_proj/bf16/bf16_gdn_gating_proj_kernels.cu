@@ -395,9 +395,9 @@ void bf16_gdn_gating_proj_mma_split4_launch(Bf16GdnGatingTokenVariant variant, c
                                             const Tensor& A_log, const Tensor& dt_bias,
                                             void* workspace, Tensor& g, Tensor& beta,
                                             cudaStream_t stream) {
-    launch_bf16_prefill_mma<Bf16Gdn27Geometry, 4>(variant, x, nullptr, 0.0F, nullptr, a_weight,
-                                                  b_weight, A_log, dt_bias, workspace, g, beta,
-                                                  stream);
+    launch_bf16_prefill_mma<Bf16Gdn27Geometry, 4, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
+                                                     b_weight, A_log, dt_bias, workspace, g, beta,
+                                                     stream);
 }
 
 void bf16_gdn_gating_proj_mma_split2_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
@@ -405,9 +405,9 @@ void bf16_gdn_gating_proj_mma_split2_launch(Bf16GdnGatingTokenVariant variant, c
                                             const Tensor& A_log, const Tensor& dt_bias,
                                             void* workspace, Tensor& g, Tensor& beta,
                                             cudaStream_t stream) {
-    launch_bf16_prefill_mma<Bf16Gdn27Geometry, 2>(variant, x, nullptr, 0.0F, nullptr, a_weight,
-                                                  b_weight, A_log, dt_bias, workspace, g, beta,
-                                                  stream);
+    launch_bf16_prefill_mma<Bf16Gdn27Geometry, 2, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
+                                                     b_weight, A_log, dt_bias, workspace, g, beta,
+                                                     stream);
 }
 
 void bf16_gdn_gating_proj_mma_unsplit_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,

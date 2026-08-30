@@ -435,12 +435,15 @@ int main() {
     }
 
     int failures = 0;
-    failures += verify_workspace_capacity_contract(kQwen27, {1, 8, 768, 1664, 1665});
+    failures += verify_workspace_capacity_contract(
+        kQwen27, {1, 8, 1280, 1281, 2688, 2689, 5376, 5377});
     failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 960, 1920, 3904, 3905});
 
     // Every registered 27B projection route, including predicated and full token tiles, and both
-    // sides of each sm_86 residency boundary.
-    for (const std::int32_t tokens : {1, 8, 9, 768, 769, 1024, 1664, 1665, 2049, 4097}) {
+    // sides of each residency boundary on the declared target (1280/1281, 2688/2689, 5376/5377).
+    // 1024 is the default prefill chunk and 768 the former split8 ceiling.
+    for (const std::int32_t tokens :
+         {1, 8, 9, 768, 1024, 1280, 1281, 2049, 2688, 2689, 5376, 5377}) {
         failures +=
             run_projection_case(kQwen27, tokens, 0x1000u + static_cast<std::uint32_t>(tokens));
     }

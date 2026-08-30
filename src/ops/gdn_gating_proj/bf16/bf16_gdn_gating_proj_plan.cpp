@@ -1,5 +1,7 @@
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 
+#include "core/device.h"
+
 #include "ninfer/ops/rmsnorm.h"
 
 #include <algorithm>
@@ -26,16 +28,19 @@ struct RouteSpec {
     Bf16GdnGatingScheduleId schedule;
 };
 
-constexpr std::array<RouteSpec, 5> k27Routes{{
+constexpr std::array<RouteSpec, 6> k27Routes{{
     {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
     {{2, 8}, Bf16GdnGatingScheduleId::SmallTSplit10},
-    // sm_86 has 82 SMs. Split8 (256 threads, 65 regs) admits 2 CTAs/SM -> 164 device-wide;
-    // split4/2 (512 threads, 74 regs) admit 1 CTA/SM -> 82. Grid is ceil(T/128)*3*SplitK, so
-    // split8 is legal to T<=768 and split2 to T<=1664. Split4 reaches the same 768 ceiling as
-    // split8 while doing less work per launch, so it is unreachable on this target.
-    {{9, 768}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
-    {{769, 1664}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
-    {{1665, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
+    // Every 27B MMA route runs 8 warps at 64 registers. 64*8*32 = 16,384 registers admits four
+    // CTAs/SM against the 64 Ki register file, while the 40 KiB of dynamic shared memory admits
+    // two against the 100 KiB SM allowance, so shared memory binds at two CTAs/SM uniformly across
+    // split8/4/2. The budget is that occupancy times the running device's SM count; the bounds
+    // below are the ends it reaches on the declared target, 128 SMs -> 256 CTAs. Grid is
+    // ceil(T/128)*3*SplitK, so the legal ends are 1280 / 2688 / 5376.
+    {{9, 1280}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
+    {{1281, 2688}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
+    {{2689, 5376}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
+    {{5377, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
 }};
 
 constexpr std::array<RouteSpec, 5> k35Routes{{
@@ -63,17 +68,18 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
 static_assert(catalog_is_closed(k27Routes, kAnyCols));
 static_assert(catalog_is_closed(k35Routes, kAnyCols));
 
-// Device-wide resident-CTA budgets, measured on the sm_86 build. These are the single source of
-// truth: both the runtime residency predicates and the compile-time catalog guard below read them,
-// so a retuned constant cannot silently disagree with the route table it is meant to bound.
-constexpr std::int32_t resident_ctas_27(Bf16GdnGatingScheduleId schedule) noexcept {
-    return schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit8 ? 164 : 82;
-}
+// Resident CTAs per SM for the compiled kernels. This is a property of the build - registers,
+// threads and shared memory of the specialization - and is the single source of truth read by both
+// the runtime residency predicates and the compile-time catalog guard below, so a retuned constant
+// cannot silently disagree with the route table it is meant to bound. A compute capability is not
+// an SM count, so the device-wide budget is this occupancy times the SM count of the device the
+// process actually opened.
+constexpr std::int32_t ctas_per_sm_27(Bf16GdnGatingScheduleId) noexcept { return 2; }
 
-constexpr std::int32_t resident_ctas_35(Bf16GdnGatingScheduleId schedule) noexcept {
-    if (schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32) { return 164; }
-    if (schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit16) { return 328; }
-    return 246;
+constexpr std::int32_t ctas_per_sm_35(Bf16GdnGatingScheduleId schedule) noexcept {
+    if (schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32) { return 2; }
+    if (schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit16) { return 4; }
+    return 3;
 }
 
 // Zero marks a schedule that is not launched cooperatively and therefore carries no residency
@@ -99,23 +105,34 @@ constexpr std::int32_t cooperative_split_k(Bf16GdnGatingScheduleId schedule) noe
 // bound exceeds the budget is not merely slow: the driver rejects the launch outright with
 // cudaErrorCooperativeLaunchTooLarge on the first prefill wide enough to reach it. Checking the
 // catalog at compile time turns that class of regression into a build failure.
-template <std::size_t N, typename Budget>
+template <std::size_t N, typename Occupancy>
 constexpr bool catalog_is_resident(const std::array<RouteSpec, N>& routes, std::int32_t tile_cols,
-                                   std::int32_t row_tiles, Budget budget) noexcept {
+                                   std::int32_t row_tiles, std::int32_t sm_count,
+                                   Occupancy ctas_per_sm) noexcept {
     for (const RouteSpec& route : routes) {
         const std::int32_t split_k = cooperative_split_k(route.schedule);
         if (split_k == 0) { continue; }
         const std::int64_t column_tiles =
             (static_cast<std::int64_t>(route.cols.last) + tile_cols - 1) / tile_cols;
-        if (column_tiles * row_tiles * split_k > budget(route.schedule)) { return false; }
+        if (column_tiles * row_tiles * split_k > ctas_per_sm(route.schedule) * sm_count) {
+            return false;
+        }
     }
     return true;
 }
 
-static_assert(catalog_is_resident(k27Routes, 128, 3, resident_ctas_27),
-              "a 27B cooperative route exceeds the sm_86 resident-CTA budget at its upper bound");
-static_assert(catalog_is_resident(k35Routes, 64, 2, resident_ctas_35),
-              "a 35B cooperative route exceeds the sm_86 resident-CTA budget at its upper bound");
+// The SM count each table's cooperative ends were derived for. The guard is an invariant about the
+// table, not about the build, so it is checked against these rather than against kTargetSmCount:
+// the bounds do not change when the build targets a smaller part, and a device with fewer SMs is
+// not a build error because resolve_plan below demotes to the next route it can hold. Checking the
+// build target instead would fail an sm_86 build, whose 82 SMs cannot hold the 27B ends.
+constexpr std::int32_t k27BoundsSmCount = 128; // NVIDIA GeForce RTX 4090, the declared target
+constexpr std::int32_t k35BoundsSmCount = 82;  // ends inherited from the sm_86 tuning
+
+static_assert(catalog_is_resident(k27Routes, 128, 3, k27BoundsSmCount, ctas_per_sm_27),
+              "a 27B cooperative route exceeds the resident-CTA budget its bounds were derived for");
+static_assert(catalog_is_resident(k35Routes, 64, 2, k35BoundsSmCount, ctas_per_sm_35),
+              "a 35B cooperative route exceeds the resident-CTA budget its bounds were derived for");
 
 bool is_27(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 48 && problem.input_rows == 5120;
@@ -180,21 +197,21 @@ bool cooperative_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t
 }
 
 bool cooperative_27_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) noexcept {
-    // sm_86, 82 SMs, 65,536 regs/SM, 100 KiB smem/SM. BN128 uses 40 KiB of dynamic shared memory,
-    // capping every specialization at two CTAs/SM by shared memory alone. Measured on the sm_86
-    // build (cuobjdump -res-usage): split8 uses 65 registers with 256 threads and reaches that
-    // 2 CTAs/SM -> 164 device-wide; split4/2 use 74 registers with 512 threads and are register
-    // bound to 1 CTA/SM -> 82. There are three 16-row tiles per token tile.
-    return cooperative_grid_is_resident(schedule, cols, 128, 3, resident_ctas_27(schedule));
+    // BN128 uses 40 KiB of dynamic shared memory against a 100 KiB SM allowance, capping every
+    // specialization at two CTAs/SM by shared memory alone; ptxas reports 64 registers at 8 warps
+    // for split8/4/2 alike, which admits four, so shared memory binds. There are three 16-row tiles
+    // per token tile.
+    return cooperative_grid_is_resident(schedule, cols, 128, 3,
+                                        ctas_per_sm_27(schedule) * device_sm_count());
 }
 
 bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) noexcept {
     // BN64 uses 24 KiB of dynamic shared memory and two 16-row tiles, so shared memory alone
-    // admits four CTAs/SM. Measured on the sm_86 build (cuobjdump -res-usage): split32 uses
-    // 122-126 registers with 256 threads and is register bound to 2 CTAs/SM -> 164 device-wide
-    // across 82 SMs; split16 uses 56 registers and reaches the shared-memory bound of
-    // 4 CTAs/SM -> 328; split8/4/2 use 74 registers and are register bound to 3 CTAs/SM -> 246.
-    return cooperative_grid_is_resident(schedule, cols, 64, 2, resident_ctas_35(schedule));
+    // admits four CTAs/SM. split32 uses 122-126 registers with 256 threads and is register bound
+    // to 2 CTAs/SM; split16 uses 56 registers and reaches the shared-memory bound of 4 CTAs/SM;
+    // split8/4/2 use 74 registers and are register bound to 3 CTAs/SM.
+    return cooperative_grid_is_resident(schedule, cols, 64, 2,
+                                        ctas_per_sm_35(schedule) * device_sm_count());
 }
 
 bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
@@ -408,20 +425,21 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
         throw std::invalid_argument(
             "BF16 GDN gating: exact problem or column count is not admitted");
     }
-    if (is_27(problem)) {
-        for (const RouteSpec& route : k27Routes) {
-            if (route.cols.contains(problem.cols)) {
+    // The table is ordered by ascending column count and descending split, so every route after
+    // the covering one launches a strictly smaller grid and the closing MmaUnsplit route carries no
+    // residency constraint at all. A device with fewer SMs than the table was tuned for therefore
+    // demotes to the widest split it can actually hold instead of failing the launch.
+    const auto resolve = [&](const auto& routes) {
+        bool covered = false;
+        for (const RouteSpec& route : routes) {
+            covered = covered || route.cols.contains(problem.cols);
+            if (covered && candidate_is_legal(route.schedule, problem)) {
                 return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
             }
         }
-    } else {
-        for (const RouteSpec& route : k35Routes) {
-            if (route.cols.contains(problem.cols)) {
-                return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
-            }
-        }
-    }
-    throw std::logic_error("BF16 GDN gating: admitted problem has no covering route");
+        throw std::logic_error("BF16 GDN gating: admitted problem has no covering route");
+    };
+    return is_27(problem) ? resolve(k27Routes) : resolve(k35Routes);
 }
 
 std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::int32_t input_rows,
