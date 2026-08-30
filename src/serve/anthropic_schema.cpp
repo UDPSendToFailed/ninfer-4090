@@ -360,10 +360,20 @@ void parse_messages(const Json& body, GenerationRequest& out, std::string& syste
         }
         const Json& content = item.at("content");
         if (role == "system") {
-            // Claude Code injects system reminders as system-role messages inside
-            // the messages array. Fold them into the leading system block: the Qwen
-            // chat template only honors leading system turns and drops the rest.
-            append_text(system_text, flatten_system_value(content, "messages"));
+            // Clients inject reminders as system-role messages inside the messages array, and
+            // their text changes every turn. Only a leading one may merge into the system block;
+            // a later one keeps its position, because hoisting content from the newest turn to the
+            // head of the prompt invalidates the entire prefix cache on every request.
+            if (out.messages.empty()) {
+                append_text(system_text, flatten_system_value(content, "messages"));
+            } else {
+                ChatTurn turn;
+                turn.role = "system";
+                turn.content.push_back(ContentPart{ContentKind::Text,
+                                                   flatten_system_value(content, "messages"),
+                                                   "text"});
+                out.messages.push_back(std::move(turn));
+            }
             continue;
         }
         if (content.is_string()) {

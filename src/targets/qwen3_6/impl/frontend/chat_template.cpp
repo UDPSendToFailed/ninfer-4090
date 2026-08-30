@@ -351,14 +351,24 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     for (std::size_t i = 0; i < messages.size(); ++i) {
         const ChatMessage& message = messages[i];
         if (i < num_sys) { continue; }
-        if (message.role == "system") {
-            throw std::invalid_argument("system message must be at the beginning");
-        }
         if (!is_allowed_role(message.role)) {
             throw std::invalid_argument("unsupported chat role: " + message.role);
         }
+        if (message.role == "system" && message.has_media()) {
+            throw std::invalid_argument("system message cannot contain images or videos");
+        }
         const std::string content = trim_ascii_whitespace(
             message.rendered_content(options.add_vision_id, &image_count, &video_count));
+        if (message.role == "system") {
+            // A system turn that arrives after the conversation has started - a per-turn client
+            // reminder, for instance - renders where it sits. Hoisting it into the leading system
+            // block instead would rewrite the head of the prompt on every turn and leave prefix
+            // reuse nothing to match. Leading system turns still merge, above.
+            rendered += "<|im_start|>system\n";
+            rendered += content;
+            rendered += "<|im_end|>\n";
+            continue;
+        }
         if (message.role == "user") {
             rendered += "<|im_start|>user\n";
             rendered += content;

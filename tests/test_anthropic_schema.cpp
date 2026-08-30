@@ -146,12 +146,12 @@ int test_parse_system_array_and_blocks() {
     return failures;
 }
 
-// Regression: Claude Code (v2.1.x) injects "system reminders" as system-role
-// messages inside the messages array (in addition to the top-level `system`
-// field). Earlier we rejected those with 400 "message role must be 'user' or
-// 'assistant'". They must instead fold into the single leading system turn so the
-// Qwen template (which drops non-leading system turns) keeps the content.
-int test_system_role_in_messages_folds() {
+// Claude Code (v2.1.x) injects "system reminders" as system-role messages inside the messages
+// array, in addition to the top-level `system` field, and their text changes every turn. A leading
+// one merges into the single leading system turn; one that arrives after the conversation has
+// started keeps its position, because hoisting it to the head of the prompt would rewrite the
+// prompt head on every request and leave prefix reuse nothing to match.
+int test_system_role_in_messages_placement() {
     int failures    = 0;
     const Json body = {
         {"model", "m"},
@@ -162,13 +162,32 @@ int test_system_role_in_messages_folds() {
                          Json{{"role", "system"}, {"content", "reminder from messages"}},
                      })}};
     const GenerationRequest req = parse_messages_request(body, default_limits());
-    // Exactly one leading system turn (top-level + in-array folded), then the user.
-    failures += check(req.messages.size() == 2, "system folded, user kept");
-    failures += check(req.messages[0].role == "system", "single leading system turn");
-    failures += check(req.messages[0].content[0].text == "top-level system\nreminder from messages",
-                      "top-level + in-array system merged in order");
+    failures += check(req.messages.size() == 3, "late system kept as its own turn");
+    failures += check(req.messages[0].role == "system" &&
+                          req.messages[0].content[0].text == "top-level system",
+                      "leading system turn carries only the top-level system text");
     failures += check(req.messages[1].role == "user" && req.messages[1].content[0].text == "hello",
                       "user turn preserved");
+    failures += check(req.messages[2].role == "system" &&
+                          req.messages[2].content[0].text == "reminder from messages",
+                      "late in-array system stayed in place");
+
+    // A system message that arrives before any conversation turn still merges into the leading
+    // block, so the top-level field and a leading reminder remain one turn.
+    const Json leading_body = {
+        {"model", "m"},
+        {"max_tokens", 16},
+        {"system", "top-level system"},
+        {"messages", Json::array({
+                         Json{{"role", "system"}, {"content", "leading reminder"}},
+                         Json{{"role", "user"}, {"content", "hello"}},
+                     })}};
+    const GenerationRequest lreq = parse_messages_request(leading_body, default_limits());
+    failures += check(lreq.messages.size() == 2, "leading system folded, user kept");
+    failures += check(lreq.messages[0].role == "system" &&
+                          lreq.messages[0].content[0].text ==
+                              "top-level system\nleading reminder",
+                      "top-level + leading in-array system merged in order");
 
     // Also works with array-of-text-blocks content and no top-level system.
     const Json blocks_body = {
@@ -180,9 +199,10 @@ int test_system_role_in_messages_folds() {
                               {"content", Json::array({Json{{"type", "text"}, {"text", "r"}}})}},
                      })}};
     const GenerationRequest breq = parse_messages_request(blocks_body, default_limits());
-    failures += check(breq.messages.size() == 2 && breq.messages[0].role == "system" &&
-                          breq.messages[0].content[0].text == "r",
-                      "in-array system text block folded without top-level system");
+    failures += check(breq.messages.size() == 2 && breq.messages[0].role == "user" &&
+                          breq.messages[1].role == "system" &&
+                          breq.messages[1].content[0].text == "r",
+                      "in-array system text block held its place without a top-level system");
     return failures;
 }
 
@@ -656,7 +676,7 @@ int main() {
     int failures = 0;
     failures += test_parse_basic_and_system();
     failures += test_parse_system_array_and_blocks();
-    failures += test_system_role_in_messages_folds();
+    failures += test_system_role_in_messages_placement();
     failures += test_missing_and_bad_fields();
     failures += test_parse_image();
     failures += test_tools_and_choice();
