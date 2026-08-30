@@ -305,24 +305,38 @@ void q6_rowsplit_gemm_mma_kernel(
 
     auto decode_weight = [&](int stage, int k_tile) {
         const int scale_group = (k_tile * BK) / Q6RowSplitStorage::kGroupK;
-        for (int local_row = warp; local_row < BM; local_row += Schedule::kWarps) {
-            auto* dst = &As[local_row * BK];
-#pragma unroll
-            for (int group = 0; group < GPB; ++group) {
-                const int staged_group = local_row * GPB + group;
-                const std::uint8_t* scale_ptr =
-                    &Sr[stage][staged_group * SB + (Schedule::kScaleLoadMode == Q6ScaleLoad::Pair32
-                                                        ? ((scale_group + group) & 1) *
-                                                              Q6RowSplitStorage::kScaleBytesPerGroup
-                                                        : 0)];
-                const float scale = __half2float(
-                    __ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scale_ptr)));
-                const __nv_bfloat162 weights = Q6MmaDecodeAtom::decode_pair_with_scale(
-                    Cr[stage], Hr[stage], scale, staged_group, lane);
-                const int shared_col =
-                    q6_mma_swizzle_k64(local_row, group * Q6RowSplitStorage::kGroupK + 2 * lane);
-                store_vec(&dst[shared_col], weights);
-            }
+        // q6_mma_swizzle_k64 permutes whole eight-element runs, so eight codes are the widest chunk that
+        // stays contiguous in As for every row, and the chunk lies inside one quantisation group.
+        // The loop is indexed by thread over chunks, so a thread reads its own scale halfword,
+        // decodes eight codes out of one 32-bit code word and stores them with one 16-byte store
+        // instead of four 4-byte ones.
+        constexpr int kChunks = Q6RowSplitStorage::kChunksPerGroup;
+        static_assert(GPB * kChunks * 8 == BK,
+                      "the block's groups must decode to exactly the tile's k width");
+        for (int item = tid; item < BM * GPB * kChunks; item += Schedule::kThreads) {
+            const int staged_group = item / kChunks;
+            const int chunk        = item - staged_group * kChunks;
+            const int local_row    = staged_group / GPB;
+            const int group        = staged_group - local_row * GPB;
+            const std::uint8_t* scale_ptr =
+                &Sr[stage][staged_group * SB + (Schedule::kScaleLoadMode == Q6ScaleLoad::Pair32
+                                                    ? ((scale_group + group) & 1) *
+                                                          Q6RowSplitStorage::kScaleBytesPerGroup
+                                                    : 0)];
+            const float scale =
+                __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scale_ptr)));
+            unsigned decoded[4];
+            Q6MmaDecodeAtom::decode_eight(
+                *reinterpret_cast<const unsigned*>(
+                    &Cr[stage][staged_group * Q6RowSplitStorage::kCodeBytesPerGroup +
+                               chunk * Q6RowSplitStorage::kCodeBytesPerChunk]),
+                &Hr[stage][staged_group * Q6RowSplitStorage::kHighBytesPerGroup +
+                           chunk * Q6RowSplitStorage::kHighBytesPerChunk],
+                scale, decoded);
+            store_vec(&As[local_row * BK +
+                          q6_mma_swizzle_k64(local_row, group * Q6RowSplitStorage::kGroupK + chunk * 8)],
+                      make_int4(static_cast<int>(decoded[0]), static_cast<int>(decoded[1]),
+                                static_cast<int>(decoded[2]), static_cast<int>(decoded[3])));
         }
     };
 

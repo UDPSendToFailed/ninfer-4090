@@ -13,6 +13,12 @@ struct Q4RowSplitStorage {
     static constexpr int kGroupK             = 64;
     static constexpr int kCodeBytesPerGroup  = 32;
     static constexpr int kScaleBytesPerGroup = 2;
+
+    // A chunk is the eight codes one thread decodes, so it spans four packed bytes.
+    static constexpr int kCodeBytesPerChunk = 4;
+    static constexpr int kChunksPerGroup    = kCodeBytesPerGroup / kCodeBytesPerChunk;
+    static_assert(kChunksPerGroup * kCodeBytesPerChunk == kCodeBytesPerGroup,
+                  "a group's codes must divide evenly into chunks");
 };
 
 struct Q4SimtDecodeAtom {
@@ -42,6 +48,23 @@ struct Q4SimtDecodeAtom {
 };
 
 struct Q4MmaDecodeAtom {
+    // Four packed bytes -> four bf16 pairs, in weight order; out[i] holds the pair
+    // decode_pair_with_scale produces at lane = 4 * chunk + i. A nibble n decodes to
+    // (n ^ 8) - 8, which is what bfe.s32 of a 4-bit field yields, so the sign extension, the
+    // float multiply by the group scale and the __floats2bfloat162_rn rounding are the same.
+    static __device__ __forceinline__ void decode_eight(unsigned word, float scale,
+                                                        unsigned (&out)[4]) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const unsigned byte        = (word >> (8 * i)) & 0xffu;
+            const int q0               = (static_cast<int>(byte & 0x0fu) ^ 0x08) - 0x08;
+            const int q1               = (static_cast<int>(byte >> 4) ^ 0x08) - 0x08;
+            const __nv_bfloat162 value = __floats2bfloat162_rn(static_cast<float>(q0) * scale,
+                                                               static_cast<float>(q1) * scale);
+            out[i]                     = *reinterpret_cast<const unsigned*>(&value);
+        }
+    }
+
     static __device__ __forceinline__ __nv_bfloat162 decode_pair(const std::uint8_t* codes,
                                                                  const std::uint8_t* scale_ptr,
                                                                  std::int64_t group_index,
