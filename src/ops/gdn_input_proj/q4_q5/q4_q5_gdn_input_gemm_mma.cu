@@ -36,7 +36,7 @@ RowSplitGroupedMmaJob make_job(const Weight& weight, std::int32_t weight_row_off
 void launch_slice(bool full, const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                   Tensor& qkv, Tensor& z, cudaStream_t stream) {
     constexpr std::int32_t kValueRows = 6144;
-    using Schedule                    = GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, true>;
+    using Schedule                    = GemmCfg<64, 128, 64, 32, 32, 2, 1, false, true, true>;
     const RowSplitGroupedMmaJob qk    = make_job(qk_weight, 0, qk_weight.n, qkv, 0);
     const RowSplitGroupedMmaJob value = make_job(value_z_weight, 0, kValueRows, qkv, qk_weight.n);
     const RowSplitGroupedMmaJob output_gate =
@@ -45,8 +45,9 @@ void launch_slice(bool full, const Tensor& x, const Weight& qk_weight, const Wei
     const int tiles = div_up(qk.n, Schedule::BM) + div_up(value.n, Schedule::BM) +
                       div_up(output_gate.n, Schedule::BM);
     const int cols = x.ne[1];
-    const dim3 grid(static_cast<unsigned>(tiles),
-                    static_cast<unsigned>(div_up(cols, Schedule::BN)));
+    // Column-tile-major CTA order; see rowsplit_grouped_mma.cuh.
+    const dim3 grid(static_cast<unsigned>(div_up(cols, Schedule::BN)),
+                    static_cast<unsigned>(tiles));
 
     if (full) {
         rowsplit_grouped_mma_kernel<Schedule, true, RowSplitGroupedMmaCodec::Mixed, 4>

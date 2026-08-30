@@ -153,8 +153,14 @@ void q5_rowsplit_gemm_mma_kernel(
     const int mma_row        = lane >> 2;
     const int mma_col        = lane & 3;
 
-    const int row0 = static_cast<int>(blockIdx.x) * BM;
-    const int col0 = static_cast<int>(blockIdx.y) * BN;
+    // CTA order is column-tile-major: blockIdx.x selects the token (column) tile and
+    // blockIdx.y the weight-row tile. The CTAs resident at any instant therefore span
+    // every column tile of a narrow band of weight rows, so each weight line is fetched
+    // from DRAM once and re-read from L2 by the other column tiles. Row-major order
+    // instead walks a fresh row band per column tile and re-streams the whole weight
+    // from DRAM once per column tile.
+    const int row0 = static_cast<int>(blockIdx.y) * BM;
+    const int col0 = static_cast<int>(blockIdx.x) * BN;
 
     float accum[MT][NT][4];
 #pragma unroll

@@ -4,6 +4,11 @@
 // rows followed by their 32 matching up rows.  One normal BM64 tensor-core
 // contraction therefore produces both projections in one accumulator array;
 // the warp's first and second row halves pair directly in the SiLU epilogue.
+//
+// A warp tile may split the block rows (WARPS_M > 1).  The fold is preserved by
+// giving each warp-row group the same 16-row slice of the gate half and of the
+// up half rather than a contiguous WM-row span: accumulator entries [0, MT/2)
+// hold gate rows and [MT/2, MT) hold their matching up rows for every WM.
 
 #include "ops/common/math.cuh"
 #include "ops/common/rowsplit_mma.cuh"
@@ -24,7 +29,6 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split
     constexpr int BM   = Cfg::BM;
     constexpr int BN   = Cfg::BN;
     constexpr int BK   = Cfg::BK;
-    constexpr int WM   = Cfg::WM;
     constexpr int WN   = Cfg::WN;
     constexpr int MT   = Cfg::MT;
     constexpr int NT   = Cfg::NT;
@@ -33,8 +37,10 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split
     constexpr int SB   = Cfg::SCALE_BYTES;
     constexpr int PM   = BM / 2;
     static_assert(BK == 64, "folded gate/up Q4 kernel requires one group per K tile");
-    static_assert(BM == 64 && WM == 64 && MT == 4,
-                  "folded gate/up mapping requires one 64-row warp tile");
+    static_assert(BM % 2 == 0 && MT % 2 == 0,
+                  "folded gate/up mapping needs an even number of 16-row MMA tiles per warp");
+    static_assert(Cfg::WARPS_M * (MT / 2) * 16 == BM / 2,
+                  "folded gate/up mapping must tile each half of the block exactly once");
 
     __shared__ __align__(16) __nv_bfloat16 As[BM * BK];
     __shared__ __align__(16) __nv_bfloat16 Bs[S][BN * BK];
@@ -45,11 +51,20 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
     const int lane = tid & 31;
-    const int wn   = warp;
-    const int gid  = lane >> 2;
-    const int lid  = lane & 3;
-    const int m0   = static_cast<int>(blockIdx.x) * PM;
-    const int t0   = static_cast<int>(blockIdx.y) * BN;
+    const int wn   = warp % Cfg::WARPS_N;
+    const int wm   = warp / Cfg::WARPS_N;
+    // 16-row MMA tile owned by this warp inside each of the two folded halves.
+    const int half_tile = wm * (MT / 2);
+    const int gid       = lane >> 2;
+    const int lid       = lane & 3;
+    // CTA order is column-tile-major: blockIdx.x selects the token (column) tile and
+    // blockIdx.y the weight-row tile. The CTAs resident at any instant therefore span
+    // every column tile of a narrow band of weight rows, so each weight line is fetched
+    // from DRAM once and re-read from L2 by the other column tiles. Row-major order
+    // instead walks a fresh row band per column tile and re-streams the whole weight
+    // from DRAM once per column tile.
+    const int m0        = static_cast<int>(blockIdx.y) * PM;
+    const int t0        = static_cast<int>(blockIdx.x) * BN;
 
     float acc[MT][NT][4];
 #pragma unroll
@@ -176,7 +191,8 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split
             const int ks = ki * 16;
 #pragma unroll
             for (int mi = 0; mi < MT; ++mi) {
-                const int arow = mi * 16 + a_rowoff;
+                const int arow =
+                    (mi >= MT / 2 ? PM : 0) + (half_tile + mi % (MT / 2)) * 16 + a_rowoff;
                 ldmatrix_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3],
                             smem_addr(&As[arow * BK + gemm_swz64(arow, ks + a_coloff)]));
             }
@@ -204,7 +220,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split
 
 #pragma unroll
     for (int mi = 0; mi < MT / 2; ++mi) {
-        const int r0 = m0 + mi * 16 + gid;
+        const int r0 = m0 + (half_tile + mi) * 16 + gid;
         const int r1 = r0 + 8;
 #pragma unroll
         for (int ni = 0; ni < NT; ++ni) {

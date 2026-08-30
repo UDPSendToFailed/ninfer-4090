@@ -25,7 +25,7 @@ using MmaR64C64Schedule =
     Q5RowSplitMmaGemmSchedule<64, 64, 64, 32, 32, 2, 3, Q5FragmentPipeline::PingPong, Cache::ca,
                               Cache::ca, Q5ScaleLoad::Scalar16>;
 using MmaR64C128Schedule =
-    Q5RowSplitMmaGemmSchedule<64, 128, 64, 64, 32, 2, 1, Q5FragmentPipeline::Serial, Cache::cg,
+    Q5RowSplitMmaGemmSchedule<64, 128, 64, 64, 16, 2, 3, Q5FragmentPipeline::Serial, Cache::cg,
                               Cache::cg, Q5ScaleLoad::Pair32>;
 
 template <class Schedule, bool Full>
@@ -39,8 +39,9 @@ void launch_kernel(const Tensor& x, const Weight& w, Tensor& residual_out, cudaS
     const std::int32_t k        = x.ne[0];
     const std::int32_t cols     = x.ne[1];
     const std::int32_t padded_k = w.padded_shape[1];
-    const dim3 grid(static_cast<unsigned>(div_up(rows, Schedule::kBlockRows)),
-                    static_cast<unsigned>(div_up(cols, Schedule::kBlockCols)), 1u);
+    // Column-tile-major CTA order; see q5_rowsplit_gemm_mma.cuh.
+    const dim3 grid(static_cast<unsigned>(div_up(cols, Schedule::kBlockCols)),
+                    static_cast<unsigned>(div_up(rows, Schedule::kBlockRows)), 1u);
 
     q5_rowsplit_gemm_mma_kernel<Schedule, Full, Q5MmaEpilogue::CtaCollectiveResidual>
         <<<grid, Schedule::kThreads, 0, stream>>>(xp, codes, high, scales, out, out, rows, k, cols,

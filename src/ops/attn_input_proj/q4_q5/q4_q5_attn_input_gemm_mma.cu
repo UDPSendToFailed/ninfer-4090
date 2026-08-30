@@ -37,8 +37,9 @@ void launch_pair(bool full, const Tensor& x, RowSplitGroupedMmaJob first,
                  RowSplitGroupedMmaJob second, cudaStream_t stream) {
     const int tiles = div_up(first.n, Schedule::BM) + div_up(second.n, Schedule::BM);
     const int cols  = x.ne[1];
-    const dim3 grid(static_cast<unsigned>(tiles),
-                    static_cast<unsigned>(div_up(cols, Schedule::BN)));
+    // Column-tile-major CTA order; see rowsplit_grouped_mma.cuh.
+    const dim3 grid(static_cast<unsigned>(div_up(cols, Schedule::BN)),
+                    static_cast<unsigned>(tiles));
     RowSplitGroupedMmaJob empty{};
 
     if (full) {
@@ -82,8 +83,9 @@ void launch(const Tensor& x, const Weight& query_key_weight, const Weight& gate_
     });
 }
 
-using MmaR16C64S3 = GemmCfg<16, 64, 64, 16, 16, 3, 1, false, true, true>;
-using MmaR32C64S4 = GemmCfg<32, 64, 64, 16, 16, 4, 1, false, true, true>;
+using MmaR16C64S3  = GemmCfg<16, 64, 64, 16, 16, 3, 1, false, true, true>;
+using MmaR32C64S4  = GemmCfg<32, 64, 64, 16, 16, 4, 1, false, true, true>;
+using MmaR64C128S2 = GemmCfg<64, 128, 64, 32, 32, 2, 1, false, true, true>;
 
 } // namespace
 
@@ -99,6 +101,14 @@ void q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(const Tensor& x, const Weigh
                                                     Tensor& gate, Tensor& k, Tensor& v,
                                                     cudaStream_t stream) {
     launch<MmaR32C64S4>(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
+}
+
+void q4_q5_attn_input_grouped_mma_r64_c128_s2_launch(const Tensor& x,
+                                                     const Weight& query_key_weight,
+                                                     const Weight& gate_value_weight, Tensor& q,
+                                                     Tensor& gate, Tensor& k, Tensor& v,
+                                                     cudaStream_t stream) {
+    launch<MmaR64C128S2>(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
 }
 
 } // namespace ninfer::ops::detail

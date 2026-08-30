@@ -13,14 +13,15 @@ namespace {
 
 using GateUpC40Cfg  = GemmCfg<64, 40, 64, 64, 8, 2, 1, false, true, true>;
 using GateUpC48Cfg  = GemmCfg<64, 48, 64, 64, 8, 2, 1, false, true, true>;
-using GateUpC128Cfg = GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, true>;
+using GateUpC128Cfg = GemmCfg<64, 128, 64, 32, 32, 2, 1, false, true, true>;
 
 template <class Cfg, bool Full>
 void launch_folded(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     constexpr int PM = Cfg::BM / 2;
     const int t      = x.ne[1];
-    const dim3 grid(static_cast<unsigned>(div_up(out.ne[0], PM)),
-                    static_cast<unsigned>(div_up(t, Cfg::BN)));
+    // Column-tile-major CTA order; see q4_linear_swiglu_gemm_mma.cuh.
+    const dim3 grid(static_cast<unsigned>(div_up(t, Cfg::BN)),
+                    static_cast<unsigned>(div_up(out.ne[0], PM)));
     if constexpr (Full) {
         q4_linear_swiglu_mma_split_half_pair_kernel<Cfg, true><<<grid, Cfg::THREADS, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),

@@ -59,8 +59,14 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
     __shared__ __align__(16) std::uint8_t Hr[S][BM * HB];
     __shared__ __align__(16) std::uint8_t Sr[S][BM * SB];
 
+    // CTA order is column-tile-major: blockIdx.x selects the token (column) tile and
+    // blockIdx.y the weight-row tile. The CTAs resident at any instant therefore span
+    // every column tile of a narrow band of weight rows, so each weight line is fetched
+    // from DRAM once and re-read from L2 by the other column tiles. Row-major order
+    // instead walks a fresh row band per column tile and re-streams the whole weight
+    // from DRAM once per column tile.
     const int tiles0 = div_up(job0.n, BM);
-    int tile         = static_cast<int>(blockIdx.x);
+    int tile         = static_cast<int>(blockIdx.y);
     RowSplitGroupedMmaJob job;
     if constexpr (Jobs == 2) {
         if (tile < tiles0) {
@@ -93,7 +99,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
     const int gid  = lane >> 2;
     const int lid  = lane & 3;
     const int m0   = tile * BM;
-    const int t0   = static_cast<int>(blockIdx.y) * BN;
+    const int t0   = static_cast<int>(blockIdx.x) * BN;
 
     float acc[MT][NT][4];
 #pragma unroll
