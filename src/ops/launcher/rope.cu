@@ -31,8 +31,12 @@ constexpr int kLargeBlock               = 256;
 constexpr int kFullChunkBlock           = 192;
 constexpr int kSmallBlock               = 128;
 constexpr int kDefaultChunkTargetTokens = 1024;
-// RTX 5090 has 170 SMs and admits six of these 256-thread CTAs per SM.
-constexpr int kLargeBlockWaveCapacity = 1020;
+// One CTA per token: the 256-thread block is the fastest choice only while the whole launch is
+// resident. Six of these CTAs fit per SM, so the wave ends at six times the device SM count;
+// past that the narrower full-chunk block wins.
+constexpr int kLargeBlockCtasPerSm = 6;
+
+int large_block_wave_capacity() { return kLargeBlockCtasPerSm * device_sm_count(); }
 
 template <RopeKernelMode Mode>
 inline constexpr bool kTextMode =
@@ -66,7 +70,7 @@ void launch_fixed(const Tensor& positions, Tensor* q, Tensor* k, cudaStream_t st
     if constexpr (kTextMode<Mode>) {
         if (tokens <= 6) {
             block = (QHeads + KHeads) * 32;
-        } else if (tokens <= kLargeBlockWaveCapacity) {
+        } else if (tokens <= large_block_wave_capacity()) {
             block = kLargeBlock;
         } else if (tokens <= kDefaultChunkTargetTokens) {
             block = kFullChunkBlock;

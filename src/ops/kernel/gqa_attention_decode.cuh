@@ -6,6 +6,7 @@
 // shared body) so each KV format can be optimized independently. This header owns
 // only what both share: layout constants, device helpers, and the split reducer.
 
+#include "core/device.h" // kTargetSmCount
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
@@ -104,9 +105,12 @@ __device__ __forceinline__ int gqa_small_t_active_splits(int window, int launch_
         } else if (tokens == 6 && window > 128 && window <= 160) {
             splits = div_up(window, 24 / Geometry::DecodeSplitScale);
         } else if (tokens == 6 && window > 5000 && window <= 8198) {
+            // Bc=64 is one CTA per SM on these shapes and the grid is
+            // (KVHeads, splits, batch), so one resident wave is exactly
+            // kTargetSmCount / KVHeads splits.
             splits             = div_up(window, 192 / Geometry::DecodeSplitScale);
             constexpr int kMin = 4 * Geometry::DecodeSplitScale;
-            constexpr int kMax = 42 * Geometry::DecodeSplitScale;
+            constexpr int kMax = kTargetSmCount / Geometry::KVHeads;
             splits             = splits > kMin ? splits : kMin;
             splits             = splits < kMax ? splits : kMax;
         } else {

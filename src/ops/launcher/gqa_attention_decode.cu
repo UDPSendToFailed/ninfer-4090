@@ -51,12 +51,13 @@ std::int32_t gqa_small_t_split_count(std::int32_t window, std::int32_t tokens, D
     if (kv_dtype == DType::I8 && tokens == 6 && window > 128 && window <= 160) {
         return div_up(window, 24 / Geometry::DecodeSplitScale);
     }
-    // Bc=64 is one CTA/SM on these model shapes. Keep the 8K grid at or below
-    // one 170-SM wave after accounting for the geometry's KV-head count.
+    // Bc=64 is one CTA/SM on these model shapes and the grid is (KVHeads, splits, batch), so
+    // keep the 8K grid at or below one wave of the build's target device. This mirrors
+    // gqa_small_t_active_splits() exactly and therefore reads the same compile-time SM count.
     if (kv_dtype == DType::I8 && tokens == 6 && window > 5000 && window <= 8198) {
         const std::int32_t splits   = div_up(window, 192 / Geometry::DecodeSplitScale);
         constexpr std::int32_t kMin = 4 * Geometry::DecodeSplitScale;
-        constexpr std::int32_t kMax = 42 * Geometry::DecodeSplitScale;
+        constexpr std::int32_t kMax = kTargetSmCount / Geometry::KVHeads;
         const std::int32_t clamped  = (splits > kMin) ? splits : kMin;
         return (clamped < kMax) ? clamped : kMax;
     }

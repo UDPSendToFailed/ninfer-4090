@@ -1302,6 +1302,16 @@ int run_geometry(const Geometry& geometry) {
             failures += run_a3_case(geometry, dtype, test_case, MappingPattern::Identity);
         }
 
+        if (dtype == DType::I8) {
+            // The six-token INT8 route caps its split count to one resident wave between 5000 and
+            // 8198 visible keys. No other case in this suite reaches that window, and the cap
+            // decides both the launched grid and the per-split key extent.
+            failures += run_a1_case(geometry, dtype, {6, 6994, 7000, 501u},
+                                    MappingPattern::Identity);
+            failures += run_a3_case(geometry, dtype, {6, 6994, 7000, 502u},
+                                    MappingPattern::Identity);
+        }
+
         if (geometry.q_heads == 16) {
             // Loose execution envelopes straddle the two registered host-resource frontiers.
             // Device positions, not these bounds, continue to define the oracle result.

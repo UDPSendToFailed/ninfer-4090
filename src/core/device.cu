@@ -43,6 +43,18 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     std::abort();
 }
 
+int device_sm_count() {
+    static const int count = [] {
+        int device_id = 0;
+        CUDA_CHECK(cudaGetDevice(&device_id));
+        int sm_count = 0;
+        CUDA_CHECK(
+            cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id));
+        return sm_count;
+    }();
+    return count;
+}
+
 DeviceContext::DeviceContext(int device_id) : device(device_id) {
     int count       = 0;
     cudaError_t err = cudaGetDeviceCount(&count);

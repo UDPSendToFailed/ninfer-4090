@@ -263,7 +263,7 @@ __global__ void sparse_moe_d3_path_tiled_kernel(
     const std::uint8_t* __restrict__ routed_scales, const std::uint8_t* __restrict__ shared_codes,
     const std::uint8_t* __restrict__ shared_scales, float* __restrict__ token_activations,
     int tokens, const int* __restrict__ adaptive_route_jobs) {
-    // Three path CTAs per token/output row expose enough blocks for the 170-SM target and keep the
+    // Three path CTAs per token/output row expose enough blocks to fill the device and keep the
     // heavier shared W8 path from holding eight completed routed warps resident.
     static_assert(PathsPerBlock > 0 && (kTopK + 1) % PathsPerBlock == 0);
     constexpr int kPathBlocks = (kTopK + 1) / PathsPerBlock;
