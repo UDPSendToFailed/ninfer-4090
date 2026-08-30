@@ -237,6 +237,15 @@ bool try_allocate_d3d12_residency_locked(std::size_t capacity_bytes, void*& out_
         cudaMemset(dev_ptr, 0, capacity_bytes);
     }
 
+    // The final zero-fill above is enqueued on the legacy default stream, which does not order
+    // against non-blocking streams such as DeviceContext::load_stream. Wait for it to land so
+    // stream-ordered weight copies cannot be wiped by the fill (silent all-zero weights).
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        cudaFree(dev_ptr);
+        cudaDestroyExternalMemory(ext_mem);
+        return false;
+    }
+
     out_ptr = dev_ptr;
     g_d3d12_allocations.push_back(std::move(res));
     return true;
@@ -362,6 +371,14 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
                 free_device(ptr);
                 throw std::runtime_error(cuda_error_message("cudaMemset failed", set_err));
             }
+            // The touch is enqueued on the legacy default stream, which does not order against
+            // non-blocking streams such as DeviceContext::load_stream. Wait for it to land so
+            // stream-ordered weight copies cannot be wiped by the fill.
+            const cudaError_t sync_err = cudaDeviceSynchronize();
+            if (sync_err != cudaSuccess) {
+                free_device(ptr);
+                throw std::runtime_error(cuda_error_message("cudaDeviceSynchronize failed", sync_err));
+            }
         }
 #endif
     }
@@ -462,9 +479,9 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     if (size_bytes == 0) { throw std::invalid_argument("PinnedHostBuffer size must be nonzero"); }
 
     void* ptr             = nullptr;
-    const cudaError_t err = cudaHostAlloc(&ptr, size_bytes, cudaHostAllocWriteCombined);
+    const cudaError_t err = cudaMallocHost(&ptr, size_bytes);
     if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaHostAlloc failed", err));
+        throw std::runtime_error(cuda_error_message("cudaMallocHost failed", err));
     }
 
     data_ = ptr;
