@@ -150,6 +150,47 @@ q5_simt_consume_slab(const __nv_bfloat16* __restrict__ x0, std::int64_t xslab, s
     }
 }
 
+// One dequant+accumulate step of the direct split2 schedule: 8 K-values of one
+// row (the lane's chunk phase) against kTt activation columns.
+//   word       : the lane's 4 packed nibble bytes
+//   high_bits  : the lane's high-plane byte (raw, pre-inversion)
+//   scale_bits : the group's fp16 scale, already broadcast across the group
+template <int kTt, int kStride>
+__device__ __forceinline__ void
+q5_split2_accumulate_chunk(std::uint32_t word, std::uint32_t high_bits, std::uint32_t scale_bits,
+                           const __nv_bfloat16* __restrict__ x, std::int64_t xoff,
+                           float (&acc)[kTt]) {
+    const std::uint32_t hc = high_bits ^ 0xffu;
+    const float scale = __half2float(__ushort_as_half(static_cast<std::uint16_t>(scale_bits)));
+    const __half2 bias = __half2half2(__ushort_as_half(0x6410)); // 1040.0
+    float w[8];
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        std::uint32_t bits = ((word >> (4 * p)) & 0x000f000fu) | 0x64006400u;
+        bits |= (((hc >> p) & 1u) << 4) | (((hc >> (p + 4)) & 1u) << 20);
+        const __half2 h = __hsub2(half2_from_bits(bits), bias);
+        const float2 f  = __half22float2(h);
+        w[p]            = f.x * scale;
+        w[p + 4]        = f.y * scale;
+    }
+#pragma unroll
+    for (int tt = 0; tt < kTt; ++tt) {
+        const uint4 xv  = load_vec<uint4>(x + static_cast<std::int64_t>(tt) * kStride + xoff);
+        const float2 f0 = bf16x2_bits_to_float2(xv.x);
+        const float2 f1 = bf16x2_bits_to_float2(xv.y);
+        const float2 f2 = bf16x2_bits_to_float2(xv.z);
+        const float2 f3 = bf16x2_bits_to_float2(xv.w);
+        acc[tt]         = fmaf(w[0], f0.x, acc[tt]);
+        acc[tt]         = fmaf(w[1], f0.y, acc[tt]);
+        acc[tt]         = fmaf(w[2], f1.x, acc[tt]);
+        acc[tt]         = fmaf(w[3], f1.y, acc[tt]);
+        acc[tt]         = fmaf(w[4], f2.x, acc[tt]);
+        acc[tt]         = fmaf(w[5], f2.y, acc[tt]);
+        acc[tt]         = fmaf(w[6], f3.x, acc[tt]);
+        acc[tt]         = fmaf(w[7], f3.y, acc[tt]);
+    }
+}
+
 template <class SC, int kTt, int kFullSlabs, int kStride, bool SplitOutput = false,
           int SplitRow = 0, bool AddResidual = false>
 __launch_bounds__(64, 16) __global__
@@ -185,55 +226,98 @@ __launch_bounds__(64, 16) __global__
 #pragma unroll
     for (int i = 0; i < kTt; ++i) { acc[i] = 0.0f; }
 
-#pragma unroll
-    for (int s = 0; s < kFullSlabs; ++s) {
-#pragma unroll
-        for (int local = 0; local < 2; ++local) {
-            const int chunk = part * 2 + local;
-            const std::uint8_t* code_phase =
-                code_row + static_cast<std::int64_t>(s) * 512 + chunk * 128 + lane * 4;
-            const std::uint8_t* high_phase =
-                high_row + static_cast<std::int64_t>(s) * 128 + chunk * 32 + lane;
-            const int group_in_slab  = chunk * 4 + (lane >> 3);
-            std::uint32_t scale_bits = 0;
-            if ((lane & 7) == 0) {
-                scale_bits = *reinterpret_cast<const std::uint16_t*>(
-                    scale_row + (static_cast<std::int64_t>(s) * 16 + group_in_slab) * 2);
-            }
-            scale_bits = __shfl_sync(0xffffffffu, scale_bits, lane & ~7);
+    // Slab schedule.
+    //
+    // kFullSlabs is a compile-time constant, so nvcc fully unrolls the K sweep
+    // by default. At K=17408 (kFullSlabs=17, kTt=5) that is ~4100 SASS
+    // instructions = 64 KB of code executed exactly once per block, which
+    // overruns the SM instruction cache and costs real bandwidth. Rolling the
+    // loop back up shrinks the body to ~10 KB, but ptxas does not
+    // software-pipeline the global loads across the back edge under -rdc=true
+    // (which this project builds with), so a naive rolled loop stalls on DRAM
+    // latency and is *slower* than the unrolled form. Issuing slab s+1's three
+    // weight-plane loads by hand, into registers, before consuming slab s
+    // restores the memory-level parallelism explicitly, so both properties hold
+    // at once.
+    //
+    // This only pays when the K sweep is long enough to overrun the instruction
+    // cache and the column tile is wide enough that the rolled schedule still
+    // saturates DRAM; on the short K=6144 sweep the extra live registers spill
+    // instead. Measured on RTX 4090 / sm_89, 5120xK Q5 linear_add, cold L2,
+    // repo build flags (-rdc=true, -lineinfo), median of 25-60 launches, us:
+    //
+    //   K=17408   kTt=2  kTt=3  kTt=4  kTt=5  kTt=8  kTt=12  kTt=14  kTt=16
+    //   unrolled   91.0   92.7  100.2  107.5  128.1   192.9   219.1   234.5
+    //   rolled     90.8   93.2   98.3  100.5  132.8   167.9   183.3   207.9
+    //
+    // so the rolled schedule is gated to kFullSlabs > 8 && kTt >= 4; every other
+    // instantiation keeps the fully unrolled body unchanged. Deeper prefetch
+    // (2-3 slabs) and unroll factors 1/3/4/5 all measured slower. Results are
+    // bit-identical either way: the accumulation order does not change.
+    constexpr bool kRollSlabs = kFullSlabs > 8 && kTt >= 4;
 
-            const std::uint32_t word = *reinterpret_cast<const std::uint32_t*>(code_phase);
-            const std::uint32_t hc   = static_cast<std::uint32_t>(*high_phase) ^ 0xffu;
-            const float scale        = __half2float(__ushort_as_half(scale_bits));
-            const __half2 bias       = __half2half2(__ushort_as_half(0x6410)); // 1040.0
-            float w[8];
-#pragma unroll
-            for (int p = 0; p < 4; ++p) {
-                std::uint32_t bits = ((word >> (4 * p)) & 0x000f000fu) | 0x64006400u;
-                bits |= (((hc >> p) & 1u) << 4) | (((hc >> (p + 4)) & 1u) << 20);
-                const __half2 h = __hsub2(half2_from_bits(bits), bias);
-                const float2 f  = __half22float2(h);
-                w[p]            = f.x * scale;
-                w[p + 4]        = f.y * scale;
-            }
+    if constexpr (kRollSlabs) {
+        // Lane-invariant slice bases; a slab is a fixed stride off each.
+        const std::uint8_t* code_base  = code_row + part * 256 + lane * 4;
+        const std::uint8_t* high_base  = high_row + part * 64 + lane;
+        const std::uint8_t* scale_base = scale_row + part * 16 + (lane >> 3) * 2;
 
-            const std::int64_t xoff = static_cast<std::int64_t>(s) * 1024 + chunk * 256 + lane * 8;
+        std::uint32_t next_word[2];
+        std::uint32_t next_high[2];
+        std::uint32_t next_scale[2];
+        const auto issue_slab = [&](int s) {
 #pragma unroll
-            for (int tt = 0; tt < kTt; ++tt) {
-                const uint4 xv =
-                    load_vec<uint4>(x + static_cast<std::int64_t>(tt) * kStride + xoff);
-                const float2 f0 = bf16x2_bits_to_float2(xv.x);
-                const float2 f1 = bf16x2_bits_to_float2(xv.y);
-                const float2 f2 = bf16x2_bits_to_float2(xv.z);
-                const float2 f3 = bf16x2_bits_to_float2(xv.w);
-                acc[tt]         = fmaf(w[0], f0.x, acc[tt]);
-                acc[tt]         = fmaf(w[1], f0.y, acc[tt]);
-                acc[tt]         = fmaf(w[2], f1.x, acc[tt]);
-                acc[tt]         = fmaf(w[3], f1.y, acc[tt]);
-                acc[tt]         = fmaf(w[4], f2.x, acc[tt]);
-                acc[tt]         = fmaf(w[5], f2.y, acc[tt]);
-                acc[tt]         = fmaf(w[6], f3.x, acc[tt]);
-                acc[tt]         = fmaf(w[7], f3.y, acc[tt]);
+            for (int local = 0; local < 2; ++local) {
+                next_word[local] = *reinterpret_cast<const std::uint32_t*>(
+                    code_base + static_cast<std::int64_t>(s) * 512 + local * 128);
+                next_high[local] = *(high_base + static_cast<std::int64_t>(s) * 128 + local * 32);
+                next_scale[local] = *reinterpret_cast<const std::uint16_t*>(
+                    scale_base + static_cast<std::int64_t>(s) * 32 + local * 8);
+            }
+        };
+        issue_slab(0);
+
+#pragma unroll 2
+        for (int s = 0; s < kFullSlabs; ++s) {
+            std::uint32_t word[2];
+            std::uint32_t high_bits[2];
+            std::uint32_t scale_bits[2];
+#pragma unroll
+            for (int local = 0; local < 2; ++local) {
+                word[local]       = next_word[local];
+                high_bits[local]  = next_high[local];
+                scale_bits[local] = next_scale[local];
+            }
+            if (s + 1 < kFullSlabs) { issue_slab(s + 1); }
+#pragma unroll
+            for (int local = 0; local < 2; ++local) {
+                const int chunk = part * 2 + local;
+                q5_split2_accumulate_chunk<kTt, kStride>(
+                    word[local], high_bits[local], scale_bits[local], x,
+                    static_cast<std::int64_t>(s) * 1024 + chunk * 256 + lane * 8, acc);
+            }
+        }
+    } else {
+#pragma unroll
+        for (int s = 0; s < kFullSlabs; ++s) {
+#pragma unroll
+            for (int local = 0; local < 2; ++local) {
+                const int chunk = part * 2 + local;
+                const std::uint8_t* code_phase =
+                    code_row + static_cast<std::int64_t>(s) * 512 + chunk * 128 + lane * 4;
+                const std::uint8_t* high_phase =
+                    high_row + static_cast<std::int64_t>(s) * 128 + chunk * 32 + lane;
+                const int group_in_slab  = chunk * 4 + (lane >> 3);
+                std::uint32_t scale_bits = 0;
+                if ((lane & 7) == 0) {
+                    scale_bits = *reinterpret_cast<const std::uint16_t*>(
+                        scale_row + (static_cast<std::int64_t>(s) * 16 + group_in_slab) * 2);
+                }
+                scale_bits = __shfl_sync(0xffffffffu, scale_bits, lane & ~7);
+                q5_split2_accumulate_chunk<kTt, kStride>(
+                    *reinterpret_cast<const std::uint32_t*>(code_phase),
+                    static_cast<std::uint32_t>(*high_phase), scale_bits, x,
+                    static_cast<std::int64_t>(s) * 1024 + chunk * 256 + lane * 8, acc);
             }
         }
     }

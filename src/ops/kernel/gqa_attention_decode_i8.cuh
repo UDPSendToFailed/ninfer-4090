@@ -443,20 +443,21 @@ __launch_bounds__(WarpsPerCta * 32, (WarpsPerCta <= 4 ? 2 : 1)) __global__
     const int b_rin    = lane & 7;
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
+    // Every lane of a four-lane quad wants the same q scale, and q_scale_tmp is
+    // zero-filled over the whole Br x Groups tile, so each lane reads its own row
+    // straight out of shared memory. The former "read on lid == 0, then
+    // __shfl_sync(.., gid * 4)" broadcast cost a dynamic-index shuffle per group,
+    // which ptxas has to guard with a divergence check and an out-of-line ABI
+    // helper call under -rdc; a shared-memory broadcast is one conflict-free LDS.
     float q_scale_r0[Groups];
     float q_scale_r1[Groups];
     if (warp < RowTiles) {
+        // warp < RowTiles and gid <= 7, so producer_row0 + 8 <= Br - 1.
         const int producer_row0 = warp * 16 + gid;
 #pragma unroll
         for (int g = 0; g < Groups; ++g) {
-            float qs0     = (lid == 0 && producer_row0 < RowCount)
-                                ? q_scale_tmp[producer_row0 * Groups + g]
-                                : 0.0f;
-            float qs1     = (lid == 0 && producer_row0 + 8 < RowCount)
-                                ? q_scale_tmp[(producer_row0 + 8) * Groups + g]
-                                : 0.0f;
-            q_scale_r0[g] = __shfl_sync(FullMask, qs0, gid * 4);
-            q_scale_r1[g] = __shfl_sync(FullMask, qs1, gid * 4);
+            q_scale_r0[g] = q_scale_tmp[producer_row0 * Groups + g];
+            q_scale_r1[g] = q_scale_tmp[(producer_row0 + 8) * Groups + g];
         }
     }
 
@@ -515,16 +516,12 @@ __launch_bounds__(WarpsPerCta * 32, (WarpsPerCta <= 4 ? 2 : 1)) __global__
                         mma_s8(c0, c1, c2, c3, af[kk][0], af[kk][1], af[kk][2], af[kk][3], bf[0],
                                bf[1]);
                     }
-                    const int keya = nt * 8 + 2 * lid;
-                    const int keyb = keya + 1;
-                    float ka       = 0.0f;
-                    float kb2      = 0.0f;
-                    if (gid == 0) {
-                        ka  = __half2float(k_scale_s[keya * Groups + g]);
-                        kb2 = __half2float(k_scale_s[keyb * Groups + g]);
-                    }
-                    ka  = __shfl_sync(FullMask, ka, lid);
-                    kb2 = __shfl_sync(FullMask, kb2, lid);
+                    // keya/keyb depend only on lid, so the eight lanes sharing a lid
+                    // read one address: an LDS broadcast, not a dynamic-index shuffle.
+                    const int keya  = nt * 8 + 2 * lid;
+                    const int keyb  = keya + 1;
+                    const float ka  = __half2float(k_scale_s[keya * Groups + g]);
+                    const float kb2 = __half2float(k_scale_s[keyb * Groups + g]);
                     score[nt][0] += q_scale_r0[g] * ka * static_cast<float>(c0);
                     score[nt][1] += q_scale_r0[g] * kb2 * static_cast<float>(c1);
                     score[nt][2] += q_scale_r1[g] * ka * static_cast<float>(c2);
@@ -618,10 +615,8 @@ __launch_bounds__(WarpsPerCta * 32, (WarpsPerCta <= 4 ? 2 : 1)) __global__
                 const int key      = k0 + key_l;
                 __nv_bfloat16* dst = &v_bf16[key_l * D + gqa_small_t_tc_swz(key_l, d)];
                 if (key >= split_start && key < split_end) {
-                    const int grp = d >> 6;
-                    float vs      = 0.0f;
-                    if ((lane & 7) == 0) { vs = __half2float(v_scale_s[key_l * Groups + grp]); }
-                    vs = __shfl_sync(FullMask, vs, grp * 8);
+                    const int grp  = d >> 6;
+                    const float vs = __half2float(v_scale_s[key_l * Groups + grp]);
                     store_vec(dst, gqa_kv_dequant_i8x8_from(&v_i8[key_l * D + d], vs));
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
