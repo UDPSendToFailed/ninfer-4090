@@ -126,8 +126,38 @@ void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& value
     case 6:
         launch_q5_split4<6>(x, weight, value, z, stream);
         return;
+    case 7:
+        launch_q5_split4<7>(x, weight, value, z, stream);
+        return;
+    case 8:
+        launch_q5_split4<8>(x, weight, value, z, stream);
+        return;
+    case 9:
+        launch_q5_split4<9>(x, weight, value, z, stream);
+        return;
+    case 10:
+        launch_q5_split4<10>(x, weight, value, z, stream);
+        return;
+    case 11:
+        launch_q5_split4<11>(x, weight, value, z, stream);
+        return;
+    case 12:
+        launch_q5_split4<12>(x, weight, value, z, stream);
+        return;
+    case 13:
+        launch_q5_split4<13>(x, weight, value, z, stream);
+        return;
+    case 14:
+        launch_q5_split4<14>(x, weight, value, z, stream);
+        return;
+    case 15:
+        launch_q5_split4<15>(x, weight, value, z, stream);
+        return;
+    case 16:
+        launch_q5_split4<16>(x, weight, value, z, stream);
+        return;
     default:
-        throw std::invalid_argument("GDN Q5 split4 requires T in [2,6]");
+        throw std::invalid_argument("GDN Q5 split4 requires T in [2,16]");
     }
 }
 
@@ -157,12 +187,10 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
         launch_q5_gemv(x, weight, value, z, stream);
         return;
     }
-    if (x.ne[1] <= 6) {
-        launch_q5_split4_exact(x, weight, value, z, stream);
-        return;
-    }
+    // split4 covers the whole SIMT band. Above T=6 the r8_c8 route it replaced cost 1.2x more on
+    // the value_z projection at every width an MTP verify step reaches.
     if (x.ne[1] <= 16) {
-        launch_q5_simt_r8_c8(x, weight, value, z, stream);
+        launch_q5_split4_exact(x, weight, value, z, stream);
         return;
     }
     throw std::invalid_argument("Q4/Q5 GDN independent launch requires T in [1,16]");
