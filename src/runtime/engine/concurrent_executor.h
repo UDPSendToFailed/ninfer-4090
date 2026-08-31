@@ -519,6 +519,13 @@ private:
 
     void invalidate_lane_plans(std::uint32_t lane) noexcept { ++lane_plan_versions_[lane]; }
 
+    [[nodiscard]] bool any_lane_active_except(std::uint32_t lane) const noexcept {
+        for (std::uint32_t other = 0; other < max_concurrency_; ++other) {
+            if (other != lane && slots_[other] != nullptr) { return true; }
+        }
+        return false;
+    }
+
     void remove_completed_slot(std::uint32_t lane) {
         slots_[lane].reset();
         invalidate_lane_plans(lane);
@@ -811,7 +818,23 @@ private:
                 }
             }
             if (!instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
-                throw std::logic_error("retained eviction did not make admission feasible");
+                // The lane plan was built against an earlier view of the page pool: concurrent
+                // checkpoint restores and snapshot saves can consume pages between planning and
+                // admission. Evicting every free retained lane was not enough, which is a
+                // scheduling shortfall rather than a broken engine, so drop the stale plan
+                // instead of throwing (an escaped exception here fails the whole executor).
+                invalidate_lane_plans(lane);
+                if (!any_lane_active_except(lane)) {
+                    // No other lane holds pages, so waiting cannot free any more: this request
+                    // does not fit the configured KV capacity at all.
+                    return remove_pending_error(
+                        request, std::make_exception_ptr(RequestError(
+                                     RequestErrorKind::ContextLengthExceeded,
+                                     "request reservation exceeds Engine shared KV capacity")));
+                }
+                // Active lanes still hold the pages we need. Leave the request pending and retry
+                // once they drain; its pending deadline bounds the wait.
+                return AdmissionProgress::ControlProgress;
             }
         }
 
