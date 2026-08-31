@@ -258,6 +258,15 @@ __launch_bounds__(64, (kTt <= 3 || (kStride <= 6144 && kTt <= 6)) ? 16 : 8) __gl
     // instantiation keeps the fully unrolled body unchanged. Deeper prefetch
     // (2-3 slabs) and unroll factors 1/3/4/5 all measured slower. Results are
     // bit-identical either way: the accumulation order does not change.
+    //
+    // The table above was taken under the previous fixed occupancy target, which
+    // capped this kernel at 64 registers. The launch bound is now a function of
+    // the column tile, so the wide tiles get 128, and the rolled body's manual
+    // prefetch no longer spills. The gate was re-verified against the new bound
+    // and still holds, but two rows moved: kTt=8 now favours rolled (116.9 vs
+    // 125.9 unrolled) where the table has it losing, and kTt=12/16 are close to
+    // a tie rather than a clear rolled win. kTt=3 still prefers unrolled
+    // (94.3 vs 101.8), which is what keeps the threshold at 4.
     constexpr bool kRollSlabs = kFullSlabs > 8 && kTt >= 4;
 
     if constexpr (kRollSlabs) {
