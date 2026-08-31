@@ -193,7 +193,11 @@ q5_split2_accumulate_chunk(std::uint32_t word, std::uint32_t high_bits, std::uin
 
 template <class SC, int kTt, int kFullSlabs, int kStride, bool SplitOutput = false,
           int SplitRow = 0, bool AddResidual = false>
-__launch_bounds__(64, 16) __global__
+// Accumulator count scales with the column tile, so the occupancy target has to as well. At 16
+// blocks ptxas is capped at 64 registers, which the wide tiles cannot hold: they spill, and the
+// spill costs more than the extra warps buy on a kernel this bandwidth-bound. Narrow tiles fit
+// inside 64 and prefer the warps.
+__launch_bounds__(64, (kTt <= 3 || (kStride <= 6144 && kTt <= 6)) ? 16 : 8) __global__
     void q5_rowsplit_gemm_simt_split2_kernel(const __nv_bfloat16* __restrict__ x,
                                              const std::uint8_t* __restrict__ codes,
                                              const std::uint8_t* __restrict__ high,
@@ -369,7 +373,9 @@ struct Q5Split4StoreEpilogue {
 template <class SC, int kTt, int kFullSlabs, int kStride, bool SplitOutput = false,
           int SplitRow = 0, class Epilogue = Q5Split4StoreEpilogue, bool TriggerPdl = false,
           bool JoinPdl = false>
-__launch_bounds__(128, 10) __global__ void q5_rowsplit_gemm_simt_split4_kernel(
+// Same trade as the split2 bound above: the wide column tiles need more registers than a 10-block
+// target leaves them, and the spill costs more than the extra warps return.
+__launch_bounds__(128, kTt <= 5 ? 10 : 8) __global__ void q5_rowsplit_gemm_simt_split4_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
     __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ out_tail, std::int32_t n,
