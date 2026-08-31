@@ -993,14 +993,16 @@ private:
                 out.flush();
                 out.close();
 
-                if (cancel_requested_.load(std::memory_order_acquire)) {
-                    std::error_code ec;
-                    std::filesystem::remove(temp_path, ec);
-                    std::cout << "[info] ninfer: [prompt-cache] aborted in-flight snapshot save tokens="
-                              << task.header.token_count << " (discarded temp file)\n" << std::flush;
-                    continue;
-                }
-
+                // Deliberately not cancelled here. cancel_requested_ is a latency-priority signal
+                // raised when a request arrives - it does not invalidate the snapshot, whose data was
+                // captured before the task was queued. By this point the expensive work is already
+                // spent: the missing pages are committed to the shared journal and the manifest is
+                // written and flushed. All that remains is a remove and a rename, microseconds of
+                // filesystem metadata. Discarding here forfeited 100-160 ms of completed I/O per save
+                // and, worse, orphaned the pages just appended - they stayed in the pool with no
+                // manifest referencing them. Under sustained load that starved the index of recent
+                // checkpoints, so restores matched stale early turns and re-prefilled the remainder.
+                // The pre-work check above is the one that genuinely avoids cost; once past it, finish.
                 std::error_code ec;
                 std::filesystem::remove(task.manifest_path, ec);
                 std::filesystem::rename(temp_path, task.manifest_path, ec);
