@@ -89,6 +89,9 @@ public:
     [[nodiscard]] LoadSummary load_summary() const;
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
+
+    // False once the executor has failed or begun shutting down; such a state is permanent.
+    [[nodiscard]] bool healthy() const;
     void reset_memory_peaks() noexcept;
 
 private:

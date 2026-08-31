@@ -93,6 +93,8 @@ public:
 
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
+    [[nodiscard]] bool engine_healthy() const { return engine_ && engine_->healthy(); }
+
     [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const {
         return engine_->sampling_defaults();
     }

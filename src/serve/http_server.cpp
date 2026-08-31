@@ -259,8 +259,13 @@ void HttpServer::register_routes() {
             }
         });
 
-    server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
-        res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
+    // Report the executor's own state: a latched failure is permanent, so answering "ok"
+    // here leaves a process that 503s every request looking healthy to any supervisor.
+    server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
+        const bool ready = service_ == nullptr || service_->engine_healthy();
+        res.status        = ready ? 200 : 503;
+        res.set_content(nlohmann::json{{"status", ready ? "ok" : "error"}}.dump(),
+                        "application/json");
     });
     server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
         res.set_content(metrics_.render(options_.max_concurrency), "text/plain; version=0.0.4");
