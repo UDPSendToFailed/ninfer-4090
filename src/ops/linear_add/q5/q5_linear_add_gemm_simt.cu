@@ -39,7 +39,11 @@ void launch_split2_rows(const Tensor& x, const Weight& w, Tensor& residual_out,
 template <int Cols>
 void dispatch_shape(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t stream) {
     if (w.k == 6144) {
-        launch_split2<Cols, 6, 6144>(x, w, residual_out, stream);
+        if constexpr (Cols >= 8) {
+            launch_split2_rows<2, Cols, 6, 6144>(x, w, residual_out, stream);
+        } else {
+            launch_split2<Cols, 6, 6144>(x, w, residual_out, stream);
+        }
     } else if (w.k == 17408) {
         // Two rows per CTA share one widened activation, which is only worth its extra
         // accumulators once the column tile is wide enough. Measured crossover on this geometry is
