@@ -92,8 +92,31 @@ void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& value, Tensor
 }
 
 template <int Cols>
+void launch_q5_split4_rows(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+                           cudaStream_t stream) {
+    constexpr int kThreads    = 4 * 32;
+    constexpr int kRows       = 2;
+    const std::int32_t out_ld = static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16));
+    const dim3 grid(static_cast<unsigned>(div_up(kValueZRows, kRows)), 1u, 1u);
+    q5_rowsplit_gemm_simt_split4_rows_kernel<Q5RowSplitSimtSchedule, kRows, Cols, 5, kHidden, true,
+                                             kValueRows><<<grid, kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.qhigh),
+        static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(value.data),
+        static_cast<__nv_bfloat16*>(z.data), kValueZRows, out_ld, kHidden, Cols,
+        weight.padded_shape[1], 5);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <int Cols>
 void launch_q5_split4(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
                       cudaStream_t stream) {
+    // Two rows per CTA share one widened activation. Below eight columns the extra accumulators
+    // cost more than the shared conversion saves, so the single-row kernel stays.
+    if constexpr (Cols >= 8) {
+        launch_q5_split4_rows<Cols>(x, weight, value, z, stream);
+        return;
+    }
     constexpr int kThreads    = 4 * 32;
     const std::int32_t out_ld = static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16));
     const dim3 grid(static_cast<unsigned>(kValueZRows), 1u, 1u);

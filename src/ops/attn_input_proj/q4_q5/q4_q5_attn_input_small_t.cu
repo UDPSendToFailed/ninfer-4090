@@ -108,8 +108,29 @@ void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& gate, Tensor&
 }
 
 template <int Cols>
+void launch_q5_split4_rows(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
+                           cudaStream_t stream) {
+    constexpr int kThreads = 4 * 32;
+    constexpr int kRows    = 2;
+    const dim3 grid(static_cast<unsigned>(div_up(kParentRows, kRows)), 1u, 1u);
+    q5_rowsplit_gemm_simt_split4_rows_kernel<Q5RowSplitSimtSchedule, kRows, Cols, 5, kHidden, true,
+                                             kSplitRow><<<grid, kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.qhigh),
+        static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(gate.data),
+        static_cast<__nv_bfloat16*>(value.data), kParentRows, gate.ne[0], kHidden, Cols,
+        weight.padded_shape[1], 5);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <int Cols>
 void launch_q5_split4(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
                       cudaStream_t stream) {
+    // Same eight-column crossover as the GDN value_z projection.
+    if constexpr (Cols >= 8) {
+        launch_q5_split4_rows<Cols>(x, weight, gate, value, stream);
+        return;
+    }
     constexpr int kThreads = 4 * 32;
     const dim3 grid(static_cast<unsigned>(kParentRows), 1u, 1u);
     q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, Cols, 5, kHidden, true, kSplitRow>
