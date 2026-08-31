@@ -141,8 +141,38 @@ void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& gate,
     case 6:
         launch_q5_split4<6>(x, weight, gate, value, stream);
         return;
+    case 7:
+        launch_q5_split4<7>(x, weight, gate, value, stream);
+        return;
+    case 8:
+        launch_q5_split4<8>(x, weight, gate, value, stream);
+        return;
+    case 9:
+        launch_q5_split4<9>(x, weight, gate, value, stream);
+        return;
+    case 10:
+        launch_q5_split4<10>(x, weight, gate, value, stream);
+        return;
+    case 11:
+        launch_q5_split4<11>(x, weight, gate, value, stream);
+        return;
+    case 12:
+        launch_q5_split4<12>(x, weight, gate, value, stream);
+        return;
+    case 13:
+        launch_q5_split4<13>(x, weight, gate, value, stream);
+        return;
+    case 14:
+        launch_q5_split4<14>(x, weight, gate, value, stream);
+        return;
+    case 15:
+        launch_q5_split4<15>(x, weight, gate, value, stream);
+        return;
+    case 16:
+        launch_q5_split4<16>(x, weight, gate, value, stream);
+        return;
     default:
-        throw std::invalid_argument("attention Q5 split4 requires T in [2,6]");
+        throw std::invalid_argument("attention Q5 split4 requires T in [2,16]");
     }
 }
 
@@ -171,7 +201,7 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& valu
         launch_q5_gemv(x, weight, gate, value, stream);
         return;
     }
-    if (x.ne[1] <= 6) {
+    if (x.ne[1] <= 16) {
         launch_q5_split4_exact(x, weight, gate, value, stream);
         return;
     }

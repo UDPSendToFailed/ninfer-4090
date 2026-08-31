@@ -88,7 +88,9 @@ int run_q4_q5() {
         quantized_weight::make_patterned_weight(QType::Q5G64_F16S, kParent, kHidden, 107U));
 
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 16, 17, 21, 48}) {
+    // 6/7 straddle the former Q5 split4 ceiling; 8 and 12 are interior widths an MTP verify
+    // step reaches at K=7 and K=11.
+    for (const std::int32_t tokens : {1, 2, 6, 7, 8, 12, 16, 17, 21, 48}) {
         failures += run_q4_q5_case(query_key, gate_value, tokens);
     }
     return failures;
