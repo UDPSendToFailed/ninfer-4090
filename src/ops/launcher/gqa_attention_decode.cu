@@ -54,7 +54,7 @@ std::int32_t gqa_small_t_split_count(std::int32_t window, std::int32_t tokens, D
     // Bc=64 is one CTA/SM on these model shapes and the grid is (KVHeads, splits, batch), so
     // keep the 8K grid at or below one wave of the build's target device. This mirrors
     // gqa_small_t_active_splits() exactly and therefore reads the same compile-time SM count.
-    if (kv_dtype == DType::I8 && tokens == 6 && window > 5000 && window <= 8198) {
+    if (kv_dtype == DType::I8 && tokens >= 1 && tokens <= 6 && window > 4096 && window <= 8198) {
         const std::int32_t splits   = div_up(window, 192 / Geometry::DecodeSplitScale);
         constexpr std::int32_t kMin = 4 * Geometry::DecodeSplitScale;
         constexpr std::int32_t kMax = kTargetSmCount / Geometry::KVHeads;
@@ -179,11 +179,11 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         if constexpr (Geometry::GroupSize == 6) {
             // Two Q row tiles for the 27B group of six (RowTiles = 2).
             if (implementation_window > 128 && implementation_window <= 512) {
-                launch.template operator()<8, 1, 32, false>();
+                launch.template operator()<8, 2, 32, false>();
             } else if (implementation_window <= 1029) {
-                launch.template operator()<8, 1, 32, false>();
+                launch.template operator()<8, 2, 32, false>();
             } else {
-                launch.template operator()<8, 1, 32, false>();
+                launch.template operator()<8, 2, 32, false>();
             }
         } else {
             // Three Q row tiles for the 35B group of eight (RowTiles = 3).
@@ -200,12 +200,12 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     } else if constexpr (TokenTile == 4) {
         // Two Q row tiles (RowTiles = 2).
         if (implementation_window <= 1029) {
-            launch.template operator()<8, 1, 32, false>();
+            launch.template operator()<8, 2, 32, false>();
         } else {
-            launch.template operator()<8, 1, 32, false>();
+            launch.template operator()<8, 2, 32, false>();
         }
     } else {
-        launch.template operator()<8, 1, 32, false>();
+        launch.template operator()<8, 2, 32, false>();
     }
     CUDA_CHECK(cudaGetLastError());
 }

@@ -1303,12 +1303,20 @@ int run_geometry(const Geometry& geometry) {
         }
 
         if (dtype == DType::I8) {
-            // The six-token INT8 route caps its split count to one resident wave between 5000 and
-            // 8198 visible keys. No other case in this suite reaches that window, and the cap
-            // decides both the launched grid and the per-split key extent.
-            failures += run_a1_case(geometry, dtype, {6, 6994, 7000, 501u},
+            // Sizing the INT8 split count to one resident wave between 4096 and 8198 visible keys
+            // covers tokens 1..6 (including T=1 MTP draft and T=5 speculative verification).
+            // Test both A1 and A3 routes across T=1, T=5, and T=6 in this window.
+            failures += run_a1_case(geometry, dtype, {1, 5630, 5631, 500u},
                                     MappingPattern::Identity);
-            failures += run_a3_case(geometry, dtype, {6, 6994, 7000, 502u},
+            failures += run_a3_case(geometry, dtype, {1, 5630, 5631, 501u},
+                                    MappingPattern::Identity);
+            failures += run_a1_case(geometry, dtype, {5, 5626, 5631, 502u},
+                                    MappingPattern::Identity);
+            failures += run_a3_case(geometry, dtype, {5, 5626, 5631, 503u},
+                                    MappingPattern::Identity);
+            failures += run_a1_case(geometry, dtype, {6, 6994, 7000, 504u},
+                                    MappingPattern::Identity);
+            failures += run_a3_case(geometry, dtype, {6, 6994, 7000, 505u},
                                     MappingPattern::Identity);
         }
 
