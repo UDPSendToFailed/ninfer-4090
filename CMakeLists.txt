@@ -64,6 +64,7 @@ endif()
 # measured as no gain (<0.25%, within run-to-run noise) and they alter floating-point results.
 add_compile_options(
   $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>           # Print exact register usage and .local stack spills
+  $<$<COMPILE_LANGUAGE:CUDA>:--split-compile=0>    # Parallelize cicc/ptxas compiler optimizations across all CPU cores
 )
 
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "86")

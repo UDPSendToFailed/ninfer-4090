@@ -126,7 +126,7 @@ Open PowerShell and initialize the MSVC x64 developer environment to configure a
 
 #### 1. Configure and Build Full Suite
 ```powershell
-cmd /c "call ""C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"" && set NVCC_PREPEND_FLAGS=--split-compile=0 && cmake -B build-ninja -G Ninja -DNINFER_BUILD_BENCHMARKS=ON && ninja -C build-ninja -j 32"
+cmd /c "call ""C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"" && cmake -B build-ninja -G Ninja -DNINFER_BUILD_BENCHMARKS=ON && ninja -C build-ninja -j 32"
 ```
 
 #### 2. Run Full Test Suite
