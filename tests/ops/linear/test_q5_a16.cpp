@@ -16,31 +16,31 @@ int q5_a16_conformance() {
     int failures = 0;
 
     constexpr std::array kN1024K5120{
-        convenience(1), a16(4), a16(5), a16(16), a16(17), a16(128),
+        convenience(1), a16(2), a16(3), a16(4), a16(5), a16(7), a16(8), a16(12), a16(16), a16(17), a16(128),
     };
     failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5g64_f16s_weight,
                           {1024, 5120, 151U, Comparison::Full, true, kN1024K5120});
 
     constexpr std::array kN6144K5120{
-        a16(1), a16(2), a16(6), a16(7), a16(24), a16(25), a16(64), a16(65), a16(128),
+        a16(1), a16(2), a16(3), a16(4), a16(5), a16(6), a16(7), a16(8), a16(12), a16(16), a16(24), a16(25), a16(64), a16(65), a16(128),
     };
     failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5g64_f16s_weight,
                           {6144, 5120, 157U, Comparison::Sampled, false, kN6144K5120});
 
     constexpr std::array kN7168K5120{
-        a16(1), a16(2), a16(6), a16(7), a16(16), a16(17), a16(128),
+        a16(1), a16(2), a16(3), a16(4), a16(5), a16(6), a16(7), a16(8), a16(12), a16(16), a16(17), a16(128),
     };
     failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5g64_f16s_weight,
                           {7168, 5120, 163U, Comparison::Sampled, false, kN7168K5120});
 
     constexpr std::array kN5120K6144{
-        a16(1), a16(2), a16(6), a16(7), a16(24), a16(25), a16(128),
+        a16(1), a16(2), a16(3), a16(4), a16(5), a16(6), a16(7), a16(8), a16(12), a16(16), a16(24), a16(25), a16(128),
     };
     failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5g64_f16s_weight,
                           {5120, 6144, 167U, Comparison::Sampled, false, kN5120K6144});
 
     constexpr std::array kN5120K17408{
-        a16(1), a16(2), a16(6), a16(7), a16(24), a16(25), a16(128),
+        a16(1), a16(2), a16(3), a16(4), a16(5), a16(6), a16(7), a16(8), a16(12), a16(16), a16(24), a16(25), a16(128),
     };
     failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5g64_f16s_weight,
                           {5120, 17408, 173U, Comparison::Sampled, false, kN5120K17408});
