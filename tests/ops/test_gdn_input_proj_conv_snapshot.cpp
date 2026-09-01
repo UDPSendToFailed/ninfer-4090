@@ -520,6 +520,7 @@ int run_q4_q5() {
         const std::int32_t initial_slot = tokens == 5 ? 0 : tokens + 1;
         failures += run_q4_q5_case(query_key, value_z_weight, tokens, initial_slot);
     }
+    failures += run_q4_q5_case(query_key, value_z_weight, 5, 3);
     constexpr std::int32_t kValueRows    = 6144;
     constexpr std::int32_t kZRows        = 6144;
     constexpr std::int32_t kChannels     = 10240;

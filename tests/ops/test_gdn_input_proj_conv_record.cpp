@@ -234,6 +234,8 @@ int run_q4_q5() {
     };
     failures += run(2, 1, {}, 1411U);
     failures += run(4, 1, {3}, 1421U);
+    failures += run(5, 1, {}, 1425U);
+    failures += run(5, 1, {4}, 1426U);
     failures += run(7, 1, {5}, 1431U);
     failures += run(16, 1, {}, 1441U);
     failures += run(6, 8, {6, 5, 4, 3, 2, 1, 6, 2}, 1451U);

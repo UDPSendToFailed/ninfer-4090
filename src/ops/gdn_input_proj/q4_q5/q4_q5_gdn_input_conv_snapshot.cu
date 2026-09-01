@@ -7,8 +7,10 @@
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "ops/linear/q4/q4_rowsplit_gemm_simt.cuh"
 #include "ops/linear/q4/q4_rowsplit_gemv.cuh"
+#include "ops/linear/q4/q4_small_t_mma.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemv.cuh"
+#include "ops/linear/q5/q5_small_t_mma.cuh"
 
 #include <cuda_bf16.h>
 
@@ -122,6 +124,94 @@ struct Q5GdnSmallTEpilogue {
             for (int token = 0; token < Tokens; ++token) {
                 z[static_cast<std::int64_t>(token) * kZRows + row - kValueRows] =
                     __float2bfloat16_rn(values[token]);
+            }
+        }
+    }
+};
+
+template <int Tokens, class Publish>
+struct Q4GdnMmaConvEpilogue {
+    static constexpr bool kIsTileEpilogue = true;
+    GdnConvEpilogue<Publish> conv;
+
+    template <int ActiveCols, int TileCols, int OutputRows>
+    __device__ __forceinline__ void store_tile(float* smem_raw, int row0, int gid, int lane,
+                                               float (&acc)[TileCols / 8][4]) const {
+        static_assert(Tokens == ActiveCols);
+        constexpr int kNt = TileCols / 8;
+        auto* smem = reinterpret_cast<float(*)[TileCols]>(smem_raw);
+
+        const int col_base = (lane & 3) * 2;
+#pragma unroll
+        for (int nt = 0; nt < kNt; ++nt) {
+            const int col0 = nt * 8 + col_base;
+            const int col1 = col0 + 1;
+            smem[gid][col0]     = acc[nt][0];
+            smem[gid][col1]     = acc[nt][1];
+            smem[gid + 8][col0] = acc[nt][2];
+            smem[gid + 8][col1] = acc[nt][3];
+        }
+
+        __syncwarp();
+
+        if (lane < 16) {
+            const int local_row = row0 + lane;
+            if (local_row < OutputRows) {
+                float projected[Tokens];
+#pragma unroll
+                for (int t = 0; t < Tokens; ++t) {
+                    projected[t] = smem[lane][t];
+                }
+                conv.store(local_row, projected);
+            }
+        }
+    }
+};
+
+template <int Tokens, class Publish>
+struct Q5GdnMmaConvEpilogue {
+    static constexpr bool kIsTileEpilogue = true;
+    GdnConvEpilogue<Publish> conv;
+    __nv_bfloat16* z;
+
+    template <int ActiveCols, int TileCols, int OutputRows>
+    __device__ __forceinline__ void store_tile(float* smem_raw, int row0, int gid, int lane,
+                                               float (&acc)[TileCols / 8][4]) const {
+        static_assert(Tokens == ActiveCols);
+        constexpr int kNt = TileCols / 8;
+        auto* smem = reinterpret_cast<float(*)[TileCols]>(smem_raw);
+
+        const int col_base = (lane & 3) * 2;
+#pragma unroll
+        for (int nt = 0; nt < kNt; ++nt) {
+            const int col0 = nt * 8 + col_base;
+            const int col1 = col0 + 1;
+            smem[gid][col0]     = acc[nt][0];
+            smem[gid][col1]     = acc[nt][1];
+            smem[gid + 8][col0] = acc[nt][2];
+            smem[gid + 8][col1] = acc[nt][3];
+        }
+
+        __syncwarp();
+
+        if (lane < 16) {
+            const int local_row = row0 + lane;
+            if (local_row < OutputRows) {
+                float projected[Tokens];
+#pragma unroll
+                for (int t = 0; t < Tokens; ++t) {
+                    projected[t] = smem[lane][t];
+                }
+
+                if (local_row < kValueRows) {
+                    conv.store(local_row, projected);
+                } else {
+#pragma unroll
+                    for (int t = 0; t < Tokens; ++t) {
+                        z[static_cast<std::int64_t>(t) * kZRows + (local_row - kValueRows)] =
+                            __float2bfloat16_rn(projected[t]);
+                    }
+                }
             }
         }
     }
@@ -289,6 +379,56 @@ void launch_small_t_schedule(const Tensor& x, const Weight& qk_weight, const Wei
 }
 
 template <int Tokens, PdlOrder Order, class Publish>
+void launch_small_t_mma(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                        const GdnConvEpilogue<Publish>& qk_epilogue,
+                        const GdnConvEpilogue<Publish>& value_epilogue, Tensor& query, Tensor& value,
+                        Tensor& z, cudaStream_t stream) {
+    constexpr int TileCols = Tokens <= 8 ? 8 : 16;
+    using Q4Geometry = Q4SmallTGeometry<kQkRows, kHidden>;
+    using Q5Geometry = Q5SmallTGeometry<kValueZRows, kHidden>;
+    using Q4Epilogue = Q4GdnMmaConvEpilogue<Tokens, Publish>;
+    using Q5Epilogue = Q5GdnMmaConvEpilogue<Tokens, Publish>;
+
+    constexpr int kQ4Blocks = kQkRows / Q4DraftSmallTSchedule::kRowsPerCta; // 4096 / 16 = 256
+    constexpr int kQ5Blocks = kValueZRows / Q5SmallTSchedule::kRowsPerCta;  // 12288 / 16 = 768
+
+    const auto in_ld    = static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16));
+    const auto value_ld = static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16));
+
+    const Q4Epilogue q4_epilogue{qk_epilogue};
+    const Q5Epilogue q5_epilogue{value_epilogue, static_cast<__nv_bfloat16*>(z.data)};
+
+    const auto launch_q4 = [&] {
+        q4_small_t_mma_kernel<Q4Geometry, TileCols, Tokens, Q4Epilogue>
+            <<<kQ4Blocks, Q4DraftSmallTSchedule::kThreads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(qk_weight.qdata),
+                static_cast<const std::uint8_t*>(qk_weight.scales),
+                static_cast<__nv_bfloat16*>(query.data),
+                q4_epilogue);
+    };
+
+    const auto launch_q5 = [&] {
+        q5_small_t_mma_kernel<Q5Geometry, TileCols, Tokens, Q5Epilogue>
+            <<<kQ5Blocks, Q5SmallTSchedule::kThreads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(value_z_weight.qdata),
+                static_cast<const std::uint8_t*>(value_z_weight.qhigh),
+                static_cast<const std::uint8_t*>(value_z_weight.scales),
+                static_cast<__nv_bfloat16*>(value.data),
+                in_ld, value_ld, q5_epilogue);
+    };
+
+    if constexpr (Order == PdlOrder::Q5ThenQ4) {
+        launch_q5();
+        launch_q4();
+    } else {
+        launch_q4();
+        launch_q5();
+    }
+}
+
+template <int Tokens, PdlOrder Order, class Publish>
 void launch_small_t(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                     const GdnConvEpilogue<Publish>& qk_epilogue,
                     const GdnConvEpilogue<Publish>& value_epilogue, Tensor& query, Tensor& value,
@@ -319,20 +459,20 @@ void launch_conv(const Tensor& x, const Weight& qk_weight, const Weight& value_z
                                   value, z, stream);
         break;
     case 2:
-        launch_small_t<2, Order, Publish>(x, qk_weight, value_z_weight, qk_epilogue, value_epilogue,
-                                          query, value, z, stream);
+        launch_small_t_mma<2, Order, Publish>(x, qk_weight, value_z_weight, qk_epilogue,
+                                              value_epilogue, query, value, z, stream);
         break;
     case 3:
-        launch_small_t<3, Order, Publish>(x, qk_weight, value_z_weight, qk_epilogue, value_epilogue,
-                                          query, value, z, stream);
+        launch_small_t_mma<3, Order, Publish>(x, qk_weight, value_z_weight, qk_epilogue,
+                                              value_epilogue, query, value, z, stream);
         break;
     case 5:
-        launch_small_t<5, Order, Publish>(x, qk_weight, value_z_weight, qk_epilogue, value_epilogue,
-                                          query, value, z, stream);
+        launch_small_t_mma<5, Order, Publish>(x, qk_weight, value_z_weight, qk_epilogue,
+                                              value_epilogue, query, value, z, stream);
         break;
     case 6:
-        launch_small_t<6, Order, Publish>(x, qk_weight, value_z_weight, qk_epilogue, value_epilogue,
-                                          query, value, z, stream);
+        launch_small_t_mma<6, Order, Publish>(x, qk_weight, value_z_weight, qk_epilogue,
+                                              value_epilogue, query, value, z, stream);
         break;
     default:
         throw std::invalid_argument("Q4/Q5 projection-epilogue GDN conv requires T=1..3 or 5..6");
