@@ -5,13 +5,17 @@
 #include "ops/common/math.h"
 #include "ops/linear/q4/q4_rowsplit_gemm_simt.cuh"
 #include "ops/linear/q4/q4_rowsplit_gemv.cuh"
+#include "ops/linear/q4/q4_small_t_mma.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemv.cuh"
+#include "ops/linear/q5/q5_small_t_mma.cuh"
 
 #include <cuda_bf16.h>
 
+#include <array>
 #include <cstdint>
 #include <stdexcept>
+#include <utility>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -61,17 +65,43 @@ void launch_q4_simt_route(const Tensor& x, const Weight& weight, Tensor& out, cu
     }
 }
 
+template <int ActiveCols>
+void launch_q4_gdn_small_t_mma_active(const Tensor& x, const Weight& weight, Tensor& out,
+                                      cudaStream_t stream) {
+    constexpr int TileCols = ActiveCols <= 8 ? 8 : 16;
+    using Geometry         = Q4SmallTGeometry<kQkRows, kHidden>;
+    using Epilogue         = Q4SmallTStrideEpilogue;
+    constexpr int kBlocks  = kQkRows / Q4DraftSmallTSchedule::kRowsPerCta; // 4096 / 16 = 256
+    const auto out_ld      = static_cast<std::int32_t>(out.nb[1] / sizeof(__nv_bfloat16));
+    const Epilogue epilogue{static_cast<__nv_bfloat16*>(out.data), out_ld};
+
+    q4_small_t_mma_kernel<Geometry, TileCols, ActiveCols, Epilogue>
+        <<<kBlocks, Q4DraftSmallTSchedule::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales),
+            static_cast<__nv_bfloat16*>(out.data), epilogue);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+using Q4GdnSmallTLauncher = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+
+template <std::size_t... Offsets>
+constexpr auto make_q4_gdn_small_t_launchers(std::index_sequence<Offsets...>) {
+    return std::array<Q4GdnSmallTLauncher, sizeof...(Offsets)>{
+        &launch_q4_gdn_small_t_mma_active<2 + static_cast<int>(Offsets)>...};
+}
+
+constexpr auto kQ4GdnSmallTLaunchers =
+    make_q4_gdn_small_t_launchers(std::make_index_sequence<15>{}); // 2..16
+
 void launch_q4(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     if (x.ne[1] == 1) {
         launch_q4_gemv(x, weight, out, stream);
         return;
     }
-    if (x.ne[1] <= 4) {
-        launch_q4_simt_route<Q4GdnSimtR8C4Schedule>(x, weight, out, stream);
-        return;
-    }
     if (x.ne[1] <= 16) {
-        launch_q4_simt_route<Q4GdnSimtR8C8Schedule>(x, weight, out, stream);
+        kQ4GdnSmallTLaunchers[static_cast<std::size_t>(x.ne[1] - 2)](x, weight, out, stream);
         return;
     }
     throw std::invalid_argument("Q4/Q5 GDN independent launch requires T in [1,16]");
@@ -204,50 +234,50 @@ void launch_q5_simt_r8_c8(const Tensor& x, const Weight& weight, Tensor& value, 
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <int ActiveCols>
+void launch_q5_gdn_small_t_mma_active(const Tensor& x, const Weight& weight, Tensor& value,
+                                      Tensor& z, cudaStream_t stream) {
+    constexpr int TileCols = ActiveCols <= 8 ? 8 : 16;
+    using Geometry         = Q5SmallTGeometry<kValueZRows, kHidden>;
+    using Epilogue         = Q5SmallTSplitEpilogue<kValueRows>;
+    constexpr int kBlocks  = kValueZRows / Q5SmallTSchedule::kRowsPerCta; // 12288 / 16 = 768
+    const auto in_ld       = static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16));
+    const auto value_ld    = static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16));
+    const auto z_ld        = static_cast<std::int32_t>(z.nb[1] / sizeof(__nv_bfloat16));
+    const Epilogue epilogue{static_cast<__nv_bfloat16*>(z.data), z_ld};
+
+    q5_small_t_mma_kernel<Geometry, TileCols, ActiveCols, Epilogue>
+        <<<kBlocks, Q5SmallTSchedule::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.qhigh),
+            static_cast<const std::uint8_t*>(weight.scales),
+            static_cast<__nv_bfloat16*>(value.data), in_ld, value_ld, epilogue);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+using Q5GdnSmallTLauncher = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, cudaStream_t);
+
+template <std::size_t... Offsets>
+constexpr auto make_q5_gdn_small_t_launchers(std::index_sequence<Offsets...>) {
+    return std::array<Q5GdnSmallTLauncher, sizeof...(Offsets)>{
+        &launch_q5_gdn_small_t_mma_active<2 + static_cast<int>(Offsets)>...};
+}
+
+constexpr auto kQ5GdnSmallTLaunchers =
+    make_q5_gdn_small_t_launchers(std::make_index_sequence<15>{}); // 2..16
+
 void launch_q5(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
                cudaStream_t stream) {
     if (x.ne[1] == 1) {
         launch_q5_gemv(x, weight, value, z, stream);
         return;
     }
-    // split4 covers the whole SIMT band. Above T=6 the r8_c8 route it replaced cost 1.2x more on
-    // the value_z projection at every width an MTP verify step reaches.
     if (x.ne[1] <= 16) {
-        launch_q5_split4_exact(x, weight, value, z, stream);
+        kQ5GdnSmallTLaunchers[static_cast<std::size_t>(x.ne[1] - 2)](x, weight, value, z, stream);
         return;
     }
     throw std::invalid_argument("Q4/Q5 GDN independent launch requires T in [1,16]");
-}
-
-void launch_t4_pdl(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
-                   Tensor& qk, Tensor& value, Tensor& z, cudaStream_t stream) {
-    using Q4Schedule         = Q4GdnSimtR8C4Schedule;
-    constexpr int kQ5Threads = 4 * 32;
-    const dim3 q4_grid(kQkRows / Q4Schedule::kRowsPerCta, 1u, 1u);
-    const dim3 q5_grid(kValueZRows, 1u, 1u);
-    const std::int32_t q4_out_ld = static_cast<std::int32_t>(qk.nb[1] / sizeof(__nv_bfloat16));
-    const std::int32_t q5_out_ld = static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16));
-
-    // Q5 and Q4 publish disjoint row ranges. Q4 can execute while Q5 drains and joins Q5 only at
-    // exit, before the following convolution/snapshot kernel becomes runnable.
-    q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, 4, 5, kHidden, true, kValueRows,
-                                        Q5Split4StoreEpilogue, true, false>
-        <<<q5_grid, kQ5Threads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(value_z_weight.qdata),
-            static_cast<const std::uint8_t*>(value_z_weight.qhigh),
-            static_cast<const std::uint8_t*>(value_z_weight.scales),
-            static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data),
-            kValueZRows, q5_out_ld, kHidden, 4, value_z_weight.padded_shape[1], 5);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(pdl::launch_dependent(
-        {q4_grid, dim3(Q4Schedule::kThreads), 0, stream},
-        q4_rowsplit_gemm_simt_kernel<Q4Schedule, true, false, 0, Q4SimtStoreEpilogue, false, true>,
-        static_cast<const __nv_bfloat16*>(x.data),
-        static_cast<const std::uint8_t*>(qk_weight.qdata),
-        static_cast<const std::uint8_t*>(qk_weight.scales), static_cast<__nv_bfloat16*>(qk.data),
-        nullptr, q4_out_ld, 0, kQkRows, kHidden, 4, qk_weight.padded_shape[1],
-        Q4SimtStoreEpilogue{}));
 }
 
 } // namespace
@@ -255,10 +285,6 @@ void launch_t4_pdl(const Tensor& x, const Weight& qk_weight, const Weight& value
 void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,
                                         Tensor& z, cudaStream_t stream) {
-    if (x.ne[1] == 4) {
-        launch_t4_pdl(x, qk_weight, value_z_weight, qk, value, z, stream);
-        return;
-    }
     launch_q4(x, qk_weight, qk, stream);
     launch_q5(x, value_z_weight, value, z, stream);
 }
