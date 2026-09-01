@@ -34,13 +34,13 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& residual_
                                                 : 48;
 #if defined(NINFER_SM86) || defined(NINFER_SM89)
     constexpr int KWarps = ActiveCols <= 24 ? 8 : 4;
+    constexpr int MinBlocks = KWarps == 4 ? 4 : 2;
 #else
     constexpr int KWarps =
         Hidden == 4096 ? (ActiveCols <= 12 ? 16 : 8) : (ActiveCols <= 32 ? 8 : 4);
-#endif
     constexpr int MinBlocks = Hidden == 4096 ? (KWarps == 16 ? 1 : 2) : (ActiveCols <= 32 ? 2 : 3);
-    constexpr auto ScaleAccess =
-        ActiveCols > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
+#endif
+    constexpr auto ScaleAccess = W8SmallTMmaScaleAccess::Shared;
     constexpr auto ActivationCache =
         Hidden == 4096 && (ActiveCols == 4 || (ActiveCols >= 27 && ActiveCols <= 40)) ? Cache::cg
                                                                                       : Cache::ca;

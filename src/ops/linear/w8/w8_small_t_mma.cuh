@@ -178,7 +178,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
 
     int read_buf = 0;
 
-    constexpr int kGroupUnroll = kHidden <= 6144 ? kGroups : 12;
+    constexpr int kGroupUnroll = kGroups <= 8 ? kGroups : 4;
 #pragma unroll kGroupUnroll
     for (int group_index = 0; group_index < kGroups; ++group_index) {
         const int group_k0 = group_index * kGroupK;

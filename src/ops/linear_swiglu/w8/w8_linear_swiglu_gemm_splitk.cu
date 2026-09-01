@@ -55,12 +55,11 @@ void launch_active_cols(const Tensor& x, const Weight& w, Tensor& out, cudaStrea
                              : ActiveCols <= 32 ? 32
                              : ActiveCols <= 40 ? 40
                                                 : 48;
-    constexpr auto ScaleAccess =
-        ActiveCols > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
+    constexpr auto ScaleAccess = W8SmallTMmaScaleAccess::Shared;
     using Geometry = W8LinearGeometry<2 * kIntermediate, kHidden>;
     using Schedule =
         std::conditional_t<(ActiveCols <= 32), W8SmallTMmaDefaultSchedule<TileCols, ActiveCols>,
-                           W8SmallTMmaSchedule<4, TileCols, 3, ScaleAccess>>;
+                           W8SmallTMmaSchedule<4, TileCols, 4, ScaleAccess>>;
     const W8ContiguousOutput ignored_output{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
     const W8SwiGluExactTEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
     const W8SwiGluExactTRows row_policy{kIntermediate};

@@ -35,13 +35,12 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& out, cuda
     constexpr int MinBlocks = 2;
 #elif defined(NINFER_SM89)
     constexpr int KWarps    = ActiveCols <= 24 ? 8 : 4;
-    constexpr int MinBlocks = 2;
+    constexpr int MinBlocks = KWarps == 4 ? 4 : 2;
 #else
     constexpr int KWarps    = ActiveCols <= 36 ? 16 : 8;
     constexpr int MinBlocks = KWarps == 16 ? 1 : 2;
 #endif
-    constexpr auto ScaleAccess =
-        ActiveCols > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
+    constexpr auto ScaleAccess = W8SmallTMmaScaleAccess::Shared;
     constexpr auto ActivationCache = ActiveCols <= 36 || ActiveCols == 48 ? Cache::cg : Cache::ca;
     using Geometry                 = W8LinearGeometry<kRows, kHidden>;
     using Schedule = W8SmallTMmaSchedule<KWarps, TileCols, MinBlocks, ScaleAccess, ActivationCache>;

@@ -56,11 +56,11 @@ struct W8SmallTMmaSchedule {
 template <int TileTokens, int ActiveTokens>
 using W8SmallTMmaDefaultSchedule = W8SmallTMmaSchedule<
 #if defined(NINFER_SM86) || defined(NINFER_SM89)
-    (TileTokens <= 24 ? 8 : 4), TileTokens, 2,
+    (TileTokens <= 24 ? 8 : 4), TileTokens, (TileTokens <= 24 ? 2 : 4),
 #else
     8, TileTokens, TileTokens == 8 ? 5 : (TileTokens == 16 ? 4 : (TileTokens == 24 ? 3 : 2)),
 #endif
-    (ActiveTokens > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct)>;
+    W8SmallTMmaScaleAccess::Shared>;
 
 using W8VocabularyProjectionGeometry   = W8LinearGeometry<248320, 5120>;
 using W8MtpInputProjectionGeometry     = W8LinearGeometry<5120, 10240>;
@@ -99,9 +99,9 @@ struct W8LinearSmallTProductionSchedule<W8VocabularyProjectionGeometry, ActiveTo
                                        : ActiveTokens <= 32 ? 32
                                                             : 40;
     static constexpr int kKWarps     = ActiveTokens <= 24 ? 8 : 4;
-    static constexpr auto kScaleAccess =
-        ActiveTokens > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
-    using Type = W8SmallTMmaSchedule<kKWarps, kTileTokens, 2, kScaleAccess>;
+    static constexpr auto kScaleAccess = W8SmallTMmaScaleAccess::Shared;
+    static constexpr int kMinBlocks  = kKWarps == 4 ? 4 : 2;
+    using Type = W8SmallTMmaSchedule<kKWarps, kTileTokens, kMinBlocks, kScaleAccess>;
 };
 
 template <int ActiveTokens>
@@ -116,9 +116,9 @@ struct W8LinearSmallTProductionSchedule<W8MtpInputProjectionGeometry, ActiveToke
                                        : ActiveTokens <= 40 ? 40
                                                             : 48;
     static constexpr int kKWarps     = ActiveTokens <= 24 ? 8 : 4;
-    static constexpr auto kScaleAccess =
-        ActiveTokens > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
-    using Type = W8SmallTMmaSchedule<kKWarps, kTileTokens, 2, kScaleAccess>;
+    static constexpr auto kScaleAccess = W8SmallTMmaScaleAccess::Shared;
+    static constexpr int kMinBlocks  = kKWarps == 4 ? 4 : 2;
+    using Type = W8SmallTMmaSchedule<kKWarps, kTileTokens, kMinBlocks, kScaleAccess>;
 };
 
 template <int ActiveTokens>
@@ -134,9 +134,9 @@ struct W8LinearSmallTProductionSchedule<W8MtpAttentionProjectionGeometry, Active
                                                             : 48;
     static constexpr int kKWarps =
         ActiveTokens <= 4 || (ActiveTokens >= 17 && ActiveTokens <= 22) ? 8 : 4;
-    static constexpr auto kScaleAccess =
-        ActiveTokens > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
-    using Type = W8SmallTMmaSchedule<kKWarps, kTileTokens, 3, kScaleAccess>;
+    static constexpr auto kScaleAccess = W8SmallTMmaScaleAccess::Shared;
+    static constexpr int kMinBlocks  = kKWarps == 4 ? 4 : (kKWarps == 8 ? 2 : 3);
+    using Type = W8SmallTMmaSchedule<kKWarps, kTileTokens, kMinBlocks, kScaleAccess>;
 };
 
 template <int ActiveTokens>
@@ -151,9 +151,9 @@ struct W8LinearSmallTProductionSchedule<W8MtpAttentionOutputGeometry, ActiveToke
                                        : ActiveTokens <= 40 ? 40
                                                             : 48;
     static constexpr int kKWarps     = ActiveTokens <= 24 ? 8 : 4;
-    static constexpr auto kScaleAccess =
-        ActiveTokens > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
-    using Type = W8SmallTMmaSchedule<kKWarps, kTileTokens, 2, kScaleAccess, Cache::ca, Cache::cg,
+    static constexpr auto kScaleAccess = W8SmallTMmaScaleAccess::Shared;
+    static constexpr int kMinBlocks  = kKWarps == 4 ? 4 : 2;
+    using Type = W8SmallTMmaSchedule<kKWarps, kTileTokens, kMinBlocks, kScaleAccess, Cache::ca, Cache::cg,
                                      W8SmallTMmaActivationStage::PaddedZero>;
 };
 
@@ -168,13 +168,13 @@ struct W8LinearSmallTProductionSchedule<W8MtpGateUpProjectionGeometry, ActiveTok
                                        : ActiveTokens <= 32 ? 32
                                                             : 40;
     static constexpr int kKWarps     = ActiveTokens >= 22 && ActiveTokens <= 24 ? 8 : 4;
-    static constexpr auto kScaleAccess =
-        ActiveTokens > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
+    static constexpr auto kScaleAccess = W8SmallTMmaScaleAccess::Shared;
     static constexpr auto kActivationStage =
         ActiveTokens <= 4 || (ActiveTokens >= 9 && ActiveTokens <= 15)
             ? W8SmallTMmaActivationStage::PaddedZero
             : W8SmallTMmaActivationStage::ActiveOnly;
-    using Type = W8SmallTMmaSchedule<kKWarps, kTileTokens, 2, kScaleAccess, Cache::ca, Cache::cg,
+    static constexpr int kMinBlocks = kKWarps == 4 ? 4 : 2;
+    using Type = W8SmallTMmaSchedule<kKWarps, kTileTokens, kMinBlocks, kScaleAccess, Cache::ca, Cache::cg,
                                      kActivationStage>;
 };
 
@@ -190,9 +190,8 @@ struct W8LinearSmallTProductionSchedule<W8MtpDownProjectionGeometry, ActiveToken
                                        : ActiveTokens <= 40 ? 40
                                                             : 48;
     static constexpr int kKWarps     = ActiveTokens <= 24 ? 8 : 4;
-    static constexpr int kMinBlocks  = kKWarps == 8 ? 2 : 3;
-    static constexpr auto kScaleAccess =
-        ActiveTokens > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
+    static constexpr int kMinBlocks  = kKWarps == 4 ? 4 : 2;
+    static constexpr auto kScaleAccess = W8SmallTMmaScaleAccess::Shared;
     using Type = W8SmallTMmaSchedule<kKWarps, kTileTokens, kMinBlocks, kScaleAccess>;
 };
 
@@ -212,9 +211,8 @@ struct W8LinearSmallTProductionSchedule<W835bMtpProjectionGeometry, ActiveTokens
 #else
     static constexpr int kKWarps = ActiveTokens <= 12 ? 16 : 8;
 #endif
-    static constexpr int kMinBlocks  = kKWarps == 16 ? 1 : 2;
-    static constexpr auto kScaleAccess =
-        ActiveTokens > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
+    static constexpr int kMinBlocks  = kKWarps == 4 ? 4 : (kKWarps == 16 ? 1 : 2);
+    static constexpr auto kScaleAccess = W8SmallTMmaScaleAccess::Shared;
     static constexpr auto kActivationCache =
         ActiveTokens == 4 || (ActiveTokens >= 27 && ActiveTokens <= 40) ? Cache::cg : Cache::ca;
     using Type =
