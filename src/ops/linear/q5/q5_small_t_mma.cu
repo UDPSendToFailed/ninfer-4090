@@ -62,10 +62,13 @@ void launch_residual_exact(const Tensor& x, const Weight& weight, Tensor& out,
         (Geometry::kOutputRows + Schedule::kRowsPerCta - 1) / Schedule::kRowsPerCta;
     const auto in_ld  = static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16));
     const auto out_ld = static_cast<std::int32_t>(out.nb[1] / sizeof(__nv_bfloat16));
-    const Q5SmallTMmaResidualEpilogue epilogue{};
+    constexpr int kSplits = 2;
+    const dim3 grid(static_cast<unsigned>(kBlocks), static_cast<unsigned>(kSplits), 1u);
+    const Q5SmallTMmaResidualAtomicEpilogue epilogue{};
 
-    q5_small_t_mma_kernel<Geometry, TileTokens, ActiveTokens, Q5SmallTMmaResidualEpilogue>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
+    q5_small_t_mma_kernel<Geometry, TileTokens, ActiveTokens, Q5SmallTMmaResidualAtomicEpilogue,
+                          Q5SmallTMmaIdentityRows, kSplits>
+        <<<grid, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.qhigh),

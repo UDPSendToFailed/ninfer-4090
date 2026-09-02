@@ -37,6 +37,15 @@ struct Q5SmallTMmaResidualEpilogue {
     }
 };
 
+struct Q5SmallTMmaResidualAtomicEpilogue {
+    __device__ __forceinline__ void store(__nv_bfloat16* out, int out_ld, int row, int col,
+                                          float acc) const {
+        auto* dst = &out[static_cast<std::int64_t>(col) * out_ld + row];
+        atomicAdd(dst, __float2bfloat16_rn(acc));
+    }
+};
+
+
 template <int SplitRow>
 struct Q5SmallTSplitEpilogue {
     __nv_bfloat16* out_tail;
@@ -100,7 +109,7 @@ __device__ __forceinline__ unsigned q5_small_t_bf16_pair(std::uint8_t code_byte,
 }
 
 template <class Geometry, int TileCols, int ActiveCols, class Epilogue = Q5SmallTMmaStoreEpilogue,
-          class RowPolicy = Q5SmallTMmaIdentityRows>
+          class RowPolicy = Q5SmallTMmaIdentityRows, int KSplits = 1>
 __launch_bounds__(256, 2) __global__
     void q5_small_t_mma_kernel(const __nv_bfloat16* __restrict__ x,
                                const std::uint8_t* __restrict__ codes,
@@ -125,6 +134,7 @@ __launch_bounds__(256, 2) __global__
     static_assert(ActiveCols >= 1 && ActiveCols <= kTileCols && ActiveCols > kTileCols - 8);
     static_assert((kHidden % kGroupK) == 0);
     static_assert(RowPolicy::kOutputRowsPerCta <= kRowsPerCta);
+    static_assert(kGroups % KSplits == 0, "kGroups must be divisible by KSplits");
 
     // Double-buffered (ping-pong) shared storage.
     union SharedStorage {
@@ -151,6 +161,11 @@ __launch_bounds__(256, 2) __global__
     const int lid     = lane & 3;
     const int k_split = warp;
     const int row0    = static_cast<int>(blockIdx.x) * RowPolicy::kOutputRowsPerCta;
+
+    const int split_idx           = static_cast<int>(blockIdx.y);
+    constexpr int kGroupsPerSplit = kGroups / KSplits;
+    const int group_start         = split_idx * kGroupsPerSplit;
+    const int group_end           = group_start + kGroupsPerSplit;
 
     // Fully coalesced activation loader: each warp stages its own 64-element K slice.
     const auto stage_x = [&](int stage, int group_k0) {
@@ -222,20 +237,21 @@ __launch_bounds__(256, 2) __global__
     float acc[kNt][4] = {};
 
     // 1. Prologue: Prefetch Stage 0.
-    stage_weight(0, 0);
-    stage_x(0, 0);
+    const int init_k0 = group_start * kGroupK;
+    stage_weight(0, init_k0);
+    stage_x(0, init_k0);
     cp_commit();
 
     int curr_stage = 0;
 
     // 2. Pipelined Loop: overlap Stage s+1 async DMA with Stage s MMA compute.
 #pragma unroll 1
-    for (int group_index = 0; group_index < kGroups; ++group_index) {
+    for (int group_index = group_start; group_index < group_end; ++group_index) {
         const int next_stage = 1 - curr_stage;
         const int next_group = group_index + 1;
 
         // Asynchronously issue next stage while current stage is in flight.
-        if (next_group < kGroups) {
+        if (next_group < group_end) {
             stage_weight(next_stage, next_group * kGroupK);
             stage_x(next_stage, next_group * kGroupK);
             cp_commit();

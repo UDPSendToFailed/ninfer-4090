@@ -13,14 +13,14 @@ int q5_a16_conformance() {
     // Starts of the registered positive-T regions. run_shape checks b-1/b/b+1 for every start,
     // plus one interior point for every region, through the public Op.
     constexpr std::array<std::int32_t, 5> kK6144RouteStarts{2, 14, 17, 65, 129};
-    constexpr std::array<std::int32_t, 6> kK6144RouteInteriors{1, 8, 15, 32, 96, 256};
+    constexpr std::array<std::int32_t, 10> kK6144RouteInteriors{1, 3, 4, 5, 6, 8, 15, 32, 96, 256};
 
     int failures = 0;
     failures += ninfer::test::linear_add::run_shape(
         "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
         ShapeCase{5120, 6144, 401U, kK6144RouteStarts, kK6144RouteInteriors});
     constexpr std::array<std::int32_t, 4> kK17408RouteStarts{2, 17, 65, 129};
-    constexpr std::array<std::int32_t, 5> kK17408RouteInteriors{1, 8, 32, 96, 256};
+    constexpr std::array<std::int32_t, 9> kK17408RouteInteriors{1, 3, 4, 5, 6, 8, 32, 96, 256};
     failures += ninfer::test::linear_add::run_shape(
         "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
         ShapeCase{5120, 17408, 409U, kK17408RouteStarts, kK17408RouteInteriors});
