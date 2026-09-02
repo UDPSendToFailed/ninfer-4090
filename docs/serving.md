@@ -42,7 +42,7 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 
 | Method and path | Behavior |
 |---|---|
-| `GET /health` | process health |
+| `GET /health` | Engine readiness |
 | `GET /v1/models` | configured OpenAI model alias |
 | `GET /v1/models/{id}` | lookup of the configured alias |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
@@ -53,6 +53,10 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | `GET /v1/responses/{id}/input_items` | list that Response's normalized input Items |
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
+
+`GET /health` returns HTTP 200 with `{"status":"ok"}` while the Engine can accept work. After an
+Engine-wide failure it returns HTTP 503 with `{"status":"unavailable"}`. Temporary queue
+saturation does not make the Engine unavailable. The endpoint remains unauthenticated.
 
 ## OpenAI Chat Completions
 
