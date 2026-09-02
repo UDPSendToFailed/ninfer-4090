@@ -54,7 +54,7 @@ __device__ __forceinline__ unsigned w8_small_t_bf16_pair_from_s8(unsigned values
 
 template <class Geometry, int ActiveCols, class Schedule, class Output,
           class Epilogue = W8SmallTMmaStoreEpilogue, class RowPolicy = W8SmallTMmaIdentityRows,
-          bool DirectPairEpilogue = false>
+          bool DirectPairEpilogue = false, int KSplits = 1>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
@@ -69,6 +69,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
     constexpr int kGroups     = kHidden / kGroupK;
     constexpr int kTileCols   = Schedule::kTileTokens;
     static_assert((kHidden % kGroupK) == 0);
+    static_assert((kGroups % KSplits) == 0);
     static_assert(ActiveCols >= 1 && ActiveCols <= kTileCols);
     static_assert(RowPolicy::kOutputRowsPerCta <= kRowsPerCta);
     constexpr int kNt        = kTileCols / 8;
@@ -170,21 +171,26 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
         acc[ni][3] = 0.0f;
     }
 
-    stage_codes(0, 0);
-    stage_x(0, 0);
+    const int split_idx = static_cast<int>(blockIdx.y);
+    constexpr int kGroupsPerSplit = kGroups / KSplits;
+    const int group_start = split_idx * kGroupsPerSplit;
+    const int group_end   = (split_idx + 1) * kGroupsPerSplit;
+
+    stage_codes(0, group_start * kGroupK);
+    stage_x(0, group_start * kGroupK);
     cp_commit();
     cp_wait<0>();
     __syncthreads();
 
     int read_buf = 0;
 
-    constexpr int kGroupUnroll = kGroups <= 8 ? kGroups : 4;
+    constexpr int kGroupUnroll = kGroupsPerSplit <= 8 ? kGroupsPerSplit : 4;
 #pragma unroll kGroupUnroll
-    for (int group_index = 0; group_index < kGroups; ++group_index) {
+    for (int group_index = group_start; group_index < group_end; ++group_index) {
         const int group_k0 = group_index * kGroupK;
         const int next_buf = 1 - read_buf;
 
-        if (group_index + 1 < kGroups) {
+        if (group_index + 1 < group_end) {
             stage_codes(next_buf, group_k0 + kGroupK);
             if constexpr (kActivationBuffers == 2) {
                 stage_x(next_buf, group_k0 + kGroupK);
@@ -307,7 +313,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
                 const auto store = [&](int row, int col, float value) {
                     __nv_bfloat16* destination   = output_tile.at(row, col);
                     const __nv_bfloat16 val_bf16 = __float2bfloat16_rn(value);
-                    if constexpr (std::is_same_v<Epilogue, W8SmallTMmaResidualEpilogue>) {
+                    if constexpr (KSplits > 1) {
+                        atomicAdd(destination, val_bf16);
+                    } else if constexpr (std::is_same_v<Epilogue, W8SmallTMmaResidualEpilogue>) {
                         *destination = __hadd(val_bf16, *destination);
                     } else {
                         *destination = val_bf16;

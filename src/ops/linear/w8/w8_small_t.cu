@@ -28,23 +28,51 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <class Geometry, int ActiveTokens, int KSplits = 2>
+void launch_splitk_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    using Schedule = typename W8LinearSmallTProductionSchedule<Geometry, ActiveTokens>::Type;
+    static_assert((Geometry::kOutputRows % Schedule::kRowsPerCta) == 0);
+    static_assert((Geometry::kInputRows % Schedule::kGroupK) == 0);
+
+    const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
+    constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
+    const dim3 grid(static_cast<unsigned>(kBlocks), static_cast<unsigned>(KSplits), 1u);
+
+    const std::size_t out_elements = static_cast<std::size_t>(Geometry::kOutputRows) * ActiveTokens;
+    CUDA_CHECK(cudaMemsetAsync(out.data, 0, out_elements * sizeof(__nv_bfloat16), stream));
+
+    w8_small_t_mma_kernel<Geometry, ActiveTokens, Schedule, W8ContiguousOutput,
+                          W8SmallTMmaStoreEpilogue, W8SmallTMmaIdentityRows, false, KSplits>
+        <<<grid, Schedule::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), output);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 template <class Geometry, int First, std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
     return std::array<W8Launch, sizeof...(Offsets)>{
         &launch_exact<Geometry, First + static_cast<int>(Offsets)>...};
 }
 
+template <class Geometry, int First, std::size_t... Offsets>
+constexpr auto make_splitk_launchers(std::index_sequence<Offsets...>) {
+    return std::array<W8Launch, sizeof...(Offsets)>{
+        &launch_splitk_exact<Geometry, First + static_cast<int>(Offsets)>...};
+}
+
 constexpr auto kVocabularyLaunchers =
     make_launchers<W8VocabularyProjectionGeometry, kW8VocabularyFirstSmallT>(
         std::make_index_sequence<kW8VocabularyLastSmallT - kW8VocabularyFirstSmallT + 1>{});
 constexpr auto kMtpInputLaunchers =
-    make_launchers<W8MtpInputProjectionGeometry, kW8MtpInputFirstSmallT>(
+    make_splitk_launchers<W8MtpInputProjectionGeometry, kW8MtpInputFirstSmallT>(
         std::make_index_sequence<kW8MtpInputLastSmallT - kW8MtpInputFirstSmallT + 1>{});
 constexpr auto kMtpAttentionLaunchers =
     make_launchers<W8MtpAttentionProjectionGeometry, kW8MtpAttentionFirstSmallT>(
         std::make_index_sequence<kW8MtpAttentionLastSmallT - kW8MtpAttentionFirstSmallT + 1>{});
 constexpr auto kMtpAttentionOutputLaunchers =
-    make_launchers<W8MtpAttentionOutputGeometry, kW8MtpAttentionOutputFirstSmallT>(
+    make_splitk_launchers<W8MtpAttentionOutputGeometry, kW8MtpAttentionOutputFirstSmallT>(
         std::make_index_sequence<kW8MtpAttentionOutputLastSmallT -
                                  kW8MtpAttentionOutputFirstSmallT + 1>{});
 constexpr auto kMtpGateUpLaunchers =
