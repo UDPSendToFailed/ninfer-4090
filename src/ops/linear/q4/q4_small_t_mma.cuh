@@ -152,7 +152,7 @@ __launch_bounds__(256, 2) __global__
     // double-buffer (ping-pong) for TileCols <= 16 (<= 41.5 KB), and single-buffer for TileCols > 16.
     constexpr int kStages       = (TileCols <= 16) ? 2 : 1;
     static_assert(kTileCols >= 8 && kTileCols <= 32 && (kTileCols % 8) == 0);
-    static_assert(ActiveCols >= 2 && ActiveCols <= kTileCols && ActiveCols > kTileCols - 8);
+    static_assert(ActiveCols >= 1 && ActiveCols <= kTileCols && ActiveCols > kTileCols - 8);
     static_assert((kHidden % kGroupK) == 0);
     static_assert(RowPolicy::kOutputRowsPerCta <= kRowsPerCta);
 
