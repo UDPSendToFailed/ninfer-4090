@@ -281,13 +281,57 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& valu
     throw std::invalid_argument("attention Q5 split-output requires T in [1,16]");
 }
 
+struct StreamForkJoinContext {
+    cudaStream_t side_stream = nullptr;
+    cudaEvent_t fork_event   = nullptr;
+    cudaEvent_t join_event   = nullptr;
+
+    StreamForkJoinContext() {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&side_stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&fork_event, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&join_event, cudaEventDisableTiming));
+    }
+
+    ~StreamForkJoinContext() {
+        if (join_event != nullptr) {
+            cudaEventDestroy(join_event);
+            join_event = nullptr;
+        }
+        if (fork_event != nullptr) {
+            cudaEventDestroy(fork_event);
+            fork_event = nullptr;
+        }
+        if (side_stream != nullptr) {
+            cudaStreamDestroy(side_stream);
+            side_stream = nullptr;
+        }
+    }
+};
+
+StreamForkJoinContext& get_fork_join_context() {
+    static thread_local StreamForkJoinContext ctx;
+    return ctx;
+}
+
 } // namespace
 
 void q4_q5_attn_input_small_t_launch(const Tensor& x, const Weight& query_key_weight,
                                      const Weight& gate_value_weight, Tensor& q, Tensor& gate,
                                      Tensor& k, Tensor& v, cudaStream_t stream) {
+    auto& ctx = get_fork_join_context();
+
+    // 1. Fork: record event on origin stream, have side_stream wait on it
+    CUDA_CHECK(cudaEventRecord(ctx.fork_event, stream));
+    CUDA_CHECK(cudaStreamWaitEvent(ctx.side_stream, ctx.fork_event, 0));
+
+    // 2. Co-schedule concurrent launches across 128 SMs:
+    //    launch_q4 (448 blocks) + launch_q5 (448 blocks) = 896 blocks = 7.0 exact integer waves
     launch_q4(x, query_key_weight, q, k, stream);
-    launch_q5(x, gate_value_weight, gate, v, stream);
+    launch_q5(x, gate_value_weight, gate, v, ctx.side_stream);
+
+    // 3. Join: record event on side_stream, have origin stream wait on it
+    CUDA_CHECK(cudaEventRecord(ctx.join_event, ctx.side_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(stream, ctx.join_event, 0));
 }
 
 } // namespace ninfer::ops::detail
