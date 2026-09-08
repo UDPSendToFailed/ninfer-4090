@@ -98,6 +98,8 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->summary.transient_bytes        = 0;
     base->sampling                       = translate_sampling(options.sampling);
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
+    base->token_mask                     = options.token_mask;
+    base->disable_speculation            = options.disable_speculation;
     const std::uint32_t reserved_context_tokens =
         base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
                                            ? 0U
@@ -178,6 +180,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     plan->sampling                    = base.sampling;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
+    plan->token_mask                  = base.token_mask;
+    plan->disable_speculation         = base.disable_speculation;
 
     if (base.allow_prefix_reuse && prompt.identity.reusable) {
         if (sequence.retained) {

@@ -43,7 +43,8 @@ bool same_config(const ops::SamplingConfig& a, const ops::SamplingConfig& b) {
     return a.temperature == b.temperature && a.top_k == b.top_k && a.top_p == b.top_p &&
            a.min_p == b.min_p && a.presence_penalty == b.presence_penalty &&
            a.frequency_penalty == b.frequency_penalty && a.seed == b.seed &&
-           a.token_counts == b.token_counts;
+           a.token_counts == b.token_counts && a.token_mask == b.token_mask &&
+           a.disable_speculation == b.disable_speculation;
 }
 
 std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
@@ -137,12 +138,23 @@ Distribution distribution_oracle(const std::vector<float>& column, int token_dom
 RunResult run_batch(const std::vector<float>& logits, int physical_rows, int token_domain,
                     std::vector<ops::SamplingConfig> configs,
                     const std::vector<int>& logical_positions, int purpose,
-                    const std::vector<std::vector<int>>& initial_counts = {}) {
+                    const std::vector<std::vector<int>>& initial_counts = {},
+                    const std::vector<std::vector<std::uint32_t>>& token_masks = {}) {
     const int batch = static_cast<int>(configs.size());
     if (batch <= 0 || logical_positions.size() != configs.size() ||
         logits.size() != static_cast<std::size_t>(physical_rows) * configs.size() ||
-        (!initial_counts.empty() && initial_counts.size() != configs.size())) {
+        (!initial_counts.empty() && initial_counts.size() != configs.size()) ||
+        (!token_masks.empty() && token_masks.size() != configs.size())) {
         throw std::invalid_argument("invalid sample batch fixture");
+    }
+    std::vector<DeviceBuffer> device_masks;
+    device_masks.reserve(token_masks.size());
+    for (std::size_t row = 0; row < token_masks.size(); ++row) {
+        if (token_masks[row].size() != static_cast<std::size_t>((token_domain + 31) / 32)) {
+            throw std::invalid_argument("invalid sample token-mask fixture");
+        }
+        device_masks.push_back(to_device(token_masks[row]));
+        configs[row].token_mask = static_cast<const std::uint32_t*>(device_masks.back().p);
     }
     const std::vector<std::uint16_t> input_bits = bf16_bits(logits);
     DeviceBuffer device_logits                  = to_device(input_bits);
@@ -579,6 +591,21 @@ int workspace_route_boundary_contract() {
     return failures;
 }
 
+int token_mask_contract() {
+    constexpr int token_domain = 257;
+    std::vector<float> logits(static_cast<std::size_t>(token_domain), 0.0f);
+    logits[9]  = 8.0f;
+    logits[42] = 4.0f;
+    std::vector<std::uint32_t> mask(static_cast<std::size_t>((token_domain + 31) / 32), 0U);
+    mask[42U >> 5] |= 1U << (42U & 31U);
+    const RunResult result = run_batch(logits, token_domain, token_domain,
+                                       {ops::SamplingConfig{}}, {0},
+                                       ops::kSamplePurposeDecode, {}, {mask});
+    int failures = result.integrity_failures;
+    failures += verify_exact("sample token mask", result.tokens, {42});
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -608,6 +635,7 @@ int main() {
     failures += real_shape_distribution_contract();
     failures += rng_key_contract();
     failures += workspace_route_boundary_contract();
+    failures += token_mask_contract();
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sample public contract\n";
     return failures == 0 ? 0 : 1;

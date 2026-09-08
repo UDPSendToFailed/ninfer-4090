@@ -381,11 +381,52 @@ int test_reject_unsupported() {
         throws_api([&] { (void)parse_chat_completion_request(function_call, default_limits()); }),
         "deprecated function_call rejected");
 
-    Json rf               = base;
+    Json rf                = base;
     rf["response_format"] = Json{{"type", "json_object"}};
+    const GenerationRequest json_object_req =
+        parse_chat_completion_request(rf, default_limits());
+    failures += check(json_object_req.response_format.mode == ResponseFormatMode::JsonObject,
+                      "json_object response_format parsed");
     failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(rf, default_limits()); }),
-              "json response_format rejected");
+        check(to_request_options(json_object_req, default_server()).structured_output.mode ==
+                  ninfer::StructuredOutputMode::JsonObject,
+              "json_object response_format reaches Engine options");
+
+    Json rf_schema = base;
+    rf_schema["response_format"] =
+        Json{{"type", "json_schema"},
+             {"json_schema",
+              Json{{"name", "translation_batch"},
+                   {"strict", true},
+                   {"schema", Json{{"type", "object"},
+                                    {"properties", Json{{"translations", Json{{"type", "array"}}}}},
+                                    {"required", Json::array({"translations"})}}}}}};
+    const GenerationRequest json_schema_req =
+        parse_chat_completion_request(rf_schema, default_limits());
+    failures += check(json_schema_req.response_format.mode == ResponseFormatMode::JsonSchema,
+                      "json_schema response_format parsed");
+    failures += check(json_schema_req.response_format.name == "translation_batch",
+                      "json_schema name retained");
+    failures += check(json_schema_req.response_format.strict,
+                      "json_schema strict retained");
+    failures += check(Json::parse(json_schema_req.response_format.schema_json).at("type") ==
+                          "object",
+                      "json_schema body retained");
+    const ninfer::StructuredOutputOptions structured =
+        to_request_options(json_schema_req, default_server()).structured_output;
+    failures += check(structured.mode == ninfer::StructuredOutputMode::JsonSchema,
+                      "json_schema response_format reaches Engine options");
+    failures += check(structured.name == "translation_batch" && structured.strict,
+                      "json_schema Engine metadata retained");
+    failures += check(Json::parse(structured.schema_json).at("type") == "object",
+                      "json_schema Engine body retained");
+
+    Json invalid_rf = base;
+    invalid_rf["response_format"] = Json{{"type", "json_schema"},
+                                          {"json_schema", Json{{"name", "missing_schema"}}}};
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(invalid_rf, default_limits()); }),
+        "json_schema without schema rejected");
 
     Json rf_text               = base;
     rf_text["response_format"] = Json{{"type", "text"}};

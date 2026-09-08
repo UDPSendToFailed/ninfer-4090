@@ -10,6 +10,9 @@
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
+#include <xgrammar/compiler.h>
+#include <xgrammar/matcher.h>
+#include <xgrammar/tokenizer_info.h>
 
 #include <algorithm>
 #include <array>
@@ -639,22 +642,44 @@ public:
             }
             defaults.token_ids.push_back(token);
         }
+        std::vector<std::int32_t> stop_tokens(defaults.token_ids.begin(), defaults.token_ids.end());
+        std::vector<std::string> decoded_vocab = tokenizer->decoded_vocabulary();
+        const int vocab_size                   = static_cast<int>(decoded_vocab.size());
+        grammar_compiler = std::make_shared<xgrammar::GrammarCompiler>(xgrammar::TokenizerInfo(
+            decoded_vocab, xgrammar::VocabType::RAW, vocab_size, std::move(stop_tokens)));
+        grammar_vocab_size = vocab_size;
     }
 
     fi::CompiledChatTemplate chat_template;
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     fi::ProcessorOptions processor;
     StopPolicy defaults;
+    std::shared_ptr<xgrammar::GrammarCompiler> grammar_compiler;
+    int grammar_vocab_size = 0;
     bool vision_enabled = true;
 };
 
 class OutputSession::Impl {
 public:
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
-         bool starts_in_reasoning)
+         const StructuredOutputOptions& structured, bool starts_in_reasoning,
+         const std::shared_ptr<xgrammar::GrammarCompiler>& compiler, int vocab_size)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
           preserve_special(output.raw || output.preserve_special_tokens) {
-        state.in_reasoning = starts_in_reasoning && !output.raw;
+        // A structured response starts at the grammar root and is published as content even when
+        // the model's normal mode would begin in a hidden reasoning channel.
+        state.in_reasoning = starts_in_reasoning && !output.raw && !structured.enabled();
+        if (structured.enabled()) {
+            xgrammar::CompiledGrammar grammar =
+                structured.mode == StructuredOutputMode::JsonObject
+                    ? compiler->CompileBuiltinJSONGrammar()
+                    : compiler->CompileJSONSchema(structured.schema_json, true, std::nullopt,
+                                                  std::nullopt, structured.strict);
+            std::vector<int> stops(policy.token_ids.begin(), policy.token_ids.end());
+            matcher.emplace(grammar, std::move(stops), false, -1);
+            mask.resize(static_cast<std::size_t>(xgrammar::GetBitmaskSize(vocab_size)));
+            grammar_vocab_size = vocab_size;
+        }
     }
 
     std::shared_ptr<const fi::Tokenizer> tokenizer;
@@ -664,6 +689,10 @@ public:
     DecoderState preview_state;
     PublishedOutput preview_output;
     bool preview_ready = false;
+    std::optional<xgrammar::GrammarMatcher> matcher;
+    std::optional<xgrammar::GrammarMatcher> preview_matcher;
+    std::vector<std::int32_t> mask;
+    int grammar_vocab_size = 0;
 };
 
 std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const {
@@ -744,8 +773,13 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
 
     impl_->preview_state = impl_->state;
     impl_->preview_output.clear();
+    if (impl_->matcher) { impl_->preview_matcher = impl_->matcher->Fork(); }
+    std::uint32_t grammar_tokens = 0;
 
     const auto complete = [&](std::uint32_t count, FinishReason reason) {
+        if (impl_->preview_matcher && grammar_tokens > count) {
+            impl_->preview_matcher->Rollback(static_cast<int>(grammar_tokens - count));
+        }
         if (impl_->preview_output.size() == 1) {
             impl_->preview_output[0].tokens = count;
         } else if (impl_->preview_output.size() == 2) {
@@ -762,6 +796,12 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
         if (!impl_->tokenizer->is_valid_token(token)) {
             throw std::out_of_range("generated token is outside the checkpoint vocabulary: " +
                                     std::to_string(token));
+        }
+        if (impl_->preview_matcher) {
+            if (!impl_->preview_matcher->AcceptToken(token)) {
+                throw std::logic_error("structured-output sampler produced a rejected token");
+            }
+            ++grammar_tokens;
         }
 
         if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
@@ -815,6 +855,7 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
         throw std::invalid_argument("invalid between-round terminal decoder reason");
     }
     impl_->preview_state = impl_->state;
+    if (impl_->matcher) { impl_->preview_matcher = impl_->matcher->Fork(); }
     impl_->preview_output.clear();
     terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
     impl_->preview_ready = true;
@@ -825,10 +866,33 @@ PublishedOutput OutputSession::commit_preview() noexcept {
     if (impl_ == nullptr || !impl_->preview_ready) { std::terminate(); }
     using std::swap;
     swap(impl_->state, impl_->preview_state);
+    if (impl_->matcher) {
+        swap(impl_->matcher, impl_->preview_matcher);
+        impl_->preview_matcher.reset();
+    }
     PublishedOutput output = std::move(impl_->preview_output);
     impl_->preview_output.clear();
     impl_->preview_ready = false;
     return output;
+}
+
+bool OutputSession::has_token_constraint() const noexcept {
+    return impl_ != nullptr && impl_->matcher.has_value();
+}
+
+std::span<const std::uint32_t> OutputSession::next_token_bitmask() {
+    if (!has_token_constraint()) { return {}; }
+    std::int64_t shape = static_cast<std::int64_t>(impl_->mask.size());
+    DLTensor tensor{};
+    tensor.data        = impl_->mask.data();
+    tensor.device      = DLDevice{kDLCPU, 0};
+    tensor.ndim        = 1;
+    tensor.dtype       = xgrammar::GetBitmaskDLType();
+    tensor.shape       = &shape;
+    tensor.strides     = nullptr;
+    tensor.byte_offset = 0;
+    (void)impl_->matcher->FillNextTokenBitmask(&tensor);
+    return {reinterpret_cast<const std::uint32_t*>(impl_->mask.data()), impl_->mask.size()};
 }
 
 std::uint32_t OutputSession::reasoning_tokens() const noexcept {
@@ -976,12 +1040,14 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
 
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
-                                            const OutputOptions& output) const {
+                                            const OutputOptions& output,
+                                            const StructuredOutputOptions& structured) const {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     if (output.raw) { policy.publish_stop_token = true; }
     return OutputSession(std::make_unique<OutputSession::Impl>(
-        impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning));
+        impl_->tokenizer, std::move(policy), output, structured, prompt.data_->starts_in_reasoning,
+        impl_->grammar_compiler, impl_->grammar_vocab_size));
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

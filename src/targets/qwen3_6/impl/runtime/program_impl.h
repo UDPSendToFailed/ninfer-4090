@@ -270,6 +270,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     prefill_hidden               = plan.persistent.prefill_hidden.bind(backing);
     token_counts                 = plan.persistent.token_counts.bind(backing);
     sampling_config              = plan.persistent.sampling_config.bind(backing);
+    token_masks                  = plan.persistent.token_masks.bind(backing);
     tail_hidden_store            = plan.persistent.tail_hidden.bind(backing);
     turn_checkpoint_hidden_store = plan.persistent.turn_checkpoint_hidden.bind(backing);
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
@@ -469,7 +470,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     const auto started       = Clock::now();
     const std::uint32_t base = request_plan.reuse_base;
     const std::uint32_t initial_mtp_extent =
-        speculative_backend == SpeculativeBackend::Mtp
+        speculative_backend == SpeculativeBackend::Mtp && !request_plan.disable_speculation
             ? std::min({draft_window,
                         request_plan.summary.effective_output_tokens > 1
                             ? request_plan.summary.effective_output_tokens - 2
@@ -770,6 +771,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                                                 : 0U;
         materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
         install_sampling(sequence, request, request_plan.sampling);
+        request.sampling_host.disable_speculation = request_plan.disable_speculation;
+        if (!request_plan.token_mask.empty()) {
+            request.initial_token_mask = std::move(request_plan.token_mask);
+            set_token_mask_lane(lane, request.initial_token_mask);
+        }
         if (request_plan.disk_snapshot_path.empty() || prompt.rope_delta != 0) {
             sequence.rope_delta = prompt.rope_delta;
         }
@@ -1632,6 +1638,23 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
                                device.stream));
 }
 
+void ProgramImplCore::set_token_mask_lane(std::uint32_t lane,
+                                          std::span<const std::uint32_t> mask) {
+    if (lane >= max_concurrency) { throw std::out_of_range("token-mask lane is out of range"); }
+    const std::size_t expected = static_cast<std::size_t>((TextConfig::token_domain + 31) / 32);
+    if (mask.size() != expected) { throw std::invalid_argument("token mask has an invalid size"); }
+    Tensor device_mask = token_masks.slice(1, static_cast<std::int32_t>(lane), 1)
+                             .view({static_cast<std::int32_t>(expected)});
+    CUDA_CHECK(cudaMemcpyAsync(device_mask.data, mask.data(), device_mask.bytes(),
+                               cudaMemcpyHostToDevice, device.stream));
+    RequestControl& request       = requests[lane];
+    request.sampling_host.token_mask = static_cast<const std::uint32_t*>(device_mask.data);
+    Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
+    CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
+                               sizeof(request.sampling_host), cudaMemcpyHostToDevice,
+                               device.stream));
+}
+
 void ProgramImplCore::copy_tail(SequenceState& sequence, const Tensor& source) {
     if (source.dtype != DType::BF16 || source.ne[0] != TextConfig::hidden || source.ne[1] != 1) {
         throw std::logic_error("target tail hidden has an invalid shape");
@@ -2101,7 +2124,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = sequences[lanes[row]];
             const RequestControl& request     = requests[lanes[row]];
-            if (sequence.mtp_draft_count == 0 && sequence.ledger.size() >= 3) {
+            if (!request.sampling_host.disable_speculation && sequence.mtp_draft_count == 0 &&
+                sequence.ledger.size() >= 3) {
                 const auto lookup =
                     find_prompt_lookup_draft(sequence.ledger, draft_window);
                 if (lookup.count > 0) {
@@ -2115,9 +2139,11 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1
                                                     : 0;
-            const std::uint32_t extent =
-                std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
-                          capacity - sequence.execution_frontier - 1});
+            const std::uint32_t extent = request.sampling_host.disable_speculation
+                                             ? 0U
+                                             : std::min({sequence.mtp_draft_count, draft_window,
+                                                         max_by_budget,
+                                                         capacity - sequence.execution_frontier - 1});
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
             mtp_host_ingress->remaining_budgets[row] =
@@ -2288,8 +2314,10 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1U
                                                     : 0U;
-            const std::uint32_t extent =
-                std::min({draft_window, max_by_budget, capacity - frontier - 1U});
+            const std::uint32_t extent = request.sampling_host.disable_speculation
+                                             ? 0U
+                                             : std::min({draft_window, max_by_budget,
+                                                         capacity - frontier - 1U});
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash batch frontier");

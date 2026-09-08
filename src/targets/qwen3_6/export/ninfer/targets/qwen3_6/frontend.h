@@ -98,6 +98,8 @@ public:
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
     [[nodiscard]] PublishedOutput commit_preview() noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
+    [[nodiscard]] bool has_token_constraint() const noexcept;
+    [[nodiscard]] std::span<const std::uint32_t> next_token_bitmask();
 
 private:
     class Impl;
@@ -122,7 +124,8 @@ public:
     [[nodiscard]] PromptCapabilities prompt_capabilities() const noexcept;
     [[nodiscard]] OutputSession make_output_session(const PreparedPrompt& prompt,
                                                     const StopPolicy& caller_stop,
-                                                    const OutputOptions& output = {}) const;
+                                                    const OutputOptions& output = {},
+                                                    const StructuredOutputOptions& structured = {}) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
 
 private:

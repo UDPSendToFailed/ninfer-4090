@@ -218,6 +218,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.sampling_config = add_tensor(
         builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
         "sampling config");
+    out.token_masks = add_tensor(
+        builder, DType::I32,
+        {(TextConfig::token_domain + 31) / 32, static_cast<std::int32_t>(plan.max_concurrency)},
+        "structured-output token masks");
     out.tail_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.max_concurrency)},
         "tail hidden");

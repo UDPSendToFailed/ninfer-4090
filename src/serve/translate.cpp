@@ -238,6 +238,19 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;
     options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
+    switch (request.response_format.mode) {
+    case ResponseFormatMode::Text:
+        break;
+    case ResponseFormatMode::JsonObject:
+        options.structured_output.mode = ninfer::StructuredOutputMode::JsonObject;
+        break;
+    case ResponseFormatMode::JsonSchema:
+        options.structured_output.mode        = ninfer::StructuredOutputMode::JsonSchema;
+        options.structured_output.name        = request.response_format.name;
+        options.structured_output.schema_json = request.response_format.schema_json;
+        options.structured_output.strict      = request.response_format.strict;
+        break;
+    }
     options.stop.strings.reserve(request.stop_strings.size());
     for (const std::string& stop : request.stop_strings) {
         if (!stop.empty()) {

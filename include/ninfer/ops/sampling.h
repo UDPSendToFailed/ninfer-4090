@@ -30,6 +30,8 @@ struct SamplingConfig {
     float frequency_penalty    = 0.0f;
     unsigned long long seed    = 0;
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
+    const std::uint32_t* token_mask = nullptr; // device ceil(token_domain/32) bitset, or null
+    bool disable_speculation = false;
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive
