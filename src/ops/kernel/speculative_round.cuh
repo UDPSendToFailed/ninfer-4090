@@ -168,14 +168,17 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     for (int i = 0; i <= extent; ++i) {
         // Column i is only reached when drafts[0..i-1] were all accepted, so the
         // round-local penalty overlay for this column is exactly those i drafts.
+        SamplingConfig column_cfg = cfg;
+        if (i != 0) { column_cfg.token_mask = nullptr; }
         const std::int64_t base = static_cast<std::int64_t>(i) * physical_rows;
         if (token_domain <= kSamplerTileItems) {
-            sampling_build_truncated_small(row_logits, base, token_domain, cfg, red_val, red_idx,
-                                           cand_val, cand_idx, prob, &n_support, row_drafts, i);
+            sampling_build_truncated_small(row_logits, base, token_domain, column_cfg, red_val,
+                                           red_idx, cand_val, cand_idx, prob, &n_support,
+                                           row_drafts, i);
         } else {
-            sampling_build_truncated_block_fast(row_logits, base, token_domain, cfg, merge_val,
-                                                merge_idx, cand_val, cand_idx, prob, &n_support,
-                                                row_drafts, i);
+            sampling_build_truncated_block_fast(row_logits, base, token_domain, column_cfg,
+                                                merge_val, merge_idx, cand_val, cand_idx, prob,
+                                                &n_support, row_drafts, i);
         }
         if (tid == 0 && done_sh == 0) {
             const int L = L_sh;
@@ -241,7 +244,8 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     int extent        = current_extents[row];
     extent            = extent < 0 ? 0 : (extent > k ? k : extent);
     if (col > extent) { return; }
-    const SamplingConfig cfg = configs[row];
+    SamplingConfig cfg = configs[row];
+    if (col != 0) { cfg.token_mask = nullptr; }
     if (!(cfg.temperature > 0.0f) || token_domain <= kSamplerTileItems) { return; }
     workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
     if (partial == 0 && threadIdx.x == 0) {
