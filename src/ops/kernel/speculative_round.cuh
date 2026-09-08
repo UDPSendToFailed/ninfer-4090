@@ -15,6 +15,34 @@
 
 namespace ninfer::ops {
 
+__device__ inline std::int32_t speculative_masked_argmax(const __nv_bfloat16* logits,
+                                                         std::int32_t token_domain,
+                                                         const SamplingConfig& cfg,
+                                                         float* values, int* indices) {
+    float best = -CUDART_INF_F;
+    int best_i = 0;
+    for (int v = threadIdx.x; v < token_domain; v += blockDim.x) {
+        const float value = sampling_adjusted_logit(__bfloat162float(logits[v]), v, cfg);
+        if (sampling_better(value, v, best, best_i)) {
+            best = value;
+            best_i = v;
+        }
+    }
+    values[threadIdx.x] = best;
+    indices[threadIdx.x] = best_i;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride != 0; stride >>= 1) {
+        if (threadIdx.x < stride &&
+            sampling_better(values[threadIdx.x + stride], indices[threadIdx.x + stride],
+                            values[threadIdx.x], indices[threadIdx.x])) {
+            values[threadIdx.x] = values[threadIdx.x + stride];
+            indices[threadIdx.x] = indices[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    return indices[0];
+}
+
 __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anchors,
                                                          const std::int32_t* drafts,
                                                          const std::int32_t* base_positions,
@@ -87,11 +115,18 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     const __nv_bfloat16* row_logits =
         logits + static_cast<std::int64_t>(row) * cols * physical_rows;
 
+    __shared__ float red_val[kSamplerBlock];
+    __shared__ int red_idx[kSamplerBlock];
+
     if (!(cfg.temperature > 0.0f)) {
+        int first_target = row_targets[0];
+        if (cfg.token_mask != nullptr) {
+            first_target = speculative_masked_argmax(row_logits, token_domain, cfg, red_val, red_idx);
+        }
         if (tid == 0) {
             int a = 0;
-            while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
-            const int t_star = row_targets[a];
+            while (a < extent && (a == 0 ? first_target : row_targets[a]) == row_drafts[a]) { ++a; }
+            const int t_star = a == 0 ? first_target : row_targets[a];
 
             for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
             for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
@@ -106,8 +141,6 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
         return;
     }
 
-    __shared__ float red_val[kSamplerBlock];
-    __shared__ int red_idx[kSamplerBlock];
     __shared__ float cand_val[kSamplerCandidateCap];
     __shared__ int cand_idx[kSamplerCandidateCap];
     __shared__ float prob[kSamplerCandidateCap];
@@ -250,10 +283,11 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
 }
 
 __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group_finalize_kernel(
-    const std::int32_t* target_tokens, const std::int32_t* drafts,
+    const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
     const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
     std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
-    const SamplingConfig* configs, std::int32_t token_domain, std::int32_t cols,
+    const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
+    std::int32_t cols,
     std::int32_t partial_blocks, std::int32_t group_count, SamplingWorkspace workspace,
     std::size_t workspace_row_stride) {
     const int row   = static_cast<int>(blockIdx.z);
@@ -268,13 +302,22 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     const std::int32_t* row_targets = target_tokens + row * cols;
     const std::int32_t* row_drafts  = drafts + row * k;
     std::int32_t* row_tokens        = licensed_tokens + row * cols;
+    const __nv_bfloat16* row_logits =
+        logits + static_cast<std::int64_t>(row) * cols * physical_rows;
+    __shared__ float greedy_val[kSamplerGroupBlock];
+    __shared__ int greedy_idx[kSamplerGroupBlock];
     if (token_domain <= kSamplerTileItems) { return; }
 
     if (!(cfg.temperature > 0.0f)) {
+        int first_target = row_targets[0];
+        if (col == 0 && group == 0 && cfg.token_mask != nullptr) {
+            first_target = speculative_masked_argmax(
+                row_logits, token_domain, cfg, greedy_val, greedy_idx);
+        }
         if (tid == 0 && col == 0 && group == 0) {
             int a = 0;
-            while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
-            const int t_star = row_targets[a];
+            while (a < extent && (a == 0 ? first_target : row_targets[a]) == row_drafts[a]) { ++a; }
+            const int t_star = a == 0 ? first_target : row_targets[a];
             for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
             for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
             row_tokens[a]        = t_star;

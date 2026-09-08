@@ -722,7 +722,6 @@ private:
             if (request->output.has_token_constraint()) {
                 const auto mask = request->output.next_token_bitmask();
                 request->options.execution.token_mask.assign(mask.begin(), mask.end());
-                request->options.execution.disable_speculation = true;
             }
             request->base_plan.emplace(
                 instance_.program->plan_request_base(request->prompt, request->options.execution));
@@ -1097,8 +1096,7 @@ private:
             }
             const OutputDecision decision = request->output.preview(
                 row_tokens, request->budget->remaining(), request->budget->limit_reason());
-            if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
-                (!decision.finished() && decision.accepted_tokens != count)) {
+            if (decision.accepted_tokens == 0 || decision.accepted_tokens > count) {
                 throw std::logic_error("output policy returned an invalid licensed prefix");
             }
             accepted[row]       = decision.accepted_tokens;

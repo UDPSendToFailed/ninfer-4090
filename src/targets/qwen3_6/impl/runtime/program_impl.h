@@ -907,19 +907,17 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
         }
         const std::uint32_t committed = cancelled[row] ? 0U : accepted_tokens[row];
         if ((cancelled[row] && accepted_tokens[row] != 0) ||
-            (!cancelled[row] && (committed == 0 || committed > pending.produced ||
-                                 (!terminal[row] && committed != pending.produced)))) {
+            (!cancelled[row] && (committed == 0 || committed > pending.produced))) {
             throw std::logic_error("speculative pending row has an invalid committed prefix");
         }
         fold_rows[row] = ops::GdnReplayFoldRow{
             .linear_state_slot = LinearStateSlots::current_state_slot(lane, max_concurrency),
             .commit_columns    = static_cast<std::int32_t>(committed),
         };
-        const bool partial_terminal =
-            !cancelled[row] && terminal[row] && committed < pending.produced;
+        const bool partial_commit = !cancelled[row] && committed < pending.produced;
         hidden_selectors[row] =
-            static_cast<std::int32_t>(partial_terminal ? committed - 1U : pending.produced - 1U);
-        needs_hidden_correction = needs_hidden_correction || partial_terminal;
+            static_cast<std::int32_t>(partial_commit ? committed - 1U : pending.produced - 1U);
+        needs_hidden_correction = needs_hidden_correction || partial_commit;
     }
 
     const auto tail_started = Clock::now();
@@ -1017,7 +1015,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
 
             if (speculative_backend == SpeculativeBackend::Mtp) {
                 sequence.mtp_kv_valid = sequence.execution_frontier;
-                if (terminal[row]) {
+                if (terminal[row] || committed < pending.produced) {
                     sequence.mtp_draft_count = 0;
                 } else {
                     const std::int32_t next  = mtp_host_egress->next_extents[row];

@@ -799,7 +799,7 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
         }
         if (impl_->preview_matcher) {
             if (!impl_->preview_matcher->AcceptToken(token)) {
-                throw std::logic_error("structured-output sampler produced a rejected token");
+                return complete(static_cast<std::uint32_t>(index), FinishReason::None);
             }
             ++grammar_tokens;
         }

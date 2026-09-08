@@ -410,6 +410,64 @@ int remap_case(int token_count) {
     return failures;
 }
 
+int grammar_masked_first_target_case(int token_domain) {
+    constexpr int k = 1;
+    const int physical_rows = token_domain;
+    std::vector<std::uint16_t> logits(static_cast<std::size_t>(physical_rows) * (k + 1),
+                                      f32_to_bf16(-20.0f));
+    logits[7]  = f32_to_bf16(30.0f); // Unconstrained target and draft.
+    logits[11] = f32_to_bf16(20.0f); // Best grammar-licensed correction.
+    logits[physical_rows + 13] = f32_to_bf16(20.0f);
+    std::vector<std::uint32_t> mask(static_cast<std::size_t>((token_domain + 31) / 32), 0U);
+    mask[11U >> 5] |= 1U << (11U & 31U);
+
+    DeviceBuffer d_targets = to_device<std::int32_t>({7, 13});
+    DeviceBuffer d_logits  = to_device(logits);
+    DeviceBuffer d_drafts  = to_device<std::int32_t>({7});
+    DeviceBuffer d_extent  = to_device<std::int32_t>({1});
+    DeviceBuffer d_lengths = to_device<std::int32_t>({100});
+    DeviceBuffer d_anchor  = to_device<std::int32_t>({-1});
+    DeviceBuffer d_tokens(static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
+    DeviceBuffer d_count(sizeof(std::int32_t));
+    DeviceBuffer d_accepted(sizeof(std::int32_t));
+    DeviceBuffer d_mask = to_device(mask);
+    ops::SamplingConfig config{};
+    config.temperature = 0.0f;
+    config.token_mask  = static_cast<const std::uint32_t*>(d_mask.p);
+    DeviceBuffer d_config = device_config(config);
+
+    Tensor targets(d_targets.p, DType::I32, {k + 1});
+    Tensor logits_tensor(d_logits.p, DType::BF16, {physical_rows, k + 1});
+    Tensor drafts(d_drafts.p, DType::I32, {k});
+    Tensor extent(d_extent.p, DType::I32, {1});
+    Tensor lengths(d_lengths.p, DType::I32, {1});
+    Tensor anchor(d_anchor.p, DType::I32, {1});
+    Tensor tokens(d_tokens.p, DType::I32, {k + 1});
+    Tensor count(d_count.p, DType::I32, {1});
+    Tensor accepted(d_accepted.p, DType::I32, {1});
+    const std::size_t workspace_bytes =
+        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1);
+    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+    ops::speculative_accept_greedy_drafts(
+        targets, logits_tensor, drafts, extent, lengths, anchor, tokens, count, accepted,
+        token_domain, static_cast<const ops::SamplingConfig*>(d_config.p), workspace, nullptr);
+    cuda_synchronize();
+
+    const std::string label = "grammar-masked speculative first target V=" +
+                              std::to_string(token_domain);
+    int failures = verify_exact((label + " tokens").c_str(),
+                                from_device<std::int32_t>(d_tokens, k + 1), {11, 0});
+    failures += verify_exact((label + " count").c_str(),
+                             from_device<std::int32_t>(d_count, 1), {1});
+    failures += verify_exact((label + " accepted").c_str(),
+                             from_device<std::int32_t>(d_accepted, 1), {0});
+    failures += verify_exact((label + " anchor").c_str(),
+                             from_device<std::int32_t>(d_anchor, 1), {11});
+    failures += verify_exact((label + " length").c_str(),
+                             from_device<std::int32_t>(d_lengths, 1), {101});
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -440,6 +498,8 @@ int main() {
     failures += greedy_accept_case(5, 5);
     failures += greedy_accept_case(15, 7, 257);
     failures += deterministic_sampling_case();
+    failures += grammar_masked_first_target_case(64);
+    failures += grammar_masked_first_target_case(2048);
     failures += batched_sampling_workspace_stride_case();
     failures += select_hidden_case(5120, 6, 0);
     failures += select_hidden_case(5120, 6, 5);
