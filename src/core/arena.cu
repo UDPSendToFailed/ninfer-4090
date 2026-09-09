@@ -124,6 +124,25 @@ bool try_allocate_d3d12_residency_locked(std::size_t capacity_bytes, void*& out_
     const std::size_t aligned_size =
         ((capacity_bytes + kD3D12Alignment - 1) / kD3D12Alignment) * kD3D12Alignment;
 
+    DXGI_ADAPTER_DESC1 desc1{};
+    if (SUCCEEDED(res.adapter->GetDesc1(&desc1))) {
+        // Enforce a minimum 512 MiB floor for DWM display scanout
+        constexpr UINT64 kDwmHeadroom = 512ULL * 1024ULL * 1024ULL;
+        const UINT64 max_usable = desc1.DedicatedVideoMemory > kDwmHeadroom
+                                      ? desc1.DedicatedVideoMemory - kDwmHeadroom
+                                      : 0;
+
+        Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter3;
+        if (SUCCEEDED(res.adapter.As(&adapter3))) {
+            DXGI_QUERY_VIDEO_MEMORY_INFO mem_info{};
+            if (SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mem_info))) {
+                if (mem_info.CurrentUsage + aligned_size > max_usable) {
+                    return false;
+                }
+            }
+        }
+    }
+
     D3D12_HEAP_DESC desc = {};
     desc.SizeInBytes = aligned_size;
     desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -231,7 +250,9 @@ bool try_allocate_d3d12_residency_locked(std::size_t capacity_bytes, void*& out_
                          "[ninfer] D3D12 residency arena failed read-back verification "
                          "(%zu bytes); falling back to cudaMalloc\n",
                          capacity_bytes);
+            cudaFree(dev_ptr);
             cudaDestroyExternalMemory(ext_mem);
+            cudaGetLastError();
             return false;
         }
         cudaMemset(dev_ptr, 0, capacity_bytes);
@@ -243,6 +264,7 @@ bool try_allocate_d3d12_residency_locked(std::size_t capacity_bytes, void*& out_
     if (cudaDeviceSynchronize() != cudaSuccess) {
         cudaFree(dev_ptr);
         cudaDestroyExternalMemory(ext_mem);
+        cudaGetLastError();
         return false;
     }
 
@@ -347,6 +369,17 @@ DeviceArena::Scope::Scope(Scope&& other) noexcept
 DeviceArena::DeviceArena(std::size_t capacity_bytes) {
     if (capacity_bytes == 0) {
         throw std::invalid_argument("DeviceArena capacity must be nonzero");
+    }
+
+    std::size_t free_bytes  = 0;
+    std::size_t total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess && total_bytes > 0) {
+        if (capacity_bytes > total_bytes) {
+            throw std::runtime_error(
+                "DeviceArena requested capacity (" + std::to_string(capacity_bytes) +
+                " bytes) exceeds total physical device VRAM (" + std::to_string(total_bytes) +
+                " bytes)");
+        }
     }
 
     void* ptr = nullptr;

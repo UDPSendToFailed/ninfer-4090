@@ -203,9 +203,128 @@ int main() {
     ninfer::core::set_wddm_residency_lock_enabled(true);
     failures += expect(ninfer::core::wddm_residency_lock_enabled(),
                        "wddm_residency_lock_enabled should be true after set(true)");
+
+    // =========================================================================
+    // Realistic Multi-Arena Startup Sequence Under Active Residency Lock
+    // Represents NInfer's real startup chain:
+    //   1. Model Weights Arena (materialized first)
+    //   2. Persistent State / KV Cache Arena (allocated concurrently with weights)
+    //   3. Workspace Scratchpad Arena (allocated concurrently with weights + KV)
+    // =========================================================================
+    {
+        // 1. Model Weights Arena (16 MiB)
+        constexpr std::size_t kWeightsBytes = 16 * 1024 * 1024;
+        ninfer::DeviceArena weights_arena(kWeightsBytes);
+        failures += expect(weights_arena.base() != nullptr, "weights arena base should be non-null");
+        failures += expect_size(weights_arena.capacity(), kWeightsBytes, "weights arena capacity");
+
+        const ninfer::Tensor embed_weights = weights_arena.alloc(ninfer::DType::U8, {128}, 64);
+        const ninfer::Tensor attn_weights  = weights_arena.alloc(ninfer::DType::U8, {256}, 64);
+        CUDA_CHECK(cudaMemset(embed_weights.data, 0x11, 128));
+        CUDA_CHECK(cudaMemset(attn_weights.data, 0x22, 256));
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // 2. Persistent State / KV Cache Arena (8 MiB) concurrently resident with weights
+        constexpr std::size_t kKvBytes = 8 * 1024 * 1024;
+        ninfer::DeviceArena kv_arena(kKvBytes);
+        failures += expect(kv_arena.base() != nullptr, "kv arena base should be non-null");
+        failures += expect_size(kv_arena.capacity(), kKvBytes, "kv arena capacity");
+        failures += expect(kv_arena.base() != weights_arena.base(), "kv arena overlaps weights arena base");
+
+        const std::uintptr_t w_start  = reinterpret_cast<std::uintptr_t>(weights_arena.base());
+        const std::uintptr_t w_end    = w_start + weights_arena.capacity();
+        const std::uintptr_t kv_start = reinterpret_cast<std::uintptr_t>(kv_arena.base());
+        const std::uintptr_t kv_end   = kv_start + kv_arena.capacity();
+        failures += expect(kv_end <= w_start || kv_start >= w_end, "kv arena overlaps weights arena range");
+
+        const ninfer::Tensor kv_chunk = kv_arena.alloc(ninfer::DType::U8, {128}, 64);
+        CUDA_CHECK(cudaMemset(kv_chunk.data, 0x33, 128));
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // 3. Workspace Scratchpad Arena (4 MiB) concurrently resident with weights + KV
+        constexpr std::size_t kWorkspaceBytes = 4 * 1024 * 1024;
+        ninfer::DeviceArena workspace_arena(kWorkspaceBytes);
+        failures += expect(workspace_arena.base() != nullptr, "workspace arena base should be non-null");
+        failures += expect_size(workspace_arena.capacity(), kWorkspaceBytes, "workspace arena capacity");
+
+        const std::uintptr_t ws_start = reinterpret_cast<std::uintptr_t>(workspace_arena.base());
+        const std::uintptr_t ws_end   = ws_start + workspace_arena.capacity();
+        failures += expect((ws_end <= w_start || ws_start >= w_end) &&
+                           (ws_end <= kv_start || ws_start >= kv_end),
+                           "workspace arena overlaps existing active arenas");
+
+        const ninfer::Tensor scratch = workspace_arena.alloc(ninfer::DType::U8, {128}, 64);
+        CUDA_CHECK(cudaMemset(scratch.data, 0x44, 128));
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // 4. Verify simultaneous integrity across all 3 active resident arenas
+        std::uint8_t probe_embed = 0, probe_attn = 0, probe_kv = 0, probe_ws = 0;
+        CUDA_CHECK(cudaMemcpy(&probe_embed, embed_weights.data, 1, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&probe_attn, attn_weights.data, 1, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&probe_kv, kv_chunk.data, 1, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&probe_ws, scratch.data, 1, cudaMemcpyDeviceToHost));
+
+        failures += expect(probe_embed == 0x11, "concurrent weights embed readback corrupted");
+        failures += expect(probe_attn == 0x22, "concurrent weights attn readback corrupted");
+        failures += expect(probe_kv == 0x33, "concurrent KV cache readback corrupted");
+        failures += expect(probe_ws == 0x44, "concurrent workspace readback corrupted");
+
+        // 5. Overbudget while weights arena is resident: must reject cleanly without corrupting live weights
+        std::size_t free_b = 0;
+        std::size_t total_b = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+        const std::size_t impossible_bytes = (total_b > 0 ? total_b : (24ULL << 30)) * 2ULL;
+
+        failures += expect_throws<std::runtime_error>(
+            [&] { ninfer::DeviceArena impossible_arena(impossible_bytes); },
+            "overbudget residency allocation while weights live should fail with std::runtime_error");
+
+        // CRITICAL: Live weights must remain fully intact and readable after rejection
+        std::uint8_t probe_embed_post = 0;
+        CUDA_CHECK(cudaMemcpy(&probe_embed_post, embed_weights.data, 1, cudaMemcpyDeviceToHost));
+        failures += expect(probe_embed_post == 0x11, "live weights corrupted after overbudget rejection");
+
+        // Verify CUDA context remains pristine (no sticky error)
+        const cudaError_t pending_err = cudaGetLastError();
+        failures += expect(pending_err == cudaSuccess,
+                           "CUDA context has lingering error after overbudget rejection");
+
+        // 6. Dynamic Recovery: Allocate a valid arena after overbudget rejection
+        constexpr std::size_t kRecoveryBytes = 2 * 1024 * 1024;
+        ninfer::DeviceArena recovery_arena(kRecoveryBytes);
+        failures += expect(recovery_arena.base() != nullptr, "recovery arena base should be non-null");
+        CUDA_CHECK(cudaMemset(recovery_arena.base(), 0x77, 64));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::uint8_t recovery_probe = 0;
+        CUDA_CHECK(cudaMemcpy(&recovery_probe, recovery_arena.base(), 1, cudaMemcpyDeviceToHost));
+        failures += expect(recovery_probe == 0x77, "recovery arena readback pattern mismatch");
+    }
+
+    // =========================================================================
+    // Standard Mode (Residency Lock Disabled) Startup Validation
+    // =========================================================================
     ninfer::core::set_wddm_residency_lock_enabled(false);
     failures += expect(!ninfer::core::wddm_residency_lock_enabled(),
                        "wddm_residency_lock_enabled should be false after set(false)");
+
+    {
+        std::size_t free_b = 0;
+        std::size_t total_b = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+        const std::size_t impossible_bytes = (total_b > 0 ? total_b : (24ULL << 30)) * 2ULL;
+
+        // In standard mode, physical VRAM bound must also reject impossible sizes cleanly
+        failures += expect_throws<std::runtime_error>(
+            [&] { ninfer::DeviceArena impossible_arena(impossible_bytes); },
+            "impossible allocation in standard mode should fail with std::runtime_error");
+
+        const cudaError_t pending_err = cudaGetLastError();
+        failures += expect(pending_err == cudaSuccess,
+                           "CUDA context has lingering error after standard impossible rejection");
+    }
+
+    // Restore initial state
+    if (initial_residency) { ninfer::core::set_wddm_residency_lock_enabled(true); }
 #endif
 
     return failures == 0 ? 0 : fail("arena test failed");

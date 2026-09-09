@@ -30,6 +30,8 @@ Evaluated on official Qwen3.8-27B (16.96 GiB groupwise `.ninfer` artifact, CUDA 
 The table below reflects the exact physical memory limits binary-searched on a 24 GB card under Windows WDDM residency management (rounded to the nearest thousand below).
 
 > **Operating Recommendation:** For sustained maximum throughput, set `--max-context` roughly **20,000 to 30,000 tokens below** the physical ceiling shown in the table. This guarantees zero desktop memory contention and keeps all buffers resident in pure on-chip GDDR6X.
+>
+> **Note on Context Ceilings:** The ceilings in this table were measured with `--wddm-evictable-budget`, which allows WDDM to evict background applications down to the non-evictable DWM display floor. Without this flag (default), NInfer budgets strictly against free device memory reported by CUDA. On systems actively driving desktop displays, Windows DWM and background applications typically reserve 1 to 3 GiB of VRAM, so expect context ceilings to be roughly **30,000 to 60,000 tokens lower** (or ~15% to 20% lower). Available capacity varies system by system depending on display resolution and desktop GPU workload.
 
 | Profile / Mode | Speculation | KV Mode | Physical Max Context | Cosine Sim vs FP32 | Recommended Safe Context |
 |---|---|---|---:|---|---:|
