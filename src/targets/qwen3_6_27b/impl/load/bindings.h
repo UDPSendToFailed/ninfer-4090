@@ -118,6 +118,10 @@ struct ArtifactLoadPlan {
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                qwen3_6::StartupFeatures features);
 
+// Stub binding for optional DFlash2 weights to ensure compatibility with
+// new Qwen3.8 artifact releases without materializing them on device.
+void bind_dflash2_stub(artifact::Binder& binder);
+
 struct DensePostMixerPayload {
     Weight gate_up;
     Weight down;

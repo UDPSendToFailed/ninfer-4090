@@ -42,6 +42,7 @@ public:
     explicit Binder(const Reader& reader);
 
     [[nodiscard]] bool has_object(std::string_view name) const noexcept;
+    [[nodiscard]] bool contains(std::string_view name) const noexcept { return has_object(name); }
 
     ObjectHandle require_tensor(std::string_view name, NumericFormat format, StorageLayout layout,
                                 std::span<const std::uint64_t> shape);

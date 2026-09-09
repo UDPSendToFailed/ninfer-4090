@@ -24,7 +24,15 @@ std::filesystem::path artifact_path(const char* environment, const char* filenam
     if (const char* value = std::getenv(environment); value != nullptr && *value != '\0') {
         return value;
     }
-    return std::filesystem::path(NINFER_SOURCE_DIR) / "out" / filename;
+    const std::filesystem::path default_path = std::filesystem::path(NINFER_SOURCE_DIR) / "out" / filename;
+    if (std::filesystem::is_regular_file(default_path)) {
+        return default_path;
+    }
+    const std::filesystem::path fallback_llm = std::filesystem::path("C:/Users/Henrik/Desktop/LLM") / filename;
+    if (std::filesystem::is_regular_file(fallback_llm)) {
+        return fallback_llm;
+    }
+    return default_path;
 }
 
 ninfer::targets::qwen3_6::StartupFeatures all_features() {
@@ -33,6 +41,37 @@ ninfer::targets::qwen3_6::StartupFeatures all_features() {
         .speculative   = ninfer::SpeculativeBackend::Mtp,
         .proposal_head = ninfer::ProposalHead::Optimized,
     };
+}
+
+std::size_t dflash2_device_objects(const ninfer::artifact::Reader& reader,
+                                   const ninfer::artifact::MaterializationPlan& plan) {
+    return static_cast<std::size_t>(
+        std::ranges::count_if(plan.device_objects, [&](const auto& item) {
+            return ninfer::artifact::object_name(reader.objects().at(item.object.index))
+                .starts_with("dflash2/");
+        }));
+}
+
+int verify_legacy_dflash2_compatibility(const std::filesystem::path& path, WeightsProfile profile) {
+    ninfer::artifact::Reader reader(path);
+    ninfer::artifact::Binder binder(reader);
+    const ArtifactLoadPlan plan = bind_artifact(binder, profile, all_features());
+    if (dflash2_device_objects(reader, plan.materialization) != 0) {
+        std::cerr << "legacy artifact unexpectedly bound DFlash2 on device: " << path << '\n';
+        return 1;
+    }
+    return 0;
+}
+
+int verify_dflash2_bundle(const std::filesystem::path& path, WeightsProfile profile) {
+    ninfer::artifact::Reader reader(path);
+    ninfer::artifact::Binder binder(reader);
+    const ArtifactLoadPlan plan = bind_artifact(binder, profile, all_features());
+    if (dflash2_device_objects(reader, plan.materialization) != 0) {
+        std::cerr << "DFlash2 bundle materialized on device instead of ValidateOnly: " << path << '\n';
+        return 1;
+    }
+    return 0;
 }
 
 int verify_groupwise(const std::filesystem::path& path) {
@@ -111,14 +150,48 @@ int verify_profile_mismatch_rejection() {
 } // namespace
 
 int main() {
+    if (const int result = verify_rejection(); result != 0) { return result; }
+    if (const int result = verify_profile_mismatch_rejection(); result != 0) { return result; }
+
     const std::filesystem::path groupwise =
         artifact_path("NINFER_QWEN3_6_27B_WEIGHTS", "qwen3_6_27b.ninfer");
-    if (!std::filesystem::is_regular_file(groupwise)) {
+    const std::filesystem::path qwen38_groupwise =
+        artifact_path("NINFER_QWEN3_8_27B_WEIGHTS", "qwen3_8_27b.ninfer");
+    const std::filesystem::path qwen38_dflash2 =
+        artifact_path("NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS", "qwen3_8_27b_dflash2.ninfer");
+
+    bool verified_any = false;
+    if (std::filesystem::is_regular_file(groupwise)) {
+        if (const int result = verify_groupwise(groupwise); result != 0) { return result; }
+        if (const int result =
+                verify_legacy_dflash2_compatibility(groupwise, WeightsProfile::GroupwiseInt);
+            result != 0) {
+            return result;
+        }
+        verified_any = true;
+    }
+
+    if (std::filesystem::is_regular_file(qwen38_groupwise)) {
+        if (const int result = verify_legacy_dflash2_compatibility(
+                qwen38_groupwise, WeightsProfile::GroupwiseIntW8Endpoints);
+            result != 0) {
+            return result;
+        }
+        verified_any = true;
+    }
+
+    if (std::filesystem::is_regular_file(qwen38_dflash2)) {
+        if (const int result = verify_dflash2_bundle(qwen38_dflash2,
+                                                     WeightsProfile::GroupwiseIntW8Endpoints);
+            result != 0) {
+            return result;
+        }
+        verified_any = true;
+    }
+
+    if (!verified_any) {
         std::cerr << "skip: real 27B artifact is required: groupwise=" << groupwise << '\n';
         return 77;
     }
-    if (const int result = verify_rejection(); result != 0) { return result; }
-    if (const int result = verify_profile_mismatch_rejection(); result != 0) { return result; }
-    if (const int result = verify_groupwise(groupwise); result != 0) { return result; }
     return 0;
 }
