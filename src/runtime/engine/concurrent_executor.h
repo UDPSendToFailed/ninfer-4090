@@ -162,7 +162,8 @@ public:
         std::shared_ptr<Request> request;
         try {
             auto output = instance_.loaded->frontend.make_output_session(prompt, options.stop,
-                                                                         options.output);
+                                                                         options.output,
+                                                                         options.structured_output);
             request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
                                                 prompt_summary, prepare_seconds, std::move(options),
                                                 pending_deadline, submitted, std::move(host_input));
@@ -521,6 +522,9 @@ private:
             complete_success(request, decision.finish_reason);
             return true;
         }
+        if (request->output.has_token_constraint()) {
+            instance_.program->set_token_mask_lane(lane, request->output.next_token_bitmask());
+        }
         return false;
     }
 
@@ -715,6 +719,10 @@ private:
 
     void ensure_base_plan(const std::shared_ptr<Request>& request) {
         if (!request->base_plan) {
+            if (request->output.has_token_constraint()) {
+                const auto mask = request->output.next_token_bitmask();
+                request->options.execution.token_mask.assign(mask.begin(), mask.end());
+            }
             request->base_plan.emplace(
                 instance_.program->plan_request_base(request->prompt, request->options.execution));
         }
@@ -1088,8 +1096,7 @@ private:
             }
             const OutputDecision decision = request->output.preview(
                 row_tokens, request->budget->remaining(), request->budget->limit_reason());
-            if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
-                (!decision.finished() && decision.accepted_tokens != count)) {
+            if (decision.accepted_tokens == 0 || decision.accepted_tokens > count) {
                 throw std::logic_error("output policy returned an invalid licensed prefix");
             }
             accepted[row]       = decision.accepted_tokens;
@@ -1121,6 +1128,9 @@ private:
             if (terminal[row]) {
                 complete_success(request, finish_reasons[row]);
                 remove_completed_slot(lane);
+            } else if (request->output.has_token_constraint()) {
+                instance_.program->set_token_mask_lane(lane,
+                                                       request->output.next_token_bitmask());
             }
         }
         ++cumulative_stats_.decode_rounds;

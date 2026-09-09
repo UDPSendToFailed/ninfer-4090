@@ -186,6 +186,12 @@ Program<Variant>::decode_batch(std::span<const std::uint32_t> lanes,
 }
 
 template <>
+void Program<Variant>::set_token_mask_lane(std::uint32_t lane,
+                                           std::span<const std::uint32_t> mask) {
+    impl_->set_token_mask_lane(lane, mask);
+}
+
+template <>
 void Program<Variant>::resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                              std::span<const std::uint32_t> accepted_tokens,
                                              std::span<const std::uint8_t> terminal,

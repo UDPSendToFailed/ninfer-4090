@@ -72,6 +72,7 @@ std::string read_file(const char* path) {
 
 std::string read_template_fixture(const char* path) {
     std::string source = read_file(path);
+    source.erase(std::remove(source.begin(), source.end(), '\r'), source.end());
     if (!source.empty() && source.back() == '\n') { source.pop_back(); }
     return source;
 }

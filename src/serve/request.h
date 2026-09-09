@@ -127,6 +127,25 @@ struct SamplingParams {
     int n = 1;
 };
 
+enum class ResponseFormatMode : std::uint8_t {
+    Text,
+    JsonObject,
+    JsonSchema,
+};
+
+// Wire-normalized structured-output contract. The schema stays serialized at
+// the serve boundary so the Engine API does not acquire a JSON-library type.
+struct ResponseFormat {
+    ResponseFormatMode mode = ResponseFormatMode::Text;
+    std::string name;
+    std::string schema_json;
+    bool strict = false;
+
+    [[nodiscard]] bool constrained() const noexcept {
+        return mode != ResponseFormatMode::Text;
+    }
+};
+
 // Protocol-level effort vocabulary. Each wire adapter accepts the values from
 // its external contract; translation then resolves them against the capabilities
 // advertised by the chat template embedded in the loaded artifact.
@@ -191,6 +210,7 @@ struct GenerationRequest {
     std::optional<bool> preserve_thinking;
     bool preserve_thinking_semantic_change = false;
     SamplingParams sampling;
+    ResponseFormat response_format;
 
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;

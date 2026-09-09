@@ -169,10 +169,28 @@ struct OutputOptions {
     bool preserve_special_tokens = false;
 };
 
+enum class StructuredOutputMode : std::uint8_t {
+    None,
+    JsonObject,
+    JsonSchema,
+};
+
+// Describes a token-level output language. The target frontend compiles this against its exact
+// tokenizer; the runtime then applies the resulting token mask before every sampling decision.
+struct StructuredOutputOptions {
+    StructuredOutputMode mode = StructuredOutputMode::None;
+    std::string name;
+    std::string schema_json;
+    bool strict = false;
+
+    [[nodiscard]] bool enabled() const noexcept { return mode != StructuredOutputMode::None; }
+};
+
 struct RequestOptions {
     ExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
+    StructuredOutputOptions structured_output;
 };
 
 // Owns a bounded host-input reservation whose lifetime may cross from request preparation into

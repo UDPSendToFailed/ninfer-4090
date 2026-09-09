@@ -23,12 +23,15 @@ struct ResolvedExecutionOptions {
     ResolvedSamplingParameters sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    std::vector<std::uint32_t> token_mask;
+    bool disable_speculation = false;
 };
 
 struct ResolvedRequestOptions {
     ResolvedExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
+    StructuredOutputOptions structured_output;
 };
 
 struct OutputDecision {

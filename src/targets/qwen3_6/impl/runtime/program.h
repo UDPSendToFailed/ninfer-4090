@@ -56,6 +56,8 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::size_t vision_transient_bytes = 0;
     std::optional<std::uint32_t> turn_rewrite_boundary;
     bool allow_prefix_reuse = false;
+    std::vector<std::uint32_t> token_mask;
+    bool disable_speculation = false;
 };
 
 template <>
@@ -74,6 +76,8 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::filesystem::path disk_snapshot_path;
+    std::vector<std::uint32_t> token_mask;
+    bool disable_speculation = false;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail
@@ -166,6 +170,7 @@ struct RequestControl {
     Lifecycle lifecycle = Lifecycle::Empty;
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
+    std::vector<std::uint32_t> initial_token_mask;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
 
@@ -214,6 +219,7 @@ public:
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
                  std::span<const runtime::RoundBudget> budgets);
+    void set_token_mask_lane(std::uint32_t lane, std::span<const std::uint32_t> mask);
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                std::span<const std::uint32_t> accepted_tokens,
@@ -353,6 +359,7 @@ public:
     Tensor prefill_hidden;
     Tensor sampling_config;
     Tensor token_counts;
+    Tensor token_masks;
     Tensor tail_hidden_store;
     Tensor turn_checkpoint_hidden_store;
 
