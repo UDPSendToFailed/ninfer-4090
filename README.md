@@ -12,15 +12,15 @@ Evaluated on official Qwen3.8-27B (16.96 GiB groupwise `.ninfer` artifact, CUDA 
 
 | Test Case | Configuration | Throughput | Notes / Acceptance |
 |---|---|---:|---|
-| **Prefill (`pp2048`)** | `pp2048`, Chunk 1024, INT8 KV | **`2,093.5 ± 0.7 tok/s`** | Saturated compute |
-| **Prefill (`pp4096`)** | `pp4096`, Chunk 1024, INT8 KV | **`2,079.5 ± 0.4 tok/s`** | Deep chunked prefill |
-| **Prefill (`pp512`)** | `pp512`, Chunk 1024, INT8 KV | **`1,738.1 ± 82.9 tok/s`** | Low-latency shallow prefill |
-| **Decode: Deep Context MTP7 (`pp32768+tg128`)** | `pp32768+tg128`, `--greedy`, MTP7, `rk4v4-e8` | **`229.9 ± 0.1 tok/s`** | 100% draft acceptance (8.00 tok/round) |
-| **Decode: Prompt-Cached MTP7 (`pp2048+tg128`)** | `pp2048+tg128`, `--greedy`, MTP7, INT8 KV | **`218.3 ± 0.9 tok/s`** | 88.0% draft acceptance (7.11 tok/round) |
-| **Decode: Prompt-Cached MTP7 (`pp2048+tg128`)** | `pp2048+tg128`, `--greedy`, MTP7, `rk4v4-e8` | **`216.9 ± 1.1 tok/s`** | 88.0% draft acceptance (7.11 tok/round) |
-| **Decode: Cold Bench Corpus (MTP4)** | `tg128`, `--greedy`, MTP4, `rk4v4-e8` | **`89.2 ± 3.5 tok/s`** | 30.7% acceptance on cold seed |
-| **Decode: Baseline (MTP0)** | `tg128`, no speculation, INT8 KV, CUDA Graph | **`52.8 ± 0.0 tok/s`** | Single-token base autoregressive decode |
-| **DirectStorage 1.3 Cold DMA Restore** | 77,615 prompt tokens ($1.51\text{ GiB}$) | **`150 ms (10.1 GB/s)`** | Drops cold TTFT from 52.6s to 1.86s |
+| **Prefill (`pp2048`)** | `pp2048`, Chunk 1024, INT8 KV | **`2,146.3 ± 3.0 tok/s`** | Saturated compute |
+| **Prefill (`pp4096`)** | `pp4096`, Chunk 1024, INT8 KV | **`2,637.6 ± 3.3 tok/s`** | Deep chunked prefill |
+| **Prefill (`pp512`)** | `pp512`, Chunk 1024, INT8 KV | **`1,971.5 ± 6.4 tok/s`** | Low-latency shallow prefill |
+| **Decode: Deep Context MTP7 (`pp32768+tg128`)** | `pp32768+tg128`, `--greedy`, MTP7, `rk4v4-e8` | **`272.5 ± 0.7 tok/s`** | 100% draft acceptance (8.00 tok/round) |
+| **Decode: Prompt-Cached MTP7 (`pp2048+tg128`)** | `pp2048+tg128`, `--greedy`, MTP7, INT8 KV | **`220.8 ± 23.5 tok/s`** | 88.0% draft acceptance (7.11 tok/round) |
+| **Decode: Prompt-Cached MTP7 (`pp2048+tg128`)** | `pp2048+tg128`, `--greedy`, MTP7, `rk4v4-e8` | **`226.0 ± 23.2 tok/s`** | 88.0% draft acceptance (7.11 tok/round) |
+| **Decode: Cold Bench Corpus (MTP4)** | `tg128`, `--greedy`, MTP4, `rk4v4-e8` | **`79.5 ± 8.7 tok/s`** | 28.4% acceptance on cold seed |
+| **Decode: Baseline (MTP0)** | `tg128`, no speculation, INT8 KV, CUDA Graph | **`51.9 ± 2.2 tok/s`** | Single-token base autoregressive decode |
+| **DirectStorage 1.3 Cold DMA Restore** | 77,615 prompt tokens (1.51 GiB) | **`150 ms (10.1 GB/s)`** | Drops cold TTFT from 52.6s to 1.86s |
 | **360k Needle-in-a-Haystack** | 359,169 prompt tokens, `rk2v4-e8` | **`100% (5/5 Needles)`** | 666.7 tok/s avg prefill, exact recall |
 
 ---
