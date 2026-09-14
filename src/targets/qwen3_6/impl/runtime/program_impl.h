@@ -2617,15 +2617,18 @@ void ProgramImplCore::snapshot_lane_to_disk(std::uint32_t lane, DiskStateCache& 
 
     std::vector<std::uint64_t> all_page_hashes;
     all_page_hashes.reserve(text_page_count);
-    std::vector<std::uint64_t> missing_page_hashes;
-    std::vector<std::int32_t> missing_physical_page_ids;
-
     for (std::uint32_t i = 0; i < text_page_count; ++i) {
         const std::size_t span_end = std::min<std::size_t>(total_tokens, static_cast<std::size_t>(i + 1) * page_size);
-        const std::uint64_t phash = DiskStateCache::hash_prompt_prefix(std::span<const TokenId>(ledger_tokens.data(), span_end));
-        all_page_hashes.push_back(phash);
-        if (!disk_cache.has_page(phash)) {
-            missing_page_hashes.push_back(phash);
+        all_page_hashes.push_back(DiskStateCache::hash_prompt_prefix(std::span<const TokenId>(ledger_tokens.data(), span_end)));
+    }
+
+    // Leased before the stored check: a compaction must not remove the pages this save reuses.
+    auto page_lease = disk_cache.lease_pages(all_page_hashes);
+    std::vector<std::uint64_t> missing_page_hashes;
+    std::vector<std::int32_t> missing_physical_page_ids;
+    for (std::uint32_t i = 0; i < text_page_count; ++i) {
+        if (!page_lease.stored(i)) {
+            missing_page_hashes.push_back(all_page_hashes[i]);
             if (i < valid_page_ids.size()) {
                 missing_physical_page_ids.push_back(valid_page_ids[i]);
             }
@@ -2710,7 +2713,7 @@ void ProgramImplCore::snapshot_lane_to_disk(std::uint32_t lane, DiskStateCache& 
                                 std::move(gdn_payload), std::move(all_page_hashes),
                                 std::move(missing_page_hashes), std::move(missing_pages_data),
                                 single_page_bytes, std::move(mtp_kv_payload),
-                                mtp_page_count, std::move(tail_hidden_payload));
+                                mtp_page_count, std::move(tail_hidden_payload), std::move(page_lease));
 }
 
 void ProgramImplCore::snapshot_turn_checkpoint_to_disk(std::uint32_t lane, DiskStateCache& disk_cache) {
@@ -2759,15 +2762,18 @@ void ProgramImplCore::snapshot_turn_checkpoint_to_disk(std::uint32_t lane, DiskS
 
     std::vector<std::uint64_t> all_page_hashes;
     all_page_hashes.reserve(text_page_count);
-    std::vector<std::uint64_t> missing_page_hashes;
-    std::vector<std::int32_t> missing_physical_page_ids;
-
     for (std::uint32_t i = 0; i < text_page_count; ++i) {
         const std::size_t span_end = std::min<std::size_t>(total_tokens, static_cast<std::size_t>(i + 1) * page_size);
-        const std::uint64_t phash = DiskStateCache::hash_prompt_prefix(std::span<const TokenId>(turn_toks.data(), span_end));
-        all_page_hashes.push_back(phash);
-        if (!disk_cache.has_page(phash)) {
-            missing_page_hashes.push_back(phash);
+        all_page_hashes.push_back(DiskStateCache::hash_prompt_prefix(std::span<const TokenId>(turn_toks.data(), span_end)));
+    }
+
+    // Leased before the stored check: a compaction must not remove the pages this save reuses.
+    auto page_lease = disk_cache.lease_pages(all_page_hashes);
+    std::vector<std::uint64_t> missing_page_hashes;
+    std::vector<std::int32_t> missing_physical_page_ids;
+    for (std::uint32_t i = 0; i < text_page_count; ++i) {
+        if (!page_lease.stored(i)) {
+            missing_page_hashes.push_back(all_page_hashes[i]);
             if (i < valid_page_ids.size()) {
                 missing_physical_page_ids.push_back(valid_page_ids[i]);
             }
@@ -2856,7 +2862,7 @@ void ProgramImplCore::snapshot_turn_checkpoint_to_disk(std::uint32_t lane, DiskS
                                 std::move(gdn_payload), std::move(all_page_hashes),
                                 std::move(missing_page_hashes), std::move(missing_pages_data),
                                 single_page_bytes, std::move(mtp_kv_payload),
-                                mtp_page_count, std::move(tail_hidden_payload));
+                                mtp_page_count, std::move(tail_hidden_payload), std::move(page_lease));
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

@@ -7,6 +7,7 @@
 #include "core/direct_storage_engine.h"
 #endif
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
@@ -447,6 +448,216 @@ void test_concurrent_compaction_and_non_blocking_lookup() {
         const bool ok = cache.load_snapshot(manifest_turn1_path, out_h, out_toks, out_gdn, out_kv, out_mtp, out_tail);
         expect(ok, "Live snapshot must remain readable after concurrent compaction / cancellation");
         expect(out_toks == tokens_turn1, "Restored tokens must match");
+    }
+
+    std::filesystem::remove_all(test_dir, ec);
+}
+
+// Saves that land while a forced compaction copies the pool must survive the swap: their pages
+// are appended to the old pool file and recorded in the old index, which the swap replaces.
+void test_pages_appended_during_compaction_survive() {
+    const std::filesystem::path test_dir = "./.test_ninfer_cache_append_during_compaction";
+    std::error_code ec;
+    std::filesystem::remove_all(test_dir, ec);
+
+    DiskStateCacheConfig config;
+    config.cache_dir       = test_dir;
+    config.max_cache_bytes = 8ULL << 30; // Far above the pool: the writer's prune_lru never compacts
+    config.enabled         = true;
+
+    const std::uint64_t model_hash = 0x5AFE5AFE00C0FFEEULL;
+    constexpr std::uint32_t page_bytes = 8192;
+    constexpr std::uint32_t base_pages = 4096; // ~32 MB of live pages keeps each copy pass long
+    constexpr std::uint32_t dead_pages = 64;
+    constexpr std::uint32_t fresh_pages = 4;
+    constexpr int rounds = 6;
+
+    const auto gdn_state  = generate_deterministic_bytes(4096, 701);
+    const auto mtp_state  = generate_deterministic_bytes(2048, 702);
+    const auto tail_state = generate_deterministic_bytes(1024, 703);
+
+    struct Saved {
+        std::vector<TokenId> tokens;
+        std::vector<std::byte> kv;
+        std::filesystem::path path;
+    };
+    std::vector<Saved> fresh;
+
+    {
+        DiskStateCache cache(config);
+
+        const auto base_tokens = generate_tokens(std::size_t{base_pages} * 64, 710);
+        const auto base_kv = generate_deterministic_bytes(std::size_t{base_pages} * page_bytes, 711);
+        cache.enqueue_save(model_hash, base_tokens, 1, 0, gdn_state, base_kv, base_pages,
+                           mtp_state, 1, tail_state);
+        expect(wait_for_match(cache, model_hash, base_tokens, 30000).has_value(),
+               "Base snapshot must be indexed before the compaction rounds");
+
+        std::uint32_t seed = 1000;
+        for (int round = 0; round < rounds; ++round) {
+            // A manifest whose file is gone leaves its pages dead, so the forced compaction rewrites.
+            const auto dead_tokens = generate_tokens(std::size_t{dead_pages} * 64, seed++);
+            const auto dead_kv = generate_deterministic_bytes(std::size_t{dead_pages} * page_bytes, seed++);
+            cache.enqueue_save(model_hash, dead_tokens, 1, 0, gdn_state, dead_kv, dead_pages,
+                               mtp_state, 1, tail_state);
+            const auto dead_match = wait_for_match(cache, model_hash, dead_tokens, 10000);
+            expect(dead_match.has_value(), "Dead-to-be snapshot must be indexed");
+            if (!dead_match) { break; }
+            std::filesystem::remove(dead_match->file_path, ec);
+
+            std::atomic<bool> compaction_done{false};
+            std::thread compactor([&]() {
+                cache.compact_pool(/*force=*/true);
+                compaction_done.store(true);
+            });
+
+            // Save one snapshot at a time until the compaction finishes, so appends are spread
+            // over the whole copy pass and at least one lands between its snapshot and its swap.
+            do {
+                Saved saved;
+                saved.tokens = generate_tokens(std::size_t{fresh_pages} * 64, seed++);
+                saved.kv = generate_deterministic_bytes(std::size_t{fresh_pages} * page_bytes, seed++);
+                cache.enqueue_save(model_hash, saved.tokens, 1, 0, gdn_state, saved.kv, fresh_pages,
+                                   mtp_state, 1, tail_state);
+                const auto match = wait_for_match(cache, model_hash, saved.tokens, 10000);
+                expect(match.has_value(), "Snapshot saved during compaction must be indexed");
+                if (!match) { break; }
+                saved.path = match->file_path;
+                fresh.push_back(std::move(saved));
+            } while (!compaction_done.load());
+
+            compactor.join();
+        }
+
+        std::size_t lost = 0;
+        for (const auto& saved : fresh) {
+            DiskStateHeader out_h;
+            std::vector<TokenId> out_toks;
+            std::vector<std::byte> out_gdn, out_kv, out_mtp, out_tail;
+            if (!cache.load_snapshot(saved.path, out_h, out_toks, out_gdn, out_kv, out_mtp, out_tail) ||
+                out_kv != saved.kv) {
+                ++lost;
+            }
+        }
+        expect(lost == 0, "Every snapshot saved during compaction must load bit-exact; lost " +
+                          std::to_string(lost) + " of " + std::to_string(fresh.size()));
+    }
+
+    // The rewritten pool index on disk must also carry the pages appended during compaction.
+    {
+        DiskStateCache cache(config);
+        std::size_t lost = 0;
+        for (const auto& saved : fresh) {
+            DiskStateHeader out_h;
+            std::vector<TokenId> out_toks;
+            std::vector<std::byte> out_gdn, out_kv, out_mtp, out_tail;
+            if (!cache.load_snapshot(saved.path, out_h, out_toks, out_gdn, out_kv, out_mtp, out_tail) ||
+                out_kv != saved.kv) {
+                ++lost;
+            }
+        }
+        expect(lost == 0, "Snapshots saved during compaction must load bit-exact after reopening; lost " +
+                          std::to_string(lost) + " of " + std::to_string(fresh.size()));
+    }
+
+    std::filesystem::remove_all(test_dir, ec);
+}
+
+// A save that reuses stored pages leases them before choosing which pages to write, so a
+// compaction that runs before the save is queued keeps them. Without a lease, pages compacted
+// away in between make the writer skip the save instead of indexing a manifest that cannot load.
+void test_leased_pages_survive_compaction() {
+    const std::filesystem::path test_dir = "./.test_ninfer_cache_leased_pages";
+    std::error_code ec;
+    std::filesystem::remove_all(test_dir, ec);
+
+    DiskStateCacheConfig config;
+    config.cache_dir       = test_dir;
+    config.max_cache_bytes = 100ULL << 20;
+    config.enabled         = true;
+
+    const std::uint64_t model_hash = 0x1EA5E1EA5E1EA5E0ULL;
+    constexpr std::uint32_t page_bytes = 8192;
+    constexpr std::uint32_t page_count = 4;
+    const auto gdn_state  = generate_deterministic_bytes(4096, 721);
+    const auto tail_state = generate_deterministic_bytes(1024, 722);
+
+    const auto page_hashes = [](const std::vector<TokenId>& tokens) {
+        std::vector<std::uint64_t> hashes;
+        for (std::size_t i = 0; i < page_count; ++i) {
+            hashes.push_back(DiskStateCache::hash_prompt_prefix(
+                std::span<const TokenId>(tokens.data(), (i + 1) * 64)));
+        }
+        return hashes;
+    };
+    const auto all_stored = [](const DiskStateCache& cache, const std::vector<std::uint64_t>& hashes) {
+        return std::all_of(hashes.begin(), hashes.end(), [&](std::uint64_t h) { return cache.has_page(h); });
+    };
+
+    DiskStateCache cache(config);
+
+    // Stores the pages of `tokens` and deletes the manifest, which leaves the pages dead.
+    const auto store_orphaned_pages = [&](const std::vector<TokenId>& tokens, const std::vector<std::byte>& kv) {
+        cache.enqueue_save(model_hash, tokens, 1, 0, gdn_state, kv, page_count, {}, 0, tail_state);
+        const auto match = wait_for_match(cache, model_hash, tokens);
+        expect(match.has_value(), "Orphaned-page fixture must be written");
+        if (match) {
+            std::filesystem::remove(match->file_path, ec);
+        }
+    };
+
+    // Leased: the pages survive a forced compaction and the save that reuses them loads.
+    {
+        const auto tokens = generate_tokens(page_count * 64, 723);
+        const auto kv = generate_deterministic_bytes(page_count * page_bytes, 724);
+        const auto hashes = page_hashes(tokens);
+        store_orphaned_pages(tokens, kv);
+
+        auto lease = cache.lease_pages(hashes);
+        bool lease_saw_all = true;
+        for (std::size_t i = 0; i < hashes.size(); ++i) {
+            lease_saw_all = lease_saw_all && lease.stored(i);
+        }
+        expect(lease_saw_all, "Lease must report the orphaned pages as stored");
+
+        cache.compact_pool(/*force=*/true);
+        expect(all_stored(cache, hashes), "Leased pages must survive a forced compaction");
+
+        cache.enqueue_save_cow(model_hash, tokens, 1, 0, gdn_state, hashes, {}, {}, page_bytes, {}, 0,
+                               tail_state, std::move(lease));
+        const auto match = wait_for_match(cache, model_hash, tokens);
+        DiskStateHeader out_h;
+        std::vector<TokenId> out_toks;
+        std::vector<std::byte> out_gdn, out_kv, out_mtp, out_tail;
+        expect(match && cache.load_snapshot(match->file_path, out_h, out_toks, out_gdn, out_kv, out_mtp, out_tail) &&
+                   out_kv == kv,
+               "Save that reuses leased pages must load bit-exact after compaction");
+    }
+
+    // Released: once the save is indexed its lease is gone, so an unreferenced page is collectable.
+    {
+        const auto tokens = generate_tokens(page_count * 64, 725);
+        const auto kv = generate_deterministic_bytes(page_count * page_bytes, 726);
+        const auto hashes = page_hashes(tokens);
+        store_orphaned_pages(tokens, kv);
+        expect(all_stored(cache, hashes), "Unleased fixture pages must be stored before compaction");
+
+        cache.compact_pool(/*force=*/true);
+        expect(!std::any_of(hashes.begin(), hashes.end(), [&](std::uint64_t h) { return cache.has_page(h); }),
+               "Pages no lease or manifest holds must be compacted away");
+
+        // The caller saw the pages stored before the compaction and sends none of their bytes.
+        cache.enqueue_save_cow(model_hash, tokens, 1, 0, gdn_state, hashes, {}, {}, page_bytes, {}, 0, tail_state);
+
+        // The writer is FIFO: once a later save is indexed, the one above has been handled.
+        const auto marker_tokens = generate_tokens(64, 727);
+        const auto marker_kv = generate_deterministic_bytes(page_bytes, 728);
+        cache.enqueue_save(model_hash, marker_tokens, 1, 0, gdn_state, marker_kv, 1, {}, 0, tail_state);
+        expect(wait_for_match(cache, model_hash, marker_tokens).has_value(), "Marker save must be indexed");
+
+        const auto match = cache.find_longest_matching_prefix(model_hash, tokens);
+        expect(!match || match->matched_tokens != tokens.size(),
+               "Save whose reused pages were compacted away must not be indexed");
     }
 
     std::filesystem::remove_all(test_dir, ec);
@@ -1750,6 +1961,8 @@ int main() {
     test_compaction_fragmentation_thresholds();
     test_bulk_lru_watermark_eviction();
     test_concurrent_compaction_and_non_blocking_lookup();
+    test_pages_appended_during_compaction_survive();
+    test_leased_pages_survive_compaction();
     test_paged_kv_gather_scatter_page_major_layout_verification();
     test_snapshot_longer_than_prompt_not_matched();
     test_failed_disk_restore_degrades_to_full_reset();
