@@ -5,6 +5,9 @@
 #include "artifact/reader.h"
 #include "core/arena.h"
 #include "core/device.h"
+#if defined(_WIN32)
+#include "core/direct_storage_engine.h"
+#endif
 #include "runtime/engine/kv_capacity.h"
 
 #include <chrono>
@@ -113,6 +116,11 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
                                        std::string_view target_key) {
 #if defined(_WIN32)
     core::set_wddm_residency_lock_enabled(options.wddm_evictable_budget);
+    // The DirectStorage staging buffer must exist before device memory is budgeted below;
+    // allocated on the first restore it lands on a device KV capacity auto has already filled.
+    if (options.enable_prompt_cache) {
+        (void)core::DirectStorageEngine::instance().prepare();
+    }
 #endif
     const auto& identity                          = reader.identity();
     const auto weights_profile                    = Target::resolve_weights(identity);

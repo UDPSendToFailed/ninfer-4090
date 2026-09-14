@@ -1280,7 +1280,7 @@ void test_direct_storage_reuse_without_teardown_race() {
     CUDA_CHECK(cudaMalloc(&d_stall_b, kStallBytes));
 
     int kStallCopies = 400;
-    void* first_ds_staging = nullptr;
+    const std::byte* first_ds_staging = nullptr;
 
     {
         DiskStateCache cache(config);
@@ -1358,7 +1358,7 @@ void test_direct_storage_reuse_without_teardown_race() {
             // Prove the staging buffer is actually reused: a changed pointer means this
             // fixture does not verify the race, regardless of the FAIL/PASS outcome below.
             if (iter == 0) {
-                first_ds_staging = const_cast<void*>(d_ds_staging);
+                first_ds_staging = d_ds_staging;
             } else {
                 expect(d_ds_staging == first_ds_staging,
                        "Reuse-race staging pointer must stay identical across iterations "

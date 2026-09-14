@@ -12,6 +12,7 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -64,6 +65,11 @@ public:
 
     [[nodiscard]] bool available() const noexcept { return initialized_; }
 
+    // Allocates the staging buffer now instead of on the first restore. Call it before
+    // device memory is budgeted (KV capacity auto) so the budget accounts for the buffer;
+    // allocating it later on a nearly full device leaves D3D12 contending for residency.
+    bool prepare();
+
     // Reads `segments` in order into the persistent staging buffer, packing consecutive
     // segments into batches of at most kStagingCapacityBytes, and hands each batch to
     // `consumer`. Before the next batch overwrites the staging buffer, the consumer's
@@ -86,9 +92,9 @@ private:
     void release_staging() noexcept;
     void cleanup();
     void sync_last_consumer() noexcept;
-    void wait_fence_on_cpu() noexcept;
+    bool wait_fence_on_cpu() noexcept;
 
-    bool initialized_ = false;
+    std::atomic<bool> initialized_ = false;
     mutable std::recursive_mutex mutex_;
 
     // Direct3D 12 & DXGI

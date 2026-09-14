@@ -92,6 +92,13 @@ bool DirectStorageEngine::init_d3d12_and_fence() {
 }
 
 bool DirectStorageEngine::init_direct_storage() {
+    // Snapshots are stored uncompressed. Left enabled, GPU decompression reserves device
+    // memory on the D3D12 device that auto KV capacity then cannot use. The call only
+    // succeeds before the first queue exists; a later re-initialization keeps the setting.
+    DSTORAGE_CONFIGURATION config{};
+    config.DisableGpuDecompression = TRUE;
+    (void)DStorageSetConfiguration(&config);
+
     HRESULT hr = DStorageGetFactory(IID_PPV_ARGS(&ds_factory_));
     if (FAILED(hr) || !ds_factory_) { return false; }
 
@@ -143,17 +150,38 @@ void DirectStorageEngine::sync_last_consumer() noexcept {
     last_consumer_stream_ = nullptr;
 }
 
-void DirectStorageEngine::wait_fence_on_cpu() noexcept {
-    if (!d3d12_fence_ || fence_value_ == 0 || d3d12_fence_->GetCompletedValue() >= fence_value_) {
-        return;
+// Blocks until DirectStorage has retired every request up to fence_value_. There is no
+// timeout: releasing files or staging while requests are pending is the crash this engine
+// exists to avoid. Returns false only when the device was removed and the requests will
+// never complete.
+bool DirectStorageEngine::wait_fence_on_cpu() noexcept {
+    if (!d3d12_fence_ || fence_value_ == 0) {
+        return true;
     }
     HANDLE event = CreateEventEx(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
-    if (event) {
-        if (SUCCEEDED(d3d12_fence_->SetEventOnCompletion(fence_value_, event))) {
-            WaitForSingleObject(event, 5000); // 5s safety timeout
+    if (event && FAILED(d3d12_fence_->SetEventOnCompletion(fence_value_, event))) {
+        CloseHandle(event);
+        event = nullptr;
+    }
+    bool completed = false;
+    for (;;) {
+        if (d3d12_fence_->GetCompletedValue() >= fence_value_) {
+            completed = true;
+            break;
         }
+        if (d3d12_device_ && FAILED(d3d12_device_->GetDeviceRemovedReason())) {
+            break;
+        }
+        if (event) {
+            WaitForSingleObject(event, 1000);
+        } else {
+            Sleep(10);
+        }
+    }
+    if (event) {
         CloseHandle(event);
     }
+    return completed;
 }
 
 bool DirectStorageEngine::ensure_staging_vram() {
@@ -246,6 +274,14 @@ void DirectStorageEngine::release_staging() noexcept {
 
     staging_resource_.Reset();
     current_capacity_ = 0;
+}
+
+bool DirectStorageEngine::prepare() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!initialized_) {
+        return false;
+    }
+    return ensure_device_alive() && ensure_staging_vram();
 }
 
 bool DirectStorageEngine::restore_segments(const std::filesystem::path& pool_path,
@@ -349,7 +385,15 @@ bool DirectStorageEngine::restore_segments(const std::filesystem::path& pool_pat
         }
 
         last_consumer_stream_ = stream;
-        if (!consumer(staging, first, std::span<const std::size_t>(offsets.data(), offsets.size()))) {
+        bool consumed = false;
+        try {
+            consumed = consumer(staging, first, std::span<const std::size_t>(offsets.data(), offsets.size()));
+        } catch (...) {
+            // The files are about to be released by unwinding.
+            wait_fence_on_cpu();
+            throw;
+        }
+        if (!consumed) {
             ok = false;
             break;
         }
@@ -357,7 +401,9 @@ bool DirectStorageEngine::restore_segments(const std::filesystem::path& pool_pat
     }
 
     // The files must outlive every request that references them.
-    wait_fence_on_cpu();
+    if (!wait_fence_on_cpu()) {
+        ok = false;
+    }
 
     DSTORAGE_ERROR_RECORD record{};
     ds_queue_->RetrieveErrorRecord(&record);
@@ -371,6 +417,15 @@ bool DirectStorageEngine::restore_segments(const std::filesystem::path& pool_pat
 }
 
 void DirectStorageEngine::cleanup() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+
+    // Retire and close the queue before its destination resource goes away.
+    sync_last_consumer();
+    wait_fence_on_cpu();
+    if (ds_queue_) {
+        ds_queue_->Close();
+        ds_queue_.Reset();
+    }
     release_staging();
     last_consumer_stream_ = nullptr;
     if (cuda_fence_sem_) {
@@ -381,7 +436,6 @@ void DirectStorageEngine::cleanup() {
         cudaEventDestroy(consumer_event_);
         consumer_event_ = nullptr;
     }
-    ds_queue_.Reset();
     ds_factory_.Reset();
     d3d12_fence_.Reset();
     fence_value_ = 0;
