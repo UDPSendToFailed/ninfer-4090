@@ -22,7 +22,7 @@
 namespace ninfer {
 
 inline constexpr std::uint64_t kDiskStateCacheMagic   = 0x4E494E465F4D414EULL; // "NINF_MAN"
-inline constexpr std::uint32_t kDiskStateCacheVersion = 4;
+inline constexpr std::uint32_t kDiskStateCacheVersion = 5; // 5: model_hash no longer mixes kv_capacity/max_context
 
 #pragma pack(push, 1)
 struct DiskStateHeader {
