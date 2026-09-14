@@ -2,6 +2,7 @@
 #include "core/device.h"
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
+#include "targets/qwen3_6/impl/runtime/disk_restore_fallback.h"
 #if defined(_WIN32)
 #include "core/direct_storage_engine.h"
 #endif
@@ -1385,6 +1386,126 @@ void test_direct_storage_reuse_without_teardown_race() {
 }
 #endif
 
+// A snapshot longer than the live prompt (and therefore than any context the planner admits)
+// must never be offered; a longer prompt extending it still matches the whole snapshot.
+void test_snapshot_longer_than_prompt_not_matched() {
+    const std::filesystem::path test_dir = "./.test_ninfer_cache_longer_snapshot";
+    std::error_code ec;
+    std::filesystem::remove_all(test_dir, ec);
+
+    DiskStateCacheConfig config;
+    config.cache_dir       = test_dir;
+    config.max_cache_bytes = 100ULL << 20;
+    config.enabled         = true;
+
+    const std::uint64_t model_hash = 0x5EED5EED5EED5EEDULL;
+    constexpr std::uint32_t page_bytes = 8192;
+    const auto tokens = generate_tokens(8 * 64, 77);
+    const auto kv     = generate_deterministic_bytes(8 * page_bytes, 771);
+    const auto gdn    = generate_deterministic_bytes(1024, 772);
+
+    {
+        DiskStateCache cache(config);
+        cache.enqueue_save(model_hash, tokens, 1, 0, gdn, kv, 8, {}, 0, {});
+        expect(wait_for_match(cache, model_hash, tokens).has_value(), "Longer-snapshot fixture must be written");
+
+        const std::span<const TokenId> shorter(tokens.data(), 4 * 64);
+        expect(!cache.find_longest_matching_prefix(model_hash, shorter).has_value(),
+               "Snapshot with token_count above the prompt length must not match");
+
+        std::vector<TokenId> longer = tokens;
+        longer.push_back(42);
+        const auto match = cache.find_longest_matching_prefix(model_hash, longer);
+        expect(match.has_value() && match->matched_tokens == tokens.size(),
+               "Prompt extending the snapshot must match the whole snapshot");
+    }
+
+    std::filesystem::remove_all(test_dir, ec);
+}
+
+// A planned disk restore whose snapshot no longer loads must degrade to the FullReset plan
+// shape, never keep the matched base over unrestored state.
+void test_failed_disk_restore_degrades_to_full_reset() {
+    const std::filesystem::path test_dir = "./.test_ninfer_cache_restore_fallback";
+    std::error_code ec;
+    std::filesystem::remove_all(test_dir, ec);
+
+    DiskStateCacheConfig config;
+    config.cache_dir       = test_dir;
+    config.max_cache_bytes = 100ULL << 20;
+    config.enabled         = true;
+
+    const std::uint64_t model_hash = 0xFA11BAC4FA11BAC4ULL;
+    const auto tokens = generate_tokens(4 * 64, 91);
+    const auto kv     = generate_deterministic_bytes(4 * 8192, 911);
+    const auto gdn    = generate_deterministic_bytes(1024, 912);
+
+    std::filesystem::path snapshot_path;
+    {
+        DiskStateCache cache(config);
+        cache.enqueue_save(model_hash, tokens, 1, 0, gdn, kv, 4, {}, 0, {});
+        const auto match = wait_for_match(cache, model_hash, tokens);
+        expect(match.has_value(), "Fallback fixture must be written");
+        if (match) { snapshot_path = match->file_path; }
+    }
+    std::filesystem::remove(snapshot_path, ec);
+    {
+        DiskStateCache cache(config);
+        DiskStateHeader header;
+        std::vector<TokenId> loaded_tokens;
+        std::vector<std::byte> loaded_gdn, loaded_kv, loaded_mtp, loaded_tail;
+        expect(!cache.load_snapshot(snapshot_path, header, loaded_tokens, loaded_gdn, loaded_kv,
+                                    loaded_mtp, loaded_tail),
+               "Loading a removed snapshot must fail so the restore branch falls back");
+    }
+    std::filesystem::remove_all(test_dir, ec);
+
+    enum class Reuse { FullReset, AppendAtFrontier, RestoreTurnCheckpoint, RestoreDiskCheckpoint };
+    enum class Bridge { None, BeforeSuffix, AfterExactHit };
+    struct Summary { std::uint32_t reusable_prompt_tokens = 0; };
+    struct Plan {
+        Summary summary;
+        Reuse reuse          = Reuse::FullReset;
+        std::uint32_t reuse_base = 0;
+        Bridge mtp_bridge    = Bridge::None;
+        bool prepare_mtp     = false;
+        std::filesystem::path disk_snapshot_path;
+    };
+    const Plan disk_plan{.summary            = {.reusable_prompt_tokens = 192},
+                         .reuse              = Reuse::RestoreDiskCheckpoint,
+                         .reuse_base         = 192,
+                         .mtp_bridge         = Bridge::BeforeSuffix,
+                         .prepare_mtp        = true,
+                         .disk_snapshot_path = "gone.ninf"};
+
+    Plan mtp = disk_plan;
+    targets::qwen3_6::detail::degrade_disk_restore_to_full_reset(mtp, true);
+    expect(mtp.reuse == Reuse::FullReset && mtp.reuse_base == 0 &&
+               mtp.summary.reusable_prompt_tokens == 0 && mtp.disk_snapshot_path.empty(),
+           "Failed restore must report FullReset from base 0");
+    expect(mtp.prepare_mtp && mtp.mtp_bridge == Bridge::None,
+           "MTP FullReset prefills the draft cache without a suffix bridge");
+
+    Plan plain = disk_plan;
+    plain.prepare_mtp = false;
+    plain.mtp_bridge  = Bridge::None;
+    targets::qwen3_6::detail::degrade_disk_restore_to_full_reset(plain, false);
+    expect(plain.reuse == Reuse::FullReset && !plain.prepare_mtp && plain.mtp_bridge == Bridge::None,
+           "Non-MTP fallback must leave MTP fields untouched");
+
+    const std::vector<std::uint8_t> text_only(256, 0);
+    std::vector<std::uint8_t> media_prefix(256, 0);
+    media_prefix[10] = 1;
+    std::vector<std::uint8_t> media_suffix(256, 0);
+    media_suffix[200] = 1;
+    expect(!targets::qwen3_6::detail::prefix_has_visual_tokens(text_only, 192),
+           "Text-only prefix can fall back");
+    expect(targets::qwen3_6::detail::prefix_has_visual_tokens(media_prefix, 192),
+           "Media inside the skipped prefix blocks the in-place fallback");
+    expect(!targets::qwen3_6::detail::prefix_has_visual_tokens(media_suffix, 192),
+           "Media past the base stays covered by the vision plan");
+}
+
 int main() {
     std::cout << "Starting Comprehensive DiskStateCache & DirectStorage test suite...\n";
     test_prompt_hashing();
@@ -1398,6 +1519,8 @@ int main() {
     test_bulk_lru_watermark_eviction();
     test_concurrent_compaction_and_non_blocking_lookup();
     test_paged_kv_gather_scatter_page_major_layout_verification();
+    test_snapshot_longer_than_prompt_not_matched();
+    test_failed_disk_restore_degrades_to_full_reset();
 #if defined(_WIN32)
     test_cow_multi_turn_delta_splicing_live_gpu();
     test_full_state_direct_storage_restore_live_gpu();

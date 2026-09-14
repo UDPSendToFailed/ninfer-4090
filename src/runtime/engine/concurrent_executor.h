@@ -896,6 +896,9 @@ private:
             if (!first.complete && (!prefill_lane_ || *prefill_lane_ != lane)) {
                 throw std::logic_error("partial prefill did not retain its execution owner");
             }
+            if (first.replanned_service_work_quanta != 0) {
+                request->remaining_service_work = first.replanned_service_work_quanta;
+            }
             const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
             resolve_prefill_step(request, first, cancel_at_boundary);
             publish_runtime_stats();

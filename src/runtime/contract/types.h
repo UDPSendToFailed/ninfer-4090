@@ -83,6 +83,10 @@ struct PrefillStepResult {
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
     bool host_input_consumed              = false;
+    // Nonzero when the target replanned the request while starting it (a failed disk restore
+    // fell back to full prefill): the request's whole service work projection, replacing the
+    // admission-time value before this step is accounted.
+    std::uint64_t replanned_service_work_quanta = 0;
 };
 
 struct RoundBudget {

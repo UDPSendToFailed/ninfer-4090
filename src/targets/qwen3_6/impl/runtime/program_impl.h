@@ -1,6 +1,7 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
 
+#include "targets/qwen3_6/impl/runtime/disk_restore_fallback.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "targets/qwen3_6/impl/runtime/prompt_lookup.h"
 #include "targets/qwen3_6/impl/runtime/yarn.h"
@@ -468,7 +469,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     }
 
     const auto started       = Clock::now();
-    const std::uint32_t base = request_plan.reuse_base;
+    // Not const: a failed disk restore degrades to FullReset and rewinds the base to 0.
+    std::uint32_t base = request_plan.reuse_base;
+    // Set with the degraded plan so the executor replaces the admission-time work projection.
+    std::uint64_t replanned_service_work = 0;
     const std::uint32_t initial_mtp_extent =
         speculative_backend == SpeculativeBackend::Mtp && !request_plan.disable_speculation
             ? std::min({draft_window,
@@ -508,6 +512,25 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             std::vector<std::byte> loaded_text_kv;
             std::vector<std::byte> loaded_mtp_kv;
             std::vector<std::byte> loaded_tail;
+
+            // The host path copies with the live pool geometry, so a snapshot whose payload
+            // geometry differs must be rejected before any byte reaches the device.
+            const auto host_snapshot_layout_ok = [&](const DiskStateHeader& h) {
+                bool ok = disk_state_layout_matches(
+                    h, static_cast<std::uint32_t>(decoder->text_kv.pool().total_page_bytes()));
+                std::uint64_t live_gdn_bytes = 0;
+                for (const auto& t : decoder->linear_attention.recurrent) { live_gdn_bytes += t.slice(3, 0, 1).bytes(); }
+                for (const auto& t : decoder->linear_attention.conv) { live_gdn_bytes += t.slice(2, 0, 1).bytes(); }
+                ok = ok && (h.gdn_state_bytes == 0 || h.gdn_state_bytes == live_gdn_bytes);
+                if (speculative_backend == SpeculativeBackend::Mtp && decoder->mtp_cache() && h.mtp_kv_bytes != 0) {
+                    ok = ok && h.mtp_kv_bytes == static_cast<std::uint64_t>(h.mtp_page_count) *
+                                                     decoder->mtp_cache()->pool().total_page_bytes();
+                }
+                if (!ok) {
+                    std::fprintf(stderr, "[warn] ninfer: [prompt-cache] host restore layout mismatch, snapshot rejected\n");
+                }
+                return ok;
+            };
 
 #if defined(_WIN32)
             // DirectStorage VRAM restore, delivered in bounded staging batches.
@@ -610,7 +633,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             if (disk_state_cache &&
                 disk_state_cache->load_snapshot(request_plan.disk_snapshot_path, header,
                                                 loaded_tokens, loaded_gdn, loaded_text_kv,
-                                                loaded_mtp_kv, loaded_tail)) {
+                                                loaded_mtp_kv, loaded_tail) &&
+                host_snapshot_layout_ok(header)) {
                 // Restore GDN state
                 const std::int32_t slot =
                     LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
@@ -718,6 +742,36 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 sequence.ledger.assign(loaded_tokens.begin(), loaded_tokens.end());
                 sequence.retained           = true;
                 set_device_i32(io.rope_delta, sequence.rope_delta);
+            } else {
+                // Neither loader restored the snapshot. The DirectStorage path may already have
+                // scattered some pages or GDN units, so the lane is rebuilt from scratch.
+                if (qwen3_6::detail::prefix_has_visual_tokens(prompt.token_types, base)) {
+                    throw std::runtime_error(
+                        "disk prompt-cache restore failed and the skipped prefix holds media");
+                }
+                std::fprintf(stderr,
+                             "[warn] ninfer: [prompt-cache] disk restore of %u tokens failed "
+                             "(%s), falling back to full prefill\n",
+                             base, request_plan.disk_snapshot_path.string().c_str());
+                device.synchronize();
+                sequence.kv.reset();
+                ordered_reset(sequence);
+                sequence.ledger.clear();
+                sequence.tail_hidden_valid = false;
+                sequence.rope_delta        = 0;
+                reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
+                                    request_plan.backend_kv_page_entitlement);
+                qwen3_6::detail::degrade_disk_restore_to_full_reset(
+                    request_plan, speculative_backend == SpeculativeBackend::Mtp);
+                base = 0;
+                // The executor admitted the request with the work of the short suffix; prefill
+                // from 0 takes more steps and would exhaust that projection mid-request.
+                const std::size_t prefill_splits =
+                    (request_plan.vision ? request_plan.vision->uses.size() : 0ULL) +
+                    (request_plan.turn_checkpoint_capture_frontier ? 1ULL : 0ULL);
+                request_plan.summary.service_work_quanta =
+                    projected_service_work(request_plan.summary, 0, prefill_chunk, prefill_splits);
+                replanned_service_work = request_plan.summary.service_work_quanta;
             }
         } else if (request_plan.reuse == ReusePath::AppendAtFrontier) {
             if (!sequence.kv) {
@@ -840,7 +894,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         }
         staged.elapsed_seconds = std::chrono::duration<double>(Clock::now() - started).count();
         request.lifecycle      = Lifecycle::Prefilling;
-        return advance_prefill(sequence, request);
+        runtime::PrefillStepResult first = advance_prefill(sequence, request);
+        first.replanned_service_work_quanta = replanned_service_work;
+        return first;
     } catch (...) {
         try {
             device.synchronize();
