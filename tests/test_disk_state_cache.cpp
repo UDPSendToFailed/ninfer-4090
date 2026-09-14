@@ -51,17 +51,19 @@ std::vector<TokenId> generate_tokens(std::size_t count, std::uint32_t seed) {
     return tokens;
 }
 
+// Polls until the background writer has indexed a snapshot covering all of `tokens`. The bound is
+// generous because the writer shares the disk with whatever else runs on the machine.
 std::optional<DiskStateMatch> wait_for_match(const DiskStateCache& cache,
                                              uint64_t model_hash,
                                              std::span<const TokenId> tokens,
-                                             int max_ms = 3000) {
+                                             int max_ms = 10000) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(max_ms);
     while (std::chrono::steady_clock::now() < deadline) {
         auto match = cache.find_longest_matching_prefix(model_hash, tokens);
         if (match.has_value() && match->matched_tokens == tokens.size()) {
             return match;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     return cache.find_longest_matching_prefix(model_hash, tokens);
 }
@@ -124,10 +126,10 @@ void test_timestamped_filename_and_datetime() {
         const auto dummy  = generate_deterministic_bytes(1024, 1);
 
         cache.enqueue_save(0x9999ULL, tokens, 1, 0, dummy, dummy, 1, {}, 0, dummy);
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-        auto match = cache.find_longest_matching_prefix(0x9999ULL, tokens);
+        auto match = wait_for_match(cache, 0x9999ULL, tokens);
         expect(match.has_value(), "Must find snapshot with timestamped filename");
+        if (!match) { return; }
         expect(match->header.created_at_utc > 0, "Header created_at_utc must be populated");
 
         const std::string filename = match->file_path.filename().string();
@@ -211,9 +213,8 @@ void test_multi_config_isolation_and_cross_contamination() {
 
         cache_a.enqueue_save(model_hash_a, shared_prompt_tokens, 1, 0,
                              gdn_a, kv_a, 4, mtp_a, 2, {});
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-        auto match_a = cache_a.find_longest_matching_prefix(model_hash_a, shared_prompt_tokens);
+        auto match_a = wait_for_match(cache_a, model_hash_a, shared_prompt_tokens);
         expect(match_a.has_value(), "Config A must hit its own snapshot");
     }
 
@@ -230,9 +231,8 @@ void test_multi_config_isolation_and_cross_contamination() {
         const auto kv_b  = generate_deterministic_bytes(16384, 444);
         cache_b.enqueue_save(model_hash_b, shared_prompt_tokens, 1, 0,
                              gdn_b, kv_b, 4, {}, 0, {});
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-        auto match_b = cache_b.find_longest_matching_prefix(model_hash_b, shared_prompt_tokens);
+        auto match_b = wait_for_match(cache_b, model_hash_b, shared_prompt_tokens);
         expect(match_b.has_value(), "Config B must hit its own INT8 snapshot");
     }
 
@@ -316,6 +316,7 @@ void test_mark_and_sweep_pool_compaction() {
 
         expect(match1.has_value() && match2.has_value() && match3.has_value() && match_b.has_value(),
                "All 4 manifests must be persisted and indexed");
+        if (!match1 || !match2 || !match3 || !match_b) { return; }
 
         manifest_turn1_path = match1->file_path;
         manifest_turn2_path = match2->file_path;
@@ -410,6 +411,7 @@ void test_concurrent_compaction_and_non_blocking_lookup() {
         auto match1 = wait_for_match(cache, model_hash, tokens_turn1);
         auto match2 = wait_for_match(cache, model_hash, tokens_turn2);
         expect(match1.has_value() && match2.has_value(), "Both manifests must be written");
+        if (!match1 || !match2) { return; }
         manifest_turn1_path = match1->file_path;
         manifest_turn2_path = match2->file_path;
     }
@@ -434,7 +436,8 @@ void test_concurrent_compaction_and_non_blocking_lookup() {
         // Concurrently query prefix match: must return immediately without blocking or deadlock!
         const auto match = cache.find_longest_matching_prefix(model_hash, tokens_turn1);
         expect(match.has_value(), "Concurrent prefix query during compaction must succeed");
-        expect(match->matched_tokens == 128, "Matched token count must be 128");
+        // No early return here: the compactor thread must be joined first.
+        expect(match && match->matched_tokens == 128, "Matched token count must be 128");
 
         // Concurrently invoke cancel_in_flight: must cancel cooperative background compaction immediately
         cache.cancel_in_flight();
@@ -693,6 +696,7 @@ void test_compaction_fragmentation_thresholds() {
         auto m1 = wait_for_match(cache, model_hash, tokens_turn1);
         auto m2 = wait_for_match(cache, model_hash, tokens_turn2);
         expect(m1.has_value() && m2.has_value(), "Both manifests written");
+        if (!m1 || !m2) { return; }
         manifest1_path = m1->file_path;
         manifest2_path = m2->file_path;
     }
@@ -1104,6 +1108,7 @@ void test_cow_multi_turn_delta_splicing_live_gpu() {
         DiskStateCache restarted_cache(config);
         auto match_t3 = restarted_cache.find_longest_matching_prefix(model_hash, t3_tokens);
         expect(match_t3.has_value() && match_t3->matched_tokens == 1536, "Turn 3 match must succeed on cold restart");
+        if (!match_t3) { return; }
 
         DiskStateHeader loaded_header;
         std::vector<TokenId> loaded_tokens;
@@ -1259,6 +1264,7 @@ void test_full_state_direct_storage_restore_live_gpu() {
                                h_kv_data, static_cast<std::uint32_t>(kv_pool.total_page_bytes()), {}, 0, original_tail);
         auto match = wait_for_match(cache, model_hash, tokens);
         expect(match.has_value(), "Snapshot must be saved and matched");
+        if (!match) { return; }
 
         // Clear GPU memory
         for (const auto& t : gdn_pool.recurrent) CUDA_CHECK(cudaMemsetAsync(t.data, 0xCC, t.bytes(), ctx.stream));
@@ -1379,6 +1385,7 @@ void test_direct_storage_rapid_restore_and_teardown_stress() {
         cache.enqueue_save(model_hash, tokens, 1, 0, original_gdn, original_kv, 8, original_mtp, 1, original_tail);
         auto match = wait_for_match(cache, model_hash, tokens);
         expect(match.has_value(), "Stress test snapshot must be written");
+        if (!match) { return; }
         manifest_path = match->file_path;
     }
 
@@ -1983,9 +1990,9 @@ void test_bad_snapshot_dropped_and_resaved() {
             expect(other.save(cache).has_value(), "Prompt saved after the truncation must be written");
             expect(!cache.has_page(f.page_hashes[0]), "Truncated prompt pages must be retired by the append");
             f.save(cache);
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
             while (!cache.has_page(f.page_hashes[3]) && std::chrono::steady_clock::now() < deadline) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
             const auto match = wait_for_match(cache, f.model_hash, f.tokens);
             expect(match && f.load_matches(cache, match->file_path),
