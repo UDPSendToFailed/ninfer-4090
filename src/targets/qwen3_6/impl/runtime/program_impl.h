@@ -528,6 +528,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 }
                 if (!ok) {
                     std::fprintf(stderr, "[warn] ninfer: [prompt-cache] host restore layout mismatch, snapshot rejected\n");
+                    disk_state_cache->discard_snapshot(request_plan.disk_snapshot_path,
+                                                       "host restore layout mismatch");
                 }
                 return ok;
             };

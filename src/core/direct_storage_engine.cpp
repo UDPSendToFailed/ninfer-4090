@@ -293,28 +293,29 @@ bool DirectStorageEngine::prepare() {
     return ensure_device_alive() && ensure_staging_vram();
 }
 
-bool DirectStorageEngine::restore_segments(const std::filesystem::path& pool_path,
+DirectStorageRestoreStatus DirectStorageEngine::restore_segments(const std::filesystem::path& pool_path,
                                           const std::filesystem::path& manifest_path,
                                           std::span<const DirectStorageSegment> segments,
                                           cudaStream_t stream,
                                           const DirectStorageBatchConsumer& consumer) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
+    using Status = DirectStorageRestoreStatus;
     if (!initialized_ || segments.empty()) {
-        return false;
+        return Status::Unavailable;
     }
 
     // The previous restore's consumer may still be reading the staging buffer.
     sync_last_consumer();
 
     if (!ensure_device_alive() || !ensure_staging_vram()) {
-        return false;
+        return Status::Unavailable;
     }
 
     bool need_pool = false;
     bool need_manifest = false;
     for (const auto& seg : segments) {
         if (seg.bytes == 0 || seg.bytes > current_capacity_) {
-            return false;
+            return Status::Unavailable;
         }
         (seg.source == DirectStorageSource::Pool ? need_pool : need_manifest) = true;
     }
@@ -323,11 +324,11 @@ bool DirectStorageEngine::restore_segments(const std::filesystem::path& pool_pat
     ComPtr<IDStorageFile> manifest_file;
     if (need_pool) {
         HRESULT hr = ds_factory_->OpenFile(pool_path.wstring().c_str(), IID_PPV_ARGS(&pool_file));
-        if (FAILED(hr) || !pool_file) { return false; }
+        if (FAILED(hr) || !pool_file) { return Status::OpenFailed; }
     }
     if (need_manifest) {
         HRESULT hr = ds_factory_->OpenFile(manifest_path.wstring().c_str(), IID_PPV_ARGS(&manifest_file));
-        if (FAILED(hr) || !manifest_file) { return false; }
+        if (FAILED(hr) || !manifest_file) { return Status::OpenFailed; }
     }
 
     // Drop failures recorded before this restore; the count resets on each retrieval.
@@ -338,7 +339,7 @@ bool DirectStorageEngine::restore_segments(const std::filesystem::path& pool_pat
     std::vector<std::size_t> offsets;
     offsets.reserve(std::min<std::size_t>(segments.size(), 4096));
 
-    bool ok = true;
+    Status status = Status::Ok;
     std::size_t first = 0;
     while (first < segments.size()) {
         // Pack consecutive whole segments into one staging batch.
@@ -389,7 +390,7 @@ bool DirectStorageEngine::restore_segments(const std::filesystem::path& pool_pat
         wait_params.flags              = 0;
         wait_params.params.fence.value = signal_val;
         if (cudaWaitExternalSemaphoresAsync(&cuda_fence_sem_, &wait_params, 1, stream) != cudaSuccess) {
-            ok = false;
+            status = Status::Unavailable;
             break;
         }
 
@@ -404,15 +405,16 @@ bool DirectStorageEngine::restore_segments(const std::filesystem::path& pool_pat
         }
         record_consumer(stream);
         if (!consumed) {
-            ok = false;
+            status = Status::ConsumerRejected;
             break;
         }
         first = end;
     }
 
-    // The files must outlive every request that references them.
+    // The files must outlive every request that references them. A removed device fails
+    // every pending request, so its read errors say nothing about the files.
     if (!wait_fence_on_cpu()) {
-        ok = false;
+        status = Status::Unavailable;
     }
 
     DSTORAGE_ERROR_RECORD record{};
@@ -421,9 +423,11 @@ bool DirectStorageEngine::restore_segments(const std::filesystem::path& pool_pat
         std::cerr << "[warn] ninfer: [directstorage] " << record.FailureCount
                   << " read request(s) failed (HRESULT=0x" << std::hex << record.FirstFailure.HResult
                   << std::dec << ")\n" << std::flush;
-        ok = false;
+        if (status != Status::Unavailable) {
+            status = Status::ReadFailed;
+        }
     }
-    return ok;
+    return status;
 }
 
 void DirectStorageEngine::cleanup() {

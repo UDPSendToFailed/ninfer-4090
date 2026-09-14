@@ -140,6 +140,12 @@ public:
     [[nodiscard]] std::optional<DiskStateMatch>
     find_longest_matching_prefix(std::uint64_t model_hash, std::span<const TokenId> tokens) const;
 
+    // A failed load that proves the on-disk data bad (unreadable or short pool, missing page,
+    // invalid manifest, checksum or layout mismatch) removes the manifest from the index and
+    // the disk, and retires the unreadable pool page records, so the next save of the same
+    // prompt writes a fresh manifest and fresh pages. Transient failures (DirectStorage or the
+    // device unavailable, a file held open, a pool compaction during the load) keep both.
+
     // Restores state from disk into host pinned buffers
     [[nodiscard]] bool load_snapshot(const std::filesystem::path& path,
                                      DiskStateHeader& out_header,
@@ -166,6 +172,10 @@ public:
                                                     const DirectStorageRestoreConsumer& consumer,
                                                     std::uint32_t expected_text_page_bytes = 0);
 #endif
+
+    // Removes a loaded snapshot that the caller rejected (for example a live layout mismatch
+    // found after load_snapshot). Its pool pages are kept.
+    void discard_snapshot(const std::filesystem::path& path, const char* reason);
 
     // True CoW enqueue with explicit delta physical pages
     void enqueue_save_cow(std::uint64_t model_hash,

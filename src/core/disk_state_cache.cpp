@@ -103,6 +103,10 @@ void read_manifest_page_hashes(const std::filesystem::path& path,
     }
 }
 
+// PageIndexRecord::reserved value of a record that retires its page_hash. The pool index is
+// append-only; the last record for a hash wins when the index is loaded.
+constexpr std::uint32_t kPageRecordTombstone = 0x42544F4DU; // "MOTB"
+
 } // namespace
 
 bool disk_state_layout_matches(const DiskStateHeader& h, std::uint32_t live_text_page_bytes) noexcept {
@@ -141,6 +145,31 @@ public:
 
     [[nodiscard]] const std::filesystem::path& pool_data_path() const noexcept { return pool_data_path_; }
 
+    // Changes whenever the pool file is rewritten or removed, which moves or invalidates offsets.
+    [[nodiscard]] std::uint64_t generation() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return generation_;
+    }
+
+    // Retires `hashes` and every record whose bytes lie past the end of the pool. Returns
+    // nullopt and retires nothing when the pool was rewritten since `expected_generation`: the
+    // failed read then used offsets that no longer apply.
+    [[nodiscard]] std::optional<std::size_t>
+    drop_unreadable_pages(std::span<const std::uint64_t> hashes, std::uint64_t expected_generation) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (generation_ != expected_generation) {
+            return std::nullopt;
+        }
+        std::vector<std::uint64_t> retired;
+        for (const std::uint64_t hash : hashes) {
+            if (page_index_.contains(hash)) {
+                retired.push_back(hash);
+            }
+        }
+        retire_locked(retired);
+        return retired.size() + drop_records_past_end_locked();
+    }
+
     void append_missing_pages(std::span<const std::uint64_t> missing_hashes,
                               std::span<const std::byte> missing_data,
                               std::uint32_t single_page_bytes) {
@@ -153,6 +182,15 @@ public:
         std::uint64_t curr_file_size = 0;
         if (std::filesystem::exists(pool_data_path_, ec)) {
             curr_file_size = std::filesystem::file_size(pool_data_path_, ec);
+        }
+
+        // A pool that shrank behind the journal's back would take the new pages at offsets that
+        // older records still claim, and those records would then read another page's bytes.
+        if (curr_file_size < known_pool_bytes_) {
+            const std::size_t retired = drop_records_past_end_locked();
+            std::cerr << "[warn] ninfer: [prompt-cache] " << pool_data_path_.filename().string()
+                      << " shrank outside the cache, retired " << retired << " pool page record(s)\n"
+                      << std::flush;
         }
 
         std::ofstream data_file(pool_data_path_, std::ios::binary | std::ios::app);
@@ -193,6 +231,7 @@ public:
 
         data_file.flush();
         index_file.flush();
+        known_pool_bytes_ = curr_file_size;
     }
 
     struct CompactStats {
@@ -223,6 +262,8 @@ public:
             if (!std::filesystem::exists(pool_data_path_, ec)) {
                 page_index_.clear();
                 std::filesystem::remove(pool_index_path_, ec);
+                known_pool_bytes_ = 0;
+                ++generation_;
                 return stats;
             }
             old_file_size = std::filesystem::file_size(pool_data_path_, ec);
@@ -232,10 +273,22 @@ public:
                 page_index_.clear();
                 std::filesystem::remove(pool_data_path_, ec);
                 std::filesystem::remove(pool_index_path_, ec);
+                known_pool_bytes_ = 0;
+                ++generation_;
                 return stats;
             }
             local_index = page_index_;
+            compacting_ = true;
+            retired_while_compacting_.clear();
         }
+        struct CompactingReset {
+            PageStoreJournal& journal;
+            ~CompactingReset() {
+                std::lock_guard<std::mutex> lock(journal.mutex_);
+                journal.compacting_ = false;
+                journal.retired_while_compacting_.clear();
+            }
+        } compacting_reset{*this};
 
         std::size_t dead_count = 0;
         std::uint64_t dead_bytes = 0;
@@ -353,6 +406,19 @@ public:
             std::filesystem::rename(temp_index_path, pool_index_path_, ec);
 
             page_index_ = std::move(new_page_index);
+            known_pool_bytes_ = new_file_size;
+            ++generation_;
+
+            // Pages retired while the copy ran came from the old index snapshot and may have
+            // been copied into the new files; retire them again against the new index.
+            compacting_ = false;
+            const std::vector<std::uint64_t> retired(retired_while_compacting_.begin(),
+                                                     retired_while_compacting_.end());
+            retired_while_compacting_.clear();
+            for (const std::uint64_t hash : retired) {
+                page_index_.erase(hash);
+            }
+            append_tombstones_locked(retired);
         }
 
         stats.bytes_freed = (old_file_size > new_file_size) ? (old_file_size - new_file_size) : 0;
@@ -365,21 +431,91 @@ private:
     void load_index() {
         std::lock_guard<std::mutex> lock(mutex_);
         page_index_.clear();
-        std::ifstream index_file(pool_index_path_, std::ios::binary);
+        {
+            std::ifstream index_file(pool_index_path_, std::ios::binary);
+            if (!index_file.is_open()) {
+                return;
+            }
+
+            PageIndexRecord rec;
+            while (index_file.read(reinterpret_cast<char*>(&rec), sizeof(rec))) {
+                if (rec.reserved == kPageRecordTombstone) {
+                    page_index_.erase(rec.page_hash);
+                } else {
+                    page_index_[rec.page_hash] = rec;
+                }
+            }
+        }
+
+        // A pool shorter than its index (truncated or replaced while the process was down) leaves
+        // records whose bytes are gone. The manifests referencing them are then removed by
+        // scan_cache_dir.
+        const std::size_t retired = drop_records_past_end_locked();
+        if (retired > 0) {
+            std::cout << "[info] ninfer: [prompt-cache] retired " << retired
+                      << " pool page record(s) past the end of " << pool_data_path_.filename().string() << "\n"
+                      << std::flush;
+        }
+    }
+
+    // Later appends reuse the offsets past the end of a shortened pool, so these records are
+    // retired on disk, not only in memory.
+    std::size_t drop_records_past_end_locked() {
+        std::error_code ec;
+        std::uint64_t pool_bytes = std::filesystem::file_size(pool_data_path_, ec);
+        if (ec) {
+            if (std::filesystem::exists(pool_data_path_, ec) || ec) {
+                return 0; // Present but not measurable right now.
+            }
+            pool_bytes = 0;
+        }
+        known_pool_bytes_ = pool_bytes;
+        std::vector<std::uint64_t> past_end;
+        for (const auto& [hash, rec] : page_index_) {
+            if (rec.file_offset + rec.page_bytes > pool_bytes) {
+                past_end.push_back(hash);
+            }
+        }
+        retire_locked(past_end);
+        return past_end.size();
+    }
+
+    void retire_locked(std::span<const std::uint64_t> hashes) {
+        for (const std::uint64_t hash : hashes) {
+            page_index_.erase(hash);
+            if (compacting_) {
+                retired_while_compacting_.insert(hash);
+            }
+        }
+        append_tombstones_locked(hashes);
+    }
+
+    void append_tombstones_locked(std::span<const std::uint64_t> hashes) {
+        if (hashes.empty()) {
+            return;
+        }
+        std::ofstream index_file(pool_index_path_, std::ios::binary | std::ios::app);
         if (!index_file.is_open()) {
             return;
         }
-
-        PageIndexRecord rec;
-        while (index_file.read(reinterpret_cast<char*>(&rec), sizeof(rec))) {
-            page_index_[rec.page_hash] = rec;
+        for (const std::uint64_t hash : hashes) {
+            PageIndexRecord rec;
+            rec.page_hash = hash;
+            rec.reserved  = kPageRecordTombstone;
+            index_file.write(reinterpret_cast<const char*>(&rec), sizeof(rec));
         }
+        index_file.flush();
     }
 
     std::filesystem::path pool_data_path_;
     std::filesystem::path pool_index_path_;
     mutable std::mutex mutex_;
     std::unordered_map<std::uint64_t, PageIndexRecord> page_index_;
+    std::uint64_t generation_ = 0;
+    // Pool size as of the journal's last write or measurement; a smaller file means truncation.
+    std::uint64_t known_pool_bytes_ = 0;
+    bool compacting_          = false;
+    std::unordered_set<std::uint64_t> retired_while_compacting_;
 };
 
 struct QueuedSaveTask {
@@ -460,98 +596,12 @@ public:
                                      std::vector<std::byte>& out_text_kv_payload,
                                      std::vector<std::byte>& out_mtp_kv_payload,
                                      std::vector<std::byte>& out_tail_hidden) {
-        std::error_code ec;
-        const auto file_size = std::filesystem::file_size(path, ec);
-        if (ec) { return false; }
-
-        std::ifstream file(path, std::ios::binary);
-        if (!file.is_open()) { return false; }
-
-        DiskStateHeader header;
-        file.read(reinterpret_cast<char*>(&header), sizeof(header));
-        if (!file || !is_valid_header(header, file_size)) {
-            return false;
-        }
-
-        out_header = header;
-        out_tokens.resize(header.token_count);
-        if (header.token_count > 0) {
-            file.read(reinterpret_cast<char*>(out_tokens.data()), header.token_count * sizeof(TokenId));
-        }
-
-        std::vector<std::uint64_t> page_hashes(header.text_page_count);
-        if (header.text_page_count > 0) {
-            file.read(reinterpret_cast<char*>(page_hashes.data()), header.text_page_count * sizeof(std::uint64_t));
-        }
-
-        const auto t_load_0 = std::chrono::steady_clock::now();
-
-        // 1. Read Text KV pages from shared pool_data.ninfer_pages
-        out_text_kv_payload.resize(header.text_page_count * header.text_page_bytes);
-        if (header.text_page_count > 0 && header.text_page_bytes > 0) {
-            std::ifstream pool_file(journal_.pool_data_path(), std::ios::binary);
-            if (!pool_file.is_open()) { return false; }
-
-            for (std::uint32_t i = 0; i < header.text_page_count; ++i) {
-                auto page_rec = journal_.get_page(page_hashes[i]);
-                if (!page_rec) { return false; }
-
-                pool_file.seekg(static_cast<std::streamoff>(page_rec->file_offset));
-                pool_file.read(reinterpret_cast<char*>(out_text_kv_payload.data() + i * header.text_page_bytes),
-                               header.text_page_bytes);
-                if (!pool_file) { return false; }
-            }
-        }
-
-        // 2. Read GDN state, MTP KV, tail hidden from manifest file
-        const std::uint64_t raw_header_bytes = sizeof(DiskStateHeader) +
-                                             static_cast<std::uint64_t>(header.token_count) * sizeof(TokenId) +
-                                             static_cast<std::uint64_t>(header.text_page_count) * sizeof(std::uint64_t);
-        const std::uint64_t payload_offset = header.payload_offset_bytes != 0
-            ? static_cast<std::uint64_t>(header.payload_offset_bytes)
-            : ((raw_header_bytes + 4095ULL) & ~4095ULL);
-        file.seekg(static_cast<std::streamoff>(payload_offset));
-
-        out_gdn_state.resize(header.gdn_state_bytes);
-        if (header.gdn_state_bytes > 0) {
-            file.read(reinterpret_cast<char*>(out_gdn_state.data()), header.gdn_state_bytes);
-        }
-
-        out_mtp_kv_payload.resize(header.mtp_kv_bytes);
-        if (header.mtp_kv_bytes > 0) {
-            file.read(reinterpret_cast<char*>(out_mtp_kv_payload.data()), header.mtp_kv_bytes);
-        }
-
-        out_tail_hidden.resize(header.tail_hidden_bytes);
-        if (header.tail_hidden_bytes > 0) {
-            file.read(reinterpret_cast<char*>(out_tail_hidden.data()), header.tail_hidden_bytes);
-        }
-
-        if (!file) { return false; }
-
-        if (header.checksum != 0) {
-            Fnv1aHasher hasher;
-            hasher.update(out_gdn_state.data(), out_gdn_state.size());
-            hasher.update(out_mtp_kv_payload.data(), out_mtp_kv_payload.size());
-            hasher.update(out_tail_hidden.data(), out_tail_hidden.size());
-            const std::uint64_t actual_checksum = hasher.finalize();
-            if (actual_checksum != header.checksum) {
-                std::cerr << "[warn] ninfer: [prompt-cache] checksum mismatch on " << path.filename().string()
-                          << " (expected 0x" << std::hex << header.checksum
-                          << ", actual 0x" << actual_checksum << std::dec << ")\n";
-                return false;
-            }
-        }
-
-        const auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_load_0).count();
-        const std::size_t total_payload_bytes = out_text_kv_payload.size() + out_gdn_state.size() +
-                                              out_mtp_kv_payload.size() + out_tail_hidden.size();
-        const double raw_mb = static_cast<double>(total_payload_bytes) / (1024.0 * 1024.0);
-        std::cout << "[info] ninfer: [prompt-cache] restored " << header.token_count
-                  << " tokens from disk (" << std::fixed << std::setprecision(1) << raw_mb
-                  << "MB in " << load_ms << "ms)\n" << std::flush;
-
-        return file.good() || file.eof();
+        const std::uint64_t journal_generation = journal_.generation();
+        LoadFailure failure;
+        const bool ok = load_snapshot_host(path, out_header, out_tokens, out_gdn_state, out_text_kv_payload,
+                                           out_mtp_kv_payload, out_tail_hidden, failure);
+        if (!ok) { discard_after_failed_load(path, failure, journal_generation); }
+        return ok;
     }
 
 #if defined(_WIN32)
@@ -562,126 +612,21 @@ public:
                                                     std::span<const std::uint64_t> gdn_unit_bytes,
                                                     const DirectStorageRestoreConsumer& consumer,
                                                     std::uint32_t expected_text_page_bytes) {
-        std::error_code ec;
-        const auto file_size = std::filesystem::file_size(path, ec);
-        if (ec) { return false; }
-
-        std::ifstream file(path, std::ios::binary);
-        if (!file.is_open()) { return false; }
-
-        DiskStateHeader header;
-        file.read(reinterpret_cast<char*>(&header), sizeof(header));
-        if (!file || !is_valid_header(header, file_size)) {
-            return false;
-        }
-
-        if (!disk_state_layout_matches(header, expected_text_page_bytes)) {
-            std::cerr << "[warn] ninfer: [prompt-cache] layout mismatch: header.text_page_bytes="
-                      << header.text_page_bytes << " live_text_page_bytes=" << expected_text_page_bytes
-                      << "\n" << std::flush;
-            return false;
-        }
-
-        out_header = header;
-        out_tokens.resize(header.token_count);
-        if (header.token_count > 0) {
-            file.read(reinterpret_cast<char*>(out_tokens.data()), header.token_count * sizeof(TokenId));
-        }
-
-        std::vector<std::uint64_t> page_hashes(header.text_page_count);
-        if (header.text_page_count > 0) {
-            file.read(reinterpret_cast<char*>(page_hashes.data()), header.text_page_count * sizeof(std::uint64_t));
-        }
-        if (!file) { return false; }
-
-        // Segment list in file order, with the kind and per-kind index of each segment.
-        std::vector<core::DirectStorageSegment> segments;
-        std::vector<DirectStorageRestoreSlice> slice_meta;
-        segments.reserve(header.text_page_count + gdn_unit_bytes.size() + header.mtp_page_count + 2);
-        slice_meta.reserve(segments.capacity());
-        const auto add_segment = [&](core::DirectStorageSource source, std::uint64_t file_offset,
-                                     std::uint64_t bytes, DirectStorageRestoreKind kind, std::uint32_t index) {
-            segments.push_back({source, file_offset, bytes});
-            slice_meta.push_back({kind, index, nullptr, static_cast<std::size_t>(bytes)});
-        };
-
-        for (std::uint32_t i = 0; i < header.text_page_count; ++i) {
-            auto page_rec = journal_.get_page(page_hashes[i]);
-            if (!page_rec) {
-                return false; // Incomplete journal
-            }
-            if (page_rec->page_bytes != header.text_page_bytes) {
-                return false; // Journal page geometry disagrees with header
-            }
-            add_segment(core::DirectStorageSource::Pool, page_rec->file_offset, page_rec->page_bytes,
-                        DirectStorageRestoreKind::TextPage, i);
-        }
-
-        std::uint64_t manifest_offset = header.payload_offset_bytes;
-        if (header.gdn_state_bytes > 0) {
-            if (gdn_unit_bytes.empty()) {
-                add_segment(core::DirectStorageSource::Manifest, manifest_offset, header.gdn_state_bytes,
-                            DirectStorageRestoreKind::Gdn, 0);
-            } else {
-                std::uint64_t gdn_sum = 0;
-                for (std::size_t i = 0; i < gdn_unit_bytes.size(); ++i) {
-                    if (gdn_unit_bytes[i] == 0) { return false; }
-                    add_segment(core::DirectStorageSource::Manifest, manifest_offset + gdn_sum, gdn_unit_bytes[i],
-                                DirectStorageRestoreKind::Gdn, static_cast<std::uint32_t>(i));
-                    gdn_sum += gdn_unit_bytes[i];
-                }
-                if (gdn_sum != header.gdn_state_bytes) {
-                    return false; // Live GDN layout disagrees with the snapshot
-                }
-            }
-            manifest_offset += header.gdn_state_bytes;
-        }
-        if (header.mtp_kv_bytes > 0) {
-            const std::uint32_t mtp_pages = std::max<std::uint32_t>(header.mtp_page_count, 1);
-            if (header.mtp_kv_bytes % mtp_pages != 0) { return false; }
-            const std::uint64_t mtp_page_bytes = header.mtp_kv_bytes / mtp_pages;
-            for (std::uint32_t i = 0; i < mtp_pages; ++i) {
-                add_segment(core::DirectStorageSource::Manifest, manifest_offset + i * mtp_page_bytes, mtp_page_bytes,
-                            DirectStorageRestoreKind::MtpPage, i);
-            }
-            manifest_offset += header.mtp_kv_bytes;
-        }
-        if (header.tail_hidden_bytes > 0) {
-            add_segment(core::DirectStorageSource::Manifest, manifest_offset, header.tail_hidden_bytes,
-                        DirectStorageRestoreKind::Tail, 0);
-        }
-
-        if (segments.empty() || !core::DirectStorageEngine::instance().available()) {
-            return false;
-        }
-
-        const std::uint64_t manifest_payload_bytes = header.gdn_state_bytes + header.mtp_kv_bytes + header.tail_hidden_bytes;
-        const auto t_load_0 = std::chrono::steady_clock::now();
-
-        std::vector<DirectStorageRestoreSlice> batch;
-        const bool ok = core::DirectStorageEngine::instance().restore_segments(
-            journal_.pool_data_path(), path, segments, stream,
-            [&](const std::byte* staging, std::size_t first, std::span<const std::size_t> offsets) {
-                batch.clear();
-                for (std::size_t i = 0; i < offsets.size(); ++i) {
-                    DirectStorageRestoreSlice slice = slice_meta[first + i];
-                    slice.data = staging + offsets[i];
-                    batch.push_back(slice);
-                }
-                return consumer(std::span<const DirectStorageRestoreSlice>(batch.data(), batch.size()));
-            });
-        if (!ok) { return false; }
-
-        const auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_load_0).count();
-        const std::size_t total_payload_bytes = header.text_page_count * header.text_page_bytes + manifest_payload_bytes;
-        const double raw_mb = static_cast<double>(total_payload_bytes) / (1024.0 * 1024.0);
-        std::cout << "[info] ninfer: [prompt-cache] directstorage restored " << header.token_count
-                  << " tokens into VRAM (" << std::fixed << std::setprecision(1) << raw_mb
-                  << "MB in " << load_ms << "ms)\n" << std::flush;
-
-        return true;
+        const std::uint64_t journal_generation = journal_.generation();
+        LoadFailure failure;
+        const bool ok = load_snapshot_ds(path, out_header, out_tokens, stream, gdn_unit_bytes, consumer,
+                                         expected_text_page_bytes, failure);
+        if (!ok) { discard_after_failed_load(path, failure, journal_generation); }
+        return ok;
     }
 #endif
+
+    void discard_snapshot(const std::filesystem::path& path, const char* reason) {
+        LoadFailure failure;
+        failure.kind   = LoadFault::Manifest;
+        failure.reason = reason;
+        discard_after_failed_load(path, failure, journal_.generation());
+    }
 
     void enqueue_save_cow(std::uint64_t model_hash,
                           std::vector<TokenId> tokens,
@@ -747,12 +692,24 @@ public:
         constexpr std::size_t kMaxQueuedTasks = 8;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            for (const auto& [path, header] : index_) {
-                if (header.model_hash == task.header.model_hash &&
-                    header.prompt_hash == task.header.prompt_hash &&
-                    header.token_count == task.header.token_count) {
+            for (auto it = index_.begin(); it != index_.end(); ++it) {
+                const auto& [path, header] = *it;
+                if (header.model_hash != task.header.model_hash ||
+                    header.prompt_hash != task.header.prompt_hash ||
+                    header.token_count != task.header.token_count) {
+                    continue;
+                }
+                if (manifest_pages_stored(path, header)) {
                     return;
                 }
+                // The duplicate lost pages it references (a retired or compacted-away record) and
+                // would only fail its next load; the new save replaces it instead of being skipped.
+                std::error_code ec;
+                std::filesystem::remove(path, ec);
+                std::cerr << "[warn] ninfer: [prompt-cache] replacing snapshot " << path.filename().string()
+                          << " whose pool pages are gone\n" << std::flush;
+                index_.erase(it);
+                break;
             }
 
             if (pending_hashes_.contains({task.header.prompt_hash, task.header.token_count})) {
@@ -954,6 +911,372 @@ public:
     }
 
 private:
+    enum class LoadFault : std::uint8_t {
+        None,
+        Transient, // The files are not implicated; keep the snapshot.
+        Manifest,  // The manifest is unusable; its pool pages are intact.
+        Pages,     // Pool bytes the manifest references could not be read.
+    };
+
+    struct LoadFailure {
+        LoadFault kind     = LoadFault::None;
+        const char* reason = "";
+        // Page records to retire for LoadFault::Pages, on top of every record past the pool's end.
+        std::vector<std::uint64_t> pages;
+    };
+
+    [[nodiscard]] bool manifest_pages_stored(const std::filesystem::path& path, const DiskStateHeader& header) const {
+        if (header.text_page_count == 0) { return true; }
+        std::unordered_set<std::uint64_t> hashes;
+        read_manifest_page_hashes(path, header, hashes);
+        if (hashes.empty()) { return false; } // Page list unreadable
+        return std::all_of(hashes.begin(), hashes.end(),
+                           [this](std::uint64_t hash) { return journal_.has_page(hash); });
+    }
+
+    static bool fail(LoadFailure& failure, LoadFault kind, const char* reason) {
+        failure.kind   = kind;
+        failure.reason = reason;
+        return false;
+    }
+
+    // Distinguishes a file that is gone from one that is present but not accessible right now.
+    [[nodiscard]] static bool file_missing(const std::filesystem::path& path) {
+        std::error_code ec;
+        return !std::filesystem::exists(path, ec) && !ec;
+    }
+
+    // Resolves the manifest's page records and checks that their bytes lie inside the pool
+    // file, so a truncated pool is diagnosed before any read is issued. Records are fetched
+    // before the pool is measured: a record becomes visible only after its bytes are flushed.
+    [[nodiscard]] bool resolve_pages(std::span<const std::uint64_t> page_hashes, std::uint32_t page_bytes,
+                                     std::vector<PageIndexRecord>& out_records, LoadFailure& failure) const {
+        out_records.clear();
+        out_records.reserve(page_hashes.size());
+        for (const std::uint64_t hash : page_hashes) {
+            const auto rec = journal_.get_page(hash);
+            if (!rec) { return fail(failure, LoadFault::Manifest, "page missing from pool index"); }
+            if (rec->page_bytes != page_bytes) {
+                return fail(failure, LoadFault::Manifest, "pool page geometry disagrees with the header");
+            }
+            out_records.push_back(*rec);
+        }
+        if (out_records.empty()) { return true; }
+
+        std::error_code ec;
+        const std::uint64_t pool_bytes = std::filesystem::file_size(journal_.pool_data_path(), ec);
+        if (ec) {
+            return file_missing(journal_.pool_data_path())
+                ? fail(failure, LoadFault::Pages, "page pool file missing")
+                : fail(failure, LoadFault::Transient, "page pool file not accessible");
+        }
+        for (const auto& rec : out_records) {
+            if (rec.file_offset + rec.page_bytes > pool_bytes) {
+                return fail(failure, LoadFault::Pages, "page pool shorter than its index");
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool load_snapshot_host(const std::filesystem::path& path,
+                                          DiskStateHeader& out_header,
+                                          std::vector<TokenId>& out_tokens,
+                                          std::vector<std::byte>& out_gdn_state,
+                                          std::vector<std::byte>& out_text_kv_payload,
+                                          std::vector<std::byte>& out_mtp_kv_payload,
+                                          std::vector<std::byte>& out_tail_hidden,
+                                          LoadFailure& failure) {
+        std::error_code ec;
+        const auto file_size = std::filesystem::file_size(path, ec);
+        if (ec) {
+            return file_missing(path) ? fail(failure, LoadFault::Manifest, "manifest missing")
+                                      : fail(failure, LoadFault::Transient, "manifest not accessible");
+        }
+
+        std::ifstream file(path, std::ios::binary);
+        if (!file.is_open()) { return fail(failure, LoadFault::Transient, "manifest could not be opened"); }
+
+        DiskStateHeader header;
+        file.read(reinterpret_cast<char*>(&header), sizeof(header));
+        if (!file || !is_valid_header(header, file_size)) {
+            return fail(failure, LoadFault::Manifest, "invalid or short manifest");
+        }
+
+        out_header = header;
+        out_tokens.resize(header.token_count);
+        if (header.token_count > 0) {
+            file.read(reinterpret_cast<char*>(out_tokens.data()), header.token_count * sizeof(TokenId));
+        }
+
+        std::vector<std::uint64_t> page_hashes(header.text_page_count);
+        if (header.text_page_count > 0) {
+            file.read(reinterpret_cast<char*>(page_hashes.data()), header.text_page_count * sizeof(std::uint64_t));
+        }
+        if (!file) { return fail(failure, LoadFault::Manifest, "manifest token or page list unreadable"); }
+
+        const auto t_load_0 = std::chrono::steady_clock::now();
+
+        // 1. Read Text KV pages from shared pool_data.ninfer_pages
+        out_text_kv_payload.resize(header.text_page_count * header.text_page_bytes);
+        if (header.text_page_count > 0 && header.text_page_bytes > 0) {
+            std::vector<PageIndexRecord> page_records;
+            if (!resolve_pages(page_hashes, header.text_page_bytes, page_records, failure)) { return false; }
+
+            std::ifstream pool_file(journal_.pool_data_path(), std::ios::binary);
+            if (!pool_file.is_open()) {
+                return fail(failure, LoadFault::Transient, "page pool file could not be opened");
+            }
+
+            for (std::uint32_t i = 0; i < header.text_page_count; ++i) {
+                pool_file.seekg(static_cast<std::streamoff>(page_records[i].file_offset));
+                pool_file.read(reinterpret_cast<char*>(out_text_kv_payload.data() + i * header.text_page_bytes),
+                               header.text_page_bytes);
+                if (!pool_file) {
+                    failure.pages = page_hashes;
+                    return fail(failure, LoadFault::Pages, "page pool read failed");
+                }
+            }
+        }
+
+        // 2. Read GDN state, MTP KV, tail hidden from manifest file
+        const std::uint64_t raw_header_bytes = sizeof(DiskStateHeader) +
+                                             static_cast<std::uint64_t>(header.token_count) * sizeof(TokenId) +
+                                             static_cast<std::uint64_t>(header.text_page_count) * sizeof(std::uint64_t);
+        const std::uint64_t payload_offset = header.payload_offset_bytes != 0
+            ? static_cast<std::uint64_t>(header.payload_offset_bytes)
+            : ((raw_header_bytes + 4095ULL) & ~4095ULL);
+        file.seekg(static_cast<std::streamoff>(payload_offset));
+
+        out_gdn_state.resize(header.gdn_state_bytes);
+        if (header.gdn_state_bytes > 0) {
+            file.read(reinterpret_cast<char*>(out_gdn_state.data()), header.gdn_state_bytes);
+        }
+
+        out_mtp_kv_payload.resize(header.mtp_kv_bytes);
+        if (header.mtp_kv_bytes > 0) {
+            file.read(reinterpret_cast<char*>(out_mtp_kv_payload.data()), header.mtp_kv_bytes);
+        }
+
+        out_tail_hidden.resize(header.tail_hidden_bytes);
+        if (header.tail_hidden_bytes > 0) {
+            file.read(reinterpret_cast<char*>(out_tail_hidden.data()), header.tail_hidden_bytes);
+        }
+
+        if (!file) { return fail(failure, LoadFault::Manifest, "manifest payload unreadable"); }
+
+        if (header.checksum != 0) {
+            Fnv1aHasher hasher;
+            hasher.update(out_gdn_state.data(), out_gdn_state.size());
+            hasher.update(out_mtp_kv_payload.data(), out_mtp_kv_payload.size());
+            hasher.update(out_tail_hidden.data(), out_tail_hidden.size());
+            const std::uint64_t actual_checksum = hasher.finalize();
+            if (actual_checksum != header.checksum) {
+                std::cerr << "[warn] ninfer: [prompt-cache] checksum mismatch on " << path.filename().string()
+                          << " (expected 0x" << std::hex << header.checksum
+                          << ", actual 0x" << actual_checksum << std::dec << ")\n";
+                return fail(failure, LoadFault::Manifest, "checksum mismatch");
+            }
+        }
+
+        const auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_load_0).count();
+        const std::size_t total_payload_bytes = out_text_kv_payload.size() + out_gdn_state.size() +
+                                              out_mtp_kv_payload.size() + out_tail_hidden.size();
+        const double raw_mb = static_cast<double>(total_payload_bytes) / (1024.0 * 1024.0);
+        std::cout << "[info] ninfer: [prompt-cache] restored " << header.token_count
+                  << " tokens from disk (" << std::fixed << std::setprecision(1) << raw_mb
+                  << "MB in " << load_ms << "ms)\n" << std::flush;
+
+        return true;
+    }
+
+#if defined(_WIN32)
+    [[nodiscard]] bool load_snapshot_ds(const std::filesystem::path& path,
+                                        DiskStateHeader& out_header,
+                                        std::vector<TokenId>& out_tokens,
+                                        cudaStream_t stream,
+                                        std::span<const std::uint64_t> gdn_unit_bytes,
+                                        const DirectStorageRestoreConsumer& consumer,
+                                        std::uint32_t expected_text_page_bytes,
+                                        LoadFailure& failure) {
+        std::error_code ec;
+        const auto file_size = std::filesystem::file_size(path, ec);
+        if (ec) {
+            return file_missing(path) ? fail(failure, LoadFault::Manifest, "manifest missing")
+                                      : fail(failure, LoadFault::Transient, "manifest not accessible");
+        }
+
+        std::ifstream file(path, std::ios::binary);
+        if (!file.is_open()) { return fail(failure, LoadFault::Transient, "manifest could not be opened"); }
+
+        DiskStateHeader header;
+        file.read(reinterpret_cast<char*>(&header), sizeof(header));
+        if (!file || !is_valid_header(header, file_size)) {
+            return fail(failure, LoadFault::Manifest, "invalid or short manifest");
+        }
+
+        if (!disk_state_layout_matches(header, expected_text_page_bytes)) {
+            std::cerr << "[warn] ninfer: [prompt-cache] layout mismatch: header.text_page_bytes="
+                      << header.text_page_bytes << " live_text_page_bytes=" << expected_text_page_bytes
+                      << "\n" << std::flush;
+            return fail(failure, LoadFault::Manifest, "page layout mismatch");
+        }
+
+        out_header = header;
+        out_tokens.resize(header.token_count);
+        if (header.token_count > 0) {
+            file.read(reinterpret_cast<char*>(out_tokens.data()), header.token_count * sizeof(TokenId));
+        }
+
+        std::vector<std::uint64_t> page_hashes(header.text_page_count);
+        if (header.text_page_count > 0) {
+            file.read(reinterpret_cast<char*>(page_hashes.data()), header.text_page_count * sizeof(std::uint64_t));
+        }
+        if (!file) { return fail(failure, LoadFault::Manifest, "manifest token or page list unreadable"); }
+        file.close();
+
+        std::vector<PageIndexRecord> page_records;
+        if (!resolve_pages(page_hashes, header.text_page_bytes, page_records, failure)) { return false; }
+
+        // Segment list in file order, with the kind and per-kind index of each segment.
+        std::vector<core::DirectStorageSegment> segments;
+        std::vector<DirectStorageRestoreSlice> slice_meta;
+        segments.reserve(header.text_page_count + gdn_unit_bytes.size() + header.mtp_page_count + 2);
+        slice_meta.reserve(segments.capacity());
+        const auto add_segment = [&](core::DirectStorageSource source, std::uint64_t file_offset,
+                                     std::uint64_t bytes, DirectStorageRestoreKind kind, std::uint32_t index) {
+            segments.push_back({source, file_offset, bytes});
+            slice_meta.push_back({kind, index, nullptr, static_cast<std::size_t>(bytes)});
+        };
+
+        for (std::uint32_t i = 0; i < header.text_page_count; ++i) {
+            add_segment(core::DirectStorageSource::Pool, page_records[i].file_offset, page_records[i].page_bytes,
+                        DirectStorageRestoreKind::TextPage, i);
+        }
+
+        std::uint64_t manifest_offset = header.payload_offset_bytes;
+        if (header.gdn_state_bytes > 0) {
+            if (gdn_unit_bytes.empty()) {
+                add_segment(core::DirectStorageSource::Manifest, manifest_offset, header.gdn_state_bytes,
+                            DirectStorageRestoreKind::Gdn, 0);
+            } else {
+                std::uint64_t gdn_sum = 0;
+                for (std::size_t i = 0; i < gdn_unit_bytes.size(); ++i) {
+                    if (gdn_unit_bytes[i] == 0) {
+                        return fail(failure, LoadFault::Transient, "live GDN unit has no bytes");
+                    }
+                    add_segment(core::DirectStorageSource::Manifest, manifest_offset + gdn_sum, gdn_unit_bytes[i],
+                                DirectStorageRestoreKind::Gdn, static_cast<std::uint32_t>(i));
+                    gdn_sum += gdn_unit_bytes[i];
+                }
+                if (gdn_sum != header.gdn_state_bytes) {
+                    return fail(failure, LoadFault::Manifest, "GDN layout disagrees with the live state");
+                }
+            }
+            manifest_offset += header.gdn_state_bytes;
+        }
+        if (header.mtp_kv_bytes > 0) {
+            const std::uint32_t mtp_pages = std::max<std::uint32_t>(header.mtp_page_count, 1);
+            if (header.mtp_kv_bytes % mtp_pages != 0) {
+                return fail(failure, LoadFault::Manifest, "MTP payload not divisible into pages");
+            }
+            const std::uint64_t mtp_page_bytes = header.mtp_kv_bytes / mtp_pages;
+            for (std::uint32_t i = 0; i < mtp_pages; ++i) {
+                add_segment(core::DirectStorageSource::Manifest, manifest_offset + i * mtp_page_bytes, mtp_page_bytes,
+                            DirectStorageRestoreKind::MtpPage, i);
+            }
+            manifest_offset += header.mtp_kv_bytes;
+        }
+        if (header.tail_hidden_bytes > 0) {
+            add_segment(core::DirectStorageSource::Manifest, manifest_offset, header.tail_hidden_bytes,
+                        DirectStorageRestoreKind::Tail, 0);
+        }
+
+        if (segments.empty()) { return fail(failure, LoadFault::Transient, "snapshot has no payload"); }
+        if (!core::DirectStorageEngine::instance().available()) {
+            return fail(failure, LoadFault::Transient, "DirectStorage unavailable");
+        }
+
+        const std::uint64_t manifest_payload_bytes = header.gdn_state_bytes + header.mtp_kv_bytes + header.tail_hidden_bytes;
+        const auto t_load_0 = std::chrono::steady_clock::now();
+
+        std::vector<DirectStorageRestoreSlice> batch;
+        const auto status = core::DirectStorageEngine::instance().restore_segments(
+            journal_.pool_data_path(), path, segments, stream,
+            [&](const std::byte* staging, std::size_t first, std::span<const std::size_t> offsets) {
+                batch.clear();
+                for (std::size_t i = 0; i < offsets.size(); ++i) {
+                    DirectStorageRestoreSlice slice = slice_meta[first + i];
+                    slice.data = staging + offsets[i];
+                    batch.push_back(slice);
+                }
+                return consumer(std::span<const DirectStorageRestoreSlice>(batch.data(), batch.size()));
+            });
+        switch (status) {
+        case core::DirectStorageRestoreStatus::Ok:
+            break;
+        case core::DirectStorageRestoreStatus::Unavailable:
+            return fail(failure, LoadFault::Transient, "DirectStorage unavailable");
+        case core::DirectStorageRestoreStatus::OpenFailed:
+            // Both files were present a moment ago, so this is a sharing or access failure.
+            return fail(failure, LoadFault::Transient, "DirectStorage could not open a snapshot file");
+        case core::DirectStorageRestoreStatus::ReadFailed:
+            // The error record names only the first failed request, not which page or manifest
+            // range it covered, so every page of the snapshot is retired with the manifest.
+            failure.pages = page_hashes;
+            return fail(failure, LoadFault::Pages, "DirectStorage read failed");
+        case core::DirectStorageRestoreStatus::ConsumerRejected:
+            return fail(failure, LoadFault::Manifest, "restore slices disagree with the live layout");
+        }
+
+        const auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_load_0).count();
+        const std::size_t total_payload_bytes = header.text_page_count * header.text_page_bytes + manifest_payload_bytes;
+        const double raw_mb = static_cast<double>(total_payload_bytes) / (1024.0 * 1024.0);
+        std::cout << "[info] ninfer: [prompt-cache] directstorage restored " << header.token_count
+                  << " tokens into VRAM (" << std::fixed << std::setprecision(1) << raw_mb
+                  << "MB in " << load_ms << "ms)\n" << std::flush;
+
+        return true;
+    }
+#endif
+
+    // Without this, a bad snapshot stays in the index: enqueue_save_cow skips the fallback's
+    // save as a duplicate and has_page keeps reporting the unreadable pages as stored, so every
+    // matching request repeats the failed load and a full prefill.
+    void discard_after_failed_load(const std::filesystem::path& path, const LoadFailure& failure,
+                                   std::uint64_t journal_generation) {
+        if (failure.kind == LoadFault::None) { return; }
+        if (failure.kind == LoadFault::Transient) {
+            std::cerr << "[warn] ninfer: [prompt-cache] kept snapshot " << path.filename().string()
+                      << " after a transient load failure (" << failure.reason << ")\n" << std::flush;
+            return;
+        }
+
+        std::size_t retired_pages = 0;
+        if (failure.kind == LoadFault::Pages) {
+            const auto retired = journal_.drop_unreadable_pages(failure.pages, journal_generation);
+            if (!retired) {
+                std::cerr << "[warn] ninfer: [prompt-cache] kept snapshot " << path.filename().string()
+                          << " (" << failure.reason << "): the page pool was compacted during the load\n"
+                          << std::flush;
+                return;
+            }
+            retired_pages = *retired;
+        }
+
+        bool removed = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            removed = index_.erase(path) > 0;
+            std::error_code ec;
+            removed = std::filesystem::remove(path, ec) || removed;
+        }
+        if (removed || retired_pages > 0) {
+            std::cerr << "[warn] ninfer: [prompt-cache] dropped snapshot " << path.filename().string()
+                      << " (" << failure.reason << "), retired " << retired_pages
+                      << " pool page record(s)\n" << std::flush;
+        }
+    }
+
     void scan_cache_dir() {
         std::error_code ec;
         const auto manifest_dir = config_.cache_dir / "manifests";
@@ -1144,6 +1467,10 @@ bool DiskStateCache::load_snapshot_direct_storage(const std::filesystem::path& p
     return impl_->load_snapshot_direct_storage(path, out_header, out_tokens, stream, gdn_unit_bytes, consumer, expected_text_page_bytes);
 }
 #endif
+
+void DiskStateCache::discard_snapshot(const std::filesystem::path& path, const char* reason) {
+    impl_->discard_snapshot(path, reason);
+}
 
 void DiskStateCache::enqueue_save_cow(std::uint64_t model_hash,
                                       std::vector<TokenId> tokens,

@@ -42,6 +42,19 @@ struct DirectStorageSegment {
 // wait is already queued on `stream`, so work the consumer enqueues on that stream sees
 // the batch's bytes. segment_offsets[i] is the staging offset of segment first_segment + i.
 // Return false to abort the restore.
+enum class DirectStorageRestoreStatus : std::uint8_t {
+    Ok,
+    // The engine or device cannot serve reads right now; the files are not implicated.
+    Unavailable,
+    // DirectStorage could not open a source file.
+    OpenFailed,
+    // At least one read request failed. DSTORAGE_ERROR_RECORD names only the first
+    // failure, so the failing segment is unknown.
+    ReadFailed,
+    // The consumer returned false.
+    ConsumerRejected,
+};
+
 using DirectStorageBatchConsumer =
     std::function<bool(const std::byte* staging, std::size_t first_segment,
                        std::span<const std::size_t> segment_offsets)>;
@@ -75,7 +88,7 @@ public:
     // `consumer`. Before the next batch overwrites the staging buffer, the consumer's
     // work on `stream` is synchronized. On false, part of the destination may already
     // have been written; the caller must fall back to a path that rewrites all of it.
-    bool restore_segments(const std::filesystem::path& pool_path,
+    DirectStorageRestoreStatus restore_segments(const std::filesystem::path& pool_path,
                           const std::filesystem::path& manifest_path,
                           std::span<const DirectStorageSegment> segments,
                           cudaStream_t stream,

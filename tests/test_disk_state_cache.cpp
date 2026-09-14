@@ -1506,6 +1506,230 @@ void test_failed_disk_restore_degrades_to_full_reset() {
            "Media past the base stays covered by the vision plan");
 }
 
+namespace {
+
+struct BadSnapshotFixture {
+    static constexpr std::uint32_t kPageBytes = 8192;
+    std::filesystem::path dir;
+    std::filesystem::path pool_path;
+    DiskStateCacheConfig config;
+    std::uint64_t model_hash = 0;
+    std::vector<TokenId> tokens;
+    std::vector<std::byte> kv;
+    std::vector<std::byte> gdn;
+    std::vector<std::byte> tail;
+    std::vector<std::uint64_t> page_hashes;
+
+    BadSnapshotFixture(std::filesystem::path test_dir, std::uint64_t hash, std::uint32_t seed)
+        : dir(std::move(test_dir)), pool_path(dir / "pool_data.ninfer_pages"), model_hash(hash),
+          tokens(generate_tokens(4 * 64, seed)), kv(generate_deterministic_bytes(4 * kPageBytes, seed + 1)),
+          gdn(generate_deterministic_bytes(1024, seed + 2)), tail(generate_deterministic_bytes(512, seed + 3)) {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+        config.cache_dir       = dir;
+        config.max_cache_bytes = 100ULL << 20;
+        config.enabled         = true;
+        for (std::size_t i = 0; i < 4; ++i) {
+            page_hashes.push_back(DiskStateCache::hash_prompt_prefix(
+                std::span<const TokenId>(tokens.data(), (i + 1) * 64)));
+        }
+    }
+
+    ~BadSnapshotFixture() {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+
+    std::optional<DiskStateMatch> save(DiskStateCache& cache) const {
+        cache.enqueue_save(model_hash, tokens, 1, 0, gdn, kv, 4, {}, 0, tail);
+        return wait_for_match(cache, model_hash, tokens);
+    }
+
+    // True only when the load succeeds and returns the saved bytes.
+    bool load_matches(DiskStateCache& cache, const std::filesystem::path& path) const {
+        DiskStateHeader header;
+        std::vector<TokenId> loaded_tokens;
+        std::vector<std::byte> loaded_gdn, loaded_kv, loaded_mtp, loaded_tail;
+        return cache.load_snapshot(path, header, loaded_tokens, loaded_gdn, loaded_kv, loaded_mtp, loaded_tail) &&
+               loaded_tokens == tokens && loaded_kv == kv && loaded_gdn == gdn && loaded_tail == tail;
+    }
+
+    bool indexed(const DiskStateCache& cache) const {
+        return cache.find_longest_matching_prefix(model_hash, tokens).has_value();
+    }
+};
+
+} // namespace
+
+// A snapshot whose data is bad must leave the index on the failed load. Otherwise the save
+// after the fallback prefill is skipped as a duplicate, the unreadable pages still count as
+// stored, and every later request with the same prompt fails the same way.
+void test_bad_snapshot_dropped_and_resaved() {
+    // Pool truncated while the cache is live.
+    {
+        BadSnapshotFixture f("./.test_ninfer_cache_bad_pool_truncated", 0xBAD0BAD0BAD0BAD0ULL, 1310);
+        DiskStateCache cache(f.config);
+        const auto first = f.save(cache);
+        expect(first.has_value() && f.load_matches(cache, first->file_path), "Truncation fixture must load");
+        if (first) {
+            std::filesystem::resize_file(f.pool_path, 0);
+            expect(!f.load_matches(cache, first->file_path), "Load from a truncated pool must fail");
+            expect(!f.indexed(cache), "Snapshot over a truncated pool must leave the index");
+            expect(!std::filesystem::exists(first->file_path), "Snapshot over a truncated pool must leave the disk");
+            expect(!cache.has_page(f.page_hashes[0]) && !cache.has_page(f.page_hashes[3]),
+                   "Pages past the end of the pool must no longer count as stored");
+
+            const auto second = f.save(cache);
+            expect(second.has_value(), "Save after the dropped snapshot must not be deduplicated");
+            expect(second && f.load_matches(cache, second->file_path), "Resaved snapshot must load its bytes");
+            expect(second && f.load_matches(cache, second->file_path), "Resaved snapshot must load again");
+        }
+    }
+    // Retired records must stay retired and the rewritten pages must win after a restart.
+    {
+        BadSnapshotFixture f("./.test_ninfer_cache_bad_pool_restart", 0xBAD1BAD1BAD1BAD1ULL, 1320);
+        {
+            DiskStateCache cache(f.config);
+            const auto first = f.save(cache);
+            expect(first.has_value(), "Restart fixture must be written");
+            std::filesystem::resize_file(f.pool_path, 0);
+            if (first) { expect(!f.load_matches(cache, first->file_path), "Load from a truncated pool must fail"); }
+            expect(f.save(cache).has_value(), "Restart fixture must be resaved");
+        }
+        DiskStateCache restarted(f.config);
+        const auto match = restarted.find_longest_matching_prefix(f.model_hash, f.tokens);
+        expect(match.has_value() && f.load_matches(restarted, match->file_path),
+               "Resaved snapshot must load after a restart");
+    }
+    // Pool cut after two pages: only the unreadable pages are retired and rewritten.
+    {
+        BadSnapshotFixture f("./.test_ninfer_cache_bad_pool_partial", 0xBAD2BAD2BAD2BAD2ULL, 1330);
+        DiskStateCache cache(f.config);
+        const auto first = f.save(cache);
+        expect(first.has_value(), "Partial truncation fixture must be written");
+        if (first) {
+            std::filesystem::resize_file(f.pool_path, 2 * BadSnapshotFixture::kPageBytes);
+            expect(!f.load_matches(cache, first->file_path), "Load from a partially truncated pool must fail");
+            expect(!f.indexed(cache), "Snapshot over a partially truncated pool must leave the index");
+            expect(cache.has_page(f.page_hashes[0]) && cache.has_page(f.page_hashes[1]),
+                   "Readable pages must stay stored");
+            expect(!cache.has_page(f.page_hashes[2]) && !cache.has_page(f.page_hashes[3]),
+                   "Pages past the end of the pool must be retired");
+            const auto second = f.save(cache);
+            expect(second && f.load_matches(cache, second->file_path),
+                   "Snapshot resaved over a partially truncated pool must load its bytes");
+        }
+    }
+    // Manifest payload corrupted: the manifest goes, its pool pages stay.
+    {
+        BadSnapshotFixture f("./.test_ninfer_cache_bad_manifest", 0xBAD3BAD3BAD3BAD3ULL, 1340);
+        DiskStateCache cache(f.config);
+        const auto first = f.save(cache);
+        expect(first.has_value(), "Checksum fixture must be written");
+        if (first) {
+            {
+                std::fstream file(first->file_path, std::ios::binary | std::ios::in | std::ios::out);
+                file.seekg(first->header.payload_offset_bytes);
+                char byte = 0;
+                file.read(&byte, 1);
+                byte = static_cast<char>(byte ^ 0x5A);
+                file.seekp(first->header.payload_offset_bytes);
+                file.write(&byte, 1);
+            }
+            expect(!f.load_matches(cache, first->file_path), "Load of a corrupted manifest must fail");
+            expect(!f.indexed(cache) && !std::filesystem::exists(first->file_path),
+                   "Corrupted manifest must leave the index and the disk");
+            expect(cache.has_page(f.page_hashes[0]) && cache.has_page(f.page_hashes[3]),
+                   "A manifest checksum mismatch must not retire pool pages");
+            const auto second = f.save(cache);
+            expect(second && f.load_matches(cache, second->file_path), "Resaved manifest must load");
+        }
+    }
+    // Pool truncated while live, then another prompt saved before this one is loaded: the append
+    // must not let the old records point at the new prompt's bytes.
+    {
+        BadSnapshotFixture f("./.test_ninfer_cache_bad_pool_reused", 0xBAD6BAD6BAD6BAD6ULL, 1370);
+        BadSnapshotFixture other("./.test_ninfer_cache_bad_pool_reused", 0xBAD6BAD6BAD6BAD6ULL, 1380);
+        DiskStateCache cache(f.config);
+        const auto first = f.save(cache);
+        expect(first.has_value(), "Offset reuse fixture must be written");
+        if (first) {
+            std::filesystem::resize_file(f.pool_path, 0);
+            const auto other_match = other.save(cache);
+            expect(other_match && other.load_matches(cache, other_match->file_path),
+                   "Prompt saved after the truncation must load");
+            expect(!cache.has_page(f.page_hashes[0]), "Records past the shrunk pool must be retired before appending");
+            expect(!f.load_matches(cache, first->file_path), "Snapshot whose pages were retired must not load");
+            expect(!f.indexed(cache), "Snapshot whose pages were retired must leave the index");
+            const auto second = f.save(cache);
+            expect(second && f.load_matches(cache, second->file_path), "Resaved snapshot must load its own bytes");
+            expect(other_match && other.load_matches(cache, other_match->file_path),
+                   "The other prompt must still load after the resave");
+        }
+    }
+    // A snapshot whose pages were retired but which was never loaded must not block a save of the
+    // same prompt as a duplicate.
+    {
+        BadSnapshotFixture f("./.test_ninfer_cache_bad_duplicate", 0xBAD7BAD7BAD7BAD7ULL, 1390);
+        BadSnapshotFixture other("./.test_ninfer_cache_bad_duplicate", 0xBAD7BAD7BAD7BAD7ULL, 1400);
+        DiskStateCache cache(f.config);
+        const auto first = f.save(cache);
+        expect(first.has_value(), "Stale duplicate fixture must be written");
+        if (first) {
+            std::filesystem::resize_file(f.pool_path, 0);
+            expect(other.save(cache).has_value(), "Prompt saved after the truncation must be written");
+            expect(!cache.has_page(f.page_hashes[0]), "Truncated prompt pages must be retired by the append");
+            f.save(cache);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (!cache.has_page(f.page_hashes[3]) && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            const auto match = wait_for_match(cache, f.model_hash, f.tokens);
+            expect(match && f.load_matches(cache, match->file_path),
+                   "Save over a duplicate with missing pages must replace it and load on the first try");
+        }
+    }
+    // Pool truncated while the process was down: startup retires the records and the manifest.
+    {
+        BadSnapshotFixture f("./.test_ninfer_cache_bad_pool_startup", 0xBAD4BAD4BAD4BAD4ULL, 1350);
+        {
+            DiskStateCache cache(f.config);
+            expect(f.save(cache).has_value(), "Startup fixture must be written");
+        }
+        std::filesystem::resize_file(f.pool_path, 0);
+        DiskStateCache cache(f.config);
+        expect(!f.indexed(cache), "Startup must not index a snapshot whose pages are past the pool end");
+        expect(!cache.has_page(f.page_hashes[0]), "Startup must retire records past the pool end");
+        const auto second = f.save(cache);
+        expect(second && f.load_matches(cache, second->file_path), "Snapshot saved after startup must load");
+    }
+#if defined(_WIN32)
+    // The DirectStorage loader diagnoses a short pool before issuing reads, without a device.
+    {
+        BadSnapshotFixture f("./.test_ninfer_cache_bad_pool_directstorage", 0xBAD5BAD5BAD5BAD5ULL, 1360);
+        DiskStateCache cache(f.config);
+        const auto first = f.save(cache);
+        expect(first.has_value(), "DirectStorage truncation fixture must be written");
+        if (first) {
+            std::filesystem::resize_file(f.pool_path, 0);
+            DiskStateHeader header;
+            std::vector<TokenId> loaded_tokens;
+            int consumer_calls = 0;
+            const bool ok = cache.load_snapshot_direct_storage(
+                first->file_path, header, loaded_tokens, /*stream=*/nullptr, {},
+                [&](std::span<const DirectStorageRestoreSlice>) { ++consumer_calls; return true; },
+                BadSnapshotFixture::kPageBytes);
+            expect(!ok && consumer_calls == 0, "DirectStorage load from a truncated pool must fail before reading");
+            expect(!f.indexed(cache) && !std::filesystem::exists(first->file_path),
+                   "DirectStorage load failure over a truncated pool must drop the snapshot");
+            const auto second = f.save(cache);
+            expect(second && f.load_matches(cache, second->file_path),
+                   "Snapshot resaved after a DirectStorage failure must load");
+        }
+    }
+#endif
+}
+
 int main() {
     std::cout << "Starting Comprehensive DiskStateCache & DirectStorage test suite...\n";
     test_prompt_hashing();
@@ -1521,6 +1745,7 @@ int main() {
     test_paged_kv_gather_scatter_page_major_layout_verification();
     test_snapshot_longer_than_prompt_not_matched();
     test_failed_disk_restore_degrades_to_full_reset();
+    test_bad_snapshot_dropped_and_resaved();
 #if defined(_WIN32)
     test_cow_multi_turn_delta_splicing_live_gpu();
     test_full_state_direct_storage_restore_live_gpu();
