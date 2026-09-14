@@ -75,6 +75,7 @@ private:
     void recreate_queue();
     bool allocate_staging_vram(std::size_t required_bytes);
     void cleanup();
+    void sync_last_consumer() noexcept;
 
     bool initialized_ = false;
     mutable std::recursive_mutex mutex_;
@@ -97,6 +98,8 @@ private:
     cudaExternalMemory_t cuda_ext_mem_ = nullptr;
     cudaExternalSemaphore_t cuda_fence_sem_ = nullptr;
     void* d_staging_ptr_ = nullptr;
+    cudaStream_t last_consumer_stream_ = nullptr;
+    cudaEvent_t consumer_event_ = nullptr;
 };
 
 } // namespace ninfer::core

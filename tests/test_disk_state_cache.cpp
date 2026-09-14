@@ -1108,6 +1108,257 @@ void test_direct_storage_rapid_restore_and_teardown_stress() {
 
     std::filesystem::remove_all(test_dir, ec);
 }
+
+// Host-only: proves the page-geometry rejection predicate and its plumbing through
+// load_snapshot_direct_storage without touching CUDA at all. Declared inside the
+// #if defined(_WIN32) block only because load_snapshot_direct_storage itself is
+// declared there in disk_state_cache.h -- the fixture requires no GPU.
+void test_disk_state_layout_mismatch_rejected() {
+    const std::filesystem::path test_dir = "./.test_ninfer_ds_layout_mismatch";
+    std::error_code ec;
+    std::filesystem::remove_all(test_dir, ec);
+
+    DiskStateCacheConfig config;
+    config.cache_dir       = test_dir;
+    config.max_cache_bytes = 100ULL << 20;
+    config.enabled         = true;
+
+    const std::uint64_t model_hash = 0xABCD1234EF567890ULL;
+    const auto tokens = generate_tokens(8 * 64, 91);
+    constexpr std::uint32_t page_bytes = 8192;
+    const auto original_kv   = generate_deterministic_bytes(8 * page_bytes, 901);
+    const auto original_gdn  = generate_deterministic_bytes(256 * 1024, 902);
+    const auto original_mtp  = generate_deterministic_bytes(1024, 904);
+    const auto original_tail = generate_deterministic_bytes(1024, 903);
+
+    std::filesystem::path manifest_path;
+    DiskStateHeader header;
+    {
+        DiskStateCache cache(config);
+        cache.enqueue_save(model_hash, tokens, 1, 0, original_gdn, original_kv, 8, original_mtp, 1, original_tail);
+        auto match = wait_for_match(cache, model_hash, tokens);
+        expect(match.has_value(), "Layout-mismatch fixture snapshot must be written");
+        if (!match.has_value()) {
+            std::filesystem::remove_all(test_dir, ec);
+            return;
+        }
+        manifest_path = match->file_path;
+        header        = match->header;
+    }
+
+    expect(disk_state_layout_matches(header, page_bytes),
+           "Layout predicate must accept a header whose page geometry matches the live pool");
+    expect(!disk_state_layout_matches(header, page_bytes + 4096),
+           "Layout predicate must reject a header whose page geometry disagrees with the live pool");
+
+    {
+        DiskStateCache cache(config);
+        DiskStateHeader hdr;
+        std::vector<TokenId> toks;
+        void* ptr = nullptr;
+        std::size_t bytes = 0;
+        const bool ok = cache.load_snapshot_direct_storage(manifest_path, hdr, toks, /*stream=*/nullptr, ptr, bytes,
+                                                           /*expected_text_page_bytes=*/page_bytes + 4096);
+        expect(!ok, "load_snapshot_direct_storage must reject a mismatched page geometry");
+        expect(ptr == nullptr, "Staging pointer must remain null when geometry rejection occurs");
+    }
+
+    std::filesystem::remove_all(test_dir, ec);
+}
+
+// Criterion 2: drives allocate_staging_vram's fast-reuse branch under an in-flight,
+// unsynchronized consumer. Distinct from test_direct_storage_rapid_restore_and_teardown_stress
+// above, which syncs and tears down every iteration and is blind to this bug by construction --
+// here the consumer copy for iteration N is still in flight on ctx.stream when the restore for
+// iteration N+1 reuses the same staging allocation without a sync or a release_staging() in
+// between.
+void test_direct_storage_reuse_without_teardown_race() {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
+        std::cout << "[skip] ninfer-test: no CUDA device, direct-storage reuse race fixture not executed\n";
+        return;
+    }
+    std::cout << "[run] ninfer-test: direct-storage reuse race fixture executed\n";
+
+    DeviceContext ctx(0);
+
+    const std::filesystem::path test_dir = "./.test_ninfer_ds_reuse_race";
+    std::error_code ec;
+    std::filesystem::remove_all(test_dir, ec);
+
+    DiskStateCacheConfig config;
+    config.cache_dir       = test_dir;
+    config.max_cache_bytes = 100ULL << 20;
+    config.enabled         = true;
+
+    const std::uint64_t model_hash = 0x1122334455667788ULL;
+    constexpr std::uint32_t page_bytes = 8192;
+    const std::size_t text_kv_bytes = 8 * page_bytes;
+    const auto original_gdn  = generate_deterministic_bytes(256 * 1024, 602);
+    const auto original_mtp  = generate_deterministic_bytes(1024, 604);
+    const auto original_tail = generate_deterministic_bytes(1024, 603);
+
+    constexpr int kIterations = 6;
+
+    // Each iteration restores a DISTINCT snapshot (own token sequence, own Text KV payload)
+    // so a racing reuse-path DMA overwrite produces byte-detectable corruption -- a shared
+    // payload across iterations would make the race undetectable by construction.
+    const std::vector<TokenId> tokens_iter0 = generate_tokens(8 * 64, 61);
+    const std::vector<TokenId> tokens_iter1 = generate_tokens(8 * 64, 62);
+    const std::vector<TokenId> tokens_iter2 = generate_tokens(8 * 64, 63);
+    const std::vector<TokenId> tokens_iter3 = generate_tokens(8 * 64, 64);
+    const std::vector<TokenId> tokens_iter4 = generate_tokens(8 * 64, 65);
+    const std::vector<TokenId> tokens_iter5 = generate_tokens(8 * 64, 66);
+    const std::vector<std::vector<TokenId>> iter_tokens = {
+        tokens_iter0, tokens_iter1, tokens_iter2, tokens_iter3, tokens_iter4, tokens_iter5};
+
+    const auto original_kv0 = generate_deterministic_bytes(text_kv_bytes, 601);
+    const auto original_kv1 = generate_deterministic_bytes(text_kv_bytes, 602);
+    const auto original_kv2 = generate_deterministic_bytes(text_kv_bytes, 603);
+    const auto original_kv3 = generate_deterministic_bytes(text_kv_bytes, 604);
+    const auto original_kv4 = generate_deterministic_bytes(text_kv_bytes, 605);
+    const auto original_kv5 = generate_deterministic_bytes(text_kv_bytes, 606);
+    const std::vector<std::vector<std::byte>> original_kv = {
+        original_kv0, original_kv1, original_kv2, original_kv3, original_kv4, original_kv5};
+
+    std::vector<std::filesystem::path> manifest_path(kIterations);
+    {
+        DiskStateCache cache(config);
+        for (int iter = 0; iter < kIterations; ++iter) {
+            cache.enqueue_save(model_hash, iter_tokens[iter], 1, 0, original_gdn, original_kv[iter], 8,
+                               original_mtp, 1, original_tail);
+            auto match = wait_for_match(cache, model_hash, iter_tokens[iter]);
+            expect(match.has_value(), "Reuse-race fixture snapshot " + std::to_string(iter) + " must be written");
+            if (!match.has_value()) {
+                std::filesystem::remove_all(test_dir, ec);
+                return;
+            }
+            manifest_path[iter] = match->file_path;
+        }
+    }
+
+    std::vector<void*> scratch(kIterations, nullptr);
+    for (int iter = 0; iter < kIterations; ++iter) {
+        CUDA_CHECK(cudaMalloc(&scratch[iter], text_kv_bytes));
+    }
+
+    // Consumer stall buffers: the DirectStorage disk->VRAM DMA is roughly two orders of
+    // magnitude slower per byte than the CUDA device-to-device consumer copy above, so no
+    // payload size or iteration count can open the race window from the producer side alone.
+    // Manufacture the window from the fixture's own side instead: enqueue enough GPU-side
+    // device-to-device copy work on ctx.stream, ahead of each iteration's consumer copy, that
+    // the consumer copy is provably still in flight when the next iteration's restore lands.
+    // These buffers must not alias the staging buffer or any scratch[iter] allocation.
+    constexpr std::size_t kStallBytes = 64ULL << 20;
+    void* d_stall_a = nullptr;
+    void* d_stall_b = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_stall_a, kStallBytes));
+    CUDA_CHECK(cudaMalloc(&d_stall_b, kStallBytes));
+
+    int kStallCopies = 400;
+    void* first_ds_staging = nullptr;
+
+    {
+        DiskStateCache cache(config);
+
+        for (int iter = 0; iter < kIterations; ++iter) {
+            if (iter == 0) {
+                // Self-measurement, not assumption: bracket iteration 0's stall chain with
+                // events on ctx.stream so the race window is proven, not assumed.
+                cudaEvent_t stall_start = nullptr;
+                cudaEvent_t stall_stop  = nullptr;
+                CUDA_CHECK(cudaEventCreate(&stall_start));
+                CUDA_CHECK(cudaEventCreate(&stall_stop));
+
+                CUDA_CHECK(cudaEventRecord(stall_start, ctx.stream));
+                for (int c = 0; c < kStallCopies; ++c) {
+                    CUDA_CHECK(cudaMemcpyAsync(d_stall_a, d_stall_b, kStallBytes,
+                                              cudaMemcpyDeviceToDevice, ctx.stream));
+                }
+                CUDA_CHECK(cudaEventRecord(stall_stop, ctx.stream));
+                CUDA_CHECK(cudaEventSynchronize(stall_stop));
+                float stall_ms = 0.0f;
+                CUDA_CHECK(cudaEventElapsedTime(&stall_ms, stall_start, stall_stop));
+
+                // Pre-authorized bounded adjustment, one step only: if the measured stall is
+                // under 5.0 ms, raise kStallCopies to 1600 for ALL iterations and re-measure
+                // iteration 0 once more. No further escalation is permitted.
+                if (stall_ms < 5.0f) {
+                    kStallCopies = 1600;
+                    CUDA_CHECK(cudaEventRecord(stall_start, ctx.stream));
+                    for (int c = 0; c < kStallCopies; ++c) {
+                        CUDA_CHECK(cudaMemcpyAsync(d_stall_a, d_stall_b, kStallBytes,
+                                                  cudaMemcpyDeviceToDevice, ctx.stream));
+                    }
+                    CUDA_CHECK(cudaEventRecord(stall_stop, ctx.stream));
+                    CUDA_CHECK(cudaEventSynchronize(stall_stop));
+                    CUDA_CHECK(cudaEventElapsedTime(&stall_ms, stall_start, stall_stop));
+                }
+
+                CUDA_CHECK(cudaEventDestroy(stall_start));
+                CUDA_CHECK(cudaEventDestroy(stall_stop));
+
+                const int stall_tenths = static_cast<int>(stall_ms * 10.0f + 0.5f);
+                std::cout << "[stall] ninfer-test: reuse-race consumer stall = "
+                          << (stall_tenths / 10) << '.' << (stall_tenths % 10) << " ms\n";
+                expect(stall_ms >= 5.0f,
+                       "Reuse-race consumer stall measurement must be >= 5.0 ms to guarantee the race window");
+            } else {
+                for (int c = 0; c < kStallCopies; ++c) {
+                    CUDA_CHECK(cudaMemcpyAsync(d_stall_a, d_stall_b, kStallBytes,
+                                              cudaMemcpyDeviceToDevice, ctx.stream));
+                }
+            }
+
+            DiskStateHeader loaded_header;
+            std::vector<TokenId> loaded_tokens;
+            void* d_ds_staging = nullptr;
+            std::size_t text_staging_bytes = 0;
+
+            const bool ok = cache.load_snapshot_direct_storage(manifest_path[iter], loaded_header, loaded_tokens,
+                                                              ctx.stream, d_ds_staging, text_staging_bytes);
+            expect(ok, "Reuse-race restore iteration " + std::to_string(iter) + " must succeed");
+            expect(d_ds_staging != nullptr, "Reuse-race staging pointer must be valid");
+
+            // Prove the fast-reuse branch is actually exercised: a changed staging pointer
+            // means allocate_staging_vram's fast-reuse branch was not taken and this fixture
+            // does not verify the race, regardless of the FAIL/PASS outcome below.
+            if (iter == 0) {
+                first_ds_staging = d_ds_staging;
+            } else {
+                expect(d_ds_staging == first_ds_staging,
+                       "Reuse-race staging pointer must stay identical across iterations "
+                       "(iteration " + std::to_string(iter) + ")");
+            }
+
+            // Consumer: copy the staging payload's Text KV region into a persistent scratch
+            // buffer on ctx.stream. Deliberately no cudaStreamSynchronize and no
+            // release_staging() here -- the next loop iteration's restore call below must
+            // reuse the same staging allocation (allocate_staging_vram's fast-reuse branch)
+            // while this device-to-device copy is still in flight.
+            CUDA_CHECK(cudaMemcpyAsync(scratch[iter], d_ds_staging, text_staging_bytes,
+                                      cudaMemcpyDeviceToDevice, ctx.stream));
+        }
+
+        // Single sync after the whole loop, once every restore + consumer copy has been issued.
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+
+        ninfer::core::DirectStorageEngine::instance().release_staging();
+    }
+
+    for (int iter = 0; iter < kIterations; ++iter) {
+        std::vector<std::byte> readback(text_kv_bytes);
+        CUDA_CHECK(cudaMemcpy(readback.data(), scratch[iter], text_kv_bytes, cudaMemcpyDeviceToHost));
+        expect(readback == original_kv[iter],
+               "Reuse-race scratch buffer " + std::to_string(iter) + " must be byte-exact against original Text KV bytes");
+        CUDA_CHECK(cudaFree(scratch[iter]));
+    }
+
+    CUDA_CHECK(cudaFree(d_stall_a));
+    CUDA_CHECK(cudaFree(d_stall_b));
+
+    std::filesystem::remove_all(test_dir, ec);
+}
 #endif
 
 int main() {
@@ -1127,6 +1378,8 @@ int main() {
     test_cow_multi_turn_delta_splicing_live_gpu();
     test_full_state_direct_storage_restore_live_gpu();
     test_direct_storage_rapid_restore_and_teardown_stress();
+    test_disk_state_layout_mismatch_rejected();
+    test_direct_storage_reuse_without_teardown_race();
 #endif
 
     if (failures != 0) {

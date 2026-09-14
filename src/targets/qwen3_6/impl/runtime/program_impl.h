@@ -515,7 +515,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             if (disk_state_cache &&
                 disk_state_cache->load_snapshot_direct_storage(request_plan.disk_snapshot_path, header,
                                                                loaded_tokens, device.stream, d_ds_staging,
-                                                               text_staging_bytes)) {
+                                                               text_staging_bytes,
+                                                               static_cast<std::uint32_t>(decoder->text_kv.pool().total_page_bytes()))) {
                 // DirectStorage VRAM restore
                 const std::byte* d_staging_bytes = static_cast<const std::byte*>(d_ds_staging);
 
@@ -1063,6 +1064,9 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
 void ProgramImplCore::abort_lane(std::uint32_t lane) noexcept {
     if (lane >= max_concurrency) { return; }
     clear_lane(sequences[lane], requests[lane]);
+#if defined(_WIN32)
+    ::ninfer::core::DirectStorageEngine::instance().release_staging();
+#endif
 }
 
 bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {

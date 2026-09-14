@@ -105,6 +105,13 @@ void read_manifest_page_hashes(const std::filesystem::path& path,
 
 } // namespace
 
+bool disk_state_layout_matches(const DiskStateHeader& h, std::uint32_t live_text_page_bytes) noexcept {
+    if (h.text_page_count > 0 && live_text_page_bytes != 0 && h.text_page_bytes != live_text_page_bytes) {
+        return false;
+    }
+    return true;
+}
+
 std::uint64_t DiskStateCache::hash_prompt_prefix(std::span<const TokenId> tokens) {
     return fnv1a_64(tokens.data(), tokens.size_bytes());
 }
@@ -553,7 +560,8 @@ public:
                                                     std::vector<TokenId>& out_tokens,
                                                     cudaStream_t stream,
                                                     void*& out_d_staging_ptr,
-                                                    std::size_t& out_text_bytes) {
+                                                    std::size_t& out_text_bytes,
+                                                    std::uint32_t expected_text_page_bytes) {
         std::error_code ec;
         const auto file_size = std::filesystem::file_size(path, ec);
         if (ec) { return false; }
@@ -564,6 +572,13 @@ public:
         DiskStateHeader header;
         file.read(reinterpret_cast<char*>(&header), sizeof(header));
         if (!file || !is_valid_header(header, file_size)) {
+            return false;
+        }
+
+        if (!disk_state_layout_matches(header, expected_text_page_bytes)) {
+            std::cerr << "[warn] ninfer: [prompt-cache] layout mismatch: header.text_page_bytes="
+                      << header.text_page_bytes << " live_text_page_bytes=" << expected_text_page_bytes
+                      << "\n" << std::flush;
             return false;
         }
 
@@ -585,6 +600,9 @@ public:
             auto page_rec = journal_.get_page(phash);
             if (!page_rec) {
                 return false; // Incomplete journal
+            }
+            if (page_rec->page_bytes != header.text_page_bytes) {
+                return false; // Journal page geometry disagrees with header
             }
             text_pages.push_back({page_rec->file_offset, page_rec->page_bytes});
         }
@@ -1069,8 +1087,9 @@ bool DiskStateCache::load_snapshot_direct_storage(const std::filesystem::path& p
                                                   std::vector<TokenId>& out_tokens,
                                                   cudaStream_t stream,
                                                   void*& out_d_staging_ptr,
-                                                  std::size_t& out_text_bytes) {
-    return impl_->load_snapshot_direct_storage(path, out_header, out_tokens, stream, out_d_staging_ptr, out_text_bytes);
+                                                  std::size_t& out_text_bytes,
+                                                  std::uint32_t expected_text_page_bytes) {
+    return impl_->load_snapshot_direct_storage(path, out_header, out_tokens, stream, out_d_staging_ptr, out_text_bytes, expected_text_page_bytes);
 }
 #endif
 

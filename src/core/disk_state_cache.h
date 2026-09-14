@@ -59,6 +59,12 @@ struct DiskStateMatch {
     DiskStateHeader header;
 };
 
+// Pure, GPU-free geometry predicate: rejects a snapshot whose header page geometry
+// disagrees with the live pool's page geometry. 0 for live_text_page_bytes means
+// unchecked (always accepted).
+[[nodiscard]] bool disk_state_layout_matches(const DiskStateHeader& h,
+                                             std::uint32_t live_text_page_bytes) noexcept;
+
 inline std::string current_utc_timestamp_compact() {
     auto now = std::chrono::system_clock::now();
     std::time_t tt = std::chrono::system_clock::to_time_t(now);
@@ -132,7 +138,8 @@ public:
                                                     std::vector<TokenId>& out_tokens,
                                                     cudaStream_t stream,
                                                     void*& out_d_staging_ptr,
-                                                    std::size_t& out_text_bytes);
+                                                    std::size_t& out_text_bytes,
+                                                    std::uint32_t expected_text_page_bytes = 0);
 #endif
 
     // True CoW enqueue with explicit delta physical pages

@@ -113,8 +113,21 @@ void DirectStorageEngine::recreate_queue() {
     ds_factory_->CreateQueue(&queue_desc, IID_PPV_ARGS(&ds_queue_));
 }
 
+void DirectStorageEngine::sync_last_consumer() noexcept {
+    if (last_consumer_stream_ == nullptr) {
+        return;
+    }
+    if (!consumer_event_) {
+        cudaEventCreateWithFlags(&consumer_event_, cudaEventDisableTiming);
+    }
+    cudaEventRecord(consumer_event_, last_consumer_stream_);
+    cudaEventSynchronize(consumer_event_);
+    last_consumer_stream_ = nullptr;
+}
+
 bool DirectStorageEngine::allocate_staging_vram(std::size_t required_bytes) {
     if (staging_resource_ && current_capacity_ >= required_bytes) {
+        sync_last_consumer();
         return true;
     }
 
@@ -205,6 +218,8 @@ bool DirectStorageEngine::allocate_staging_vram(std::size_t required_bytes) {
 
 void DirectStorageEngine::release_staging() noexcept {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
+
+    sync_last_consumer();
 
     // 1. Ensure D3D12 / DirectStorage queue has 100% finished retiring all DMA requests
     if (d3d12_fence_ && fence_value_ > 0) {
@@ -298,6 +313,7 @@ bool DirectStorageEngine::restore_snapshot_payload(const std::filesystem::path& 
         return false;
     }
 
+    last_consumer_stream_ = stream;
     out_d_staging_ptr = d_staging_ptr_;
     return true;
 }
@@ -412,6 +428,7 @@ bool DirectStorageEngine::restore_snapshot_cow(const std::filesystem::path& pool
         return false;
     }
 
+    last_consumer_stream_ = stream;
     out_d_staging_ptr = d_staging_ptr_;
     out_text_bytes    = total_text_bytes;
     return true;
@@ -422,6 +439,10 @@ void DirectStorageEngine::cleanup() {
     if (cuda_fence_sem_) {
         cudaDestroyExternalSemaphore(cuda_fence_sem_);
         cuda_fence_sem_ = nullptr;
+    }
+    if (consumer_event_) {
+        cudaEventDestroy(consumer_event_);
+        consumer_event_ = nullptr;
     }
     ds_queue_.Reset();
     ds_factory_.Reset();
