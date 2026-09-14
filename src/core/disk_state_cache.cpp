@@ -178,6 +178,31 @@ public:
         }
     }
 
+    // Pool bytes a compaction would keep: the stored pages in `referenced` plus every leased one.
+    [[nodiscard]] std::uint64_t retained_bytes(const std::unordered_map<std::uint64_t, std::uint32_t>& referenced) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::uint64_t bytes = 0;
+        for (const auto& [hash, rec] : page_index_) {
+            if (referenced.contains(hash) || pins_.contains(hash)) {
+                bytes += aligned_bytes(rec);
+            }
+        }
+        return bytes;
+    }
+
+    // Pool bytes a compaction would free once nothing references `hashes`: the stored, unleased ones.
+    [[nodiscard]] std::uint64_t releasable_bytes(std::span<const std::uint64_t> hashes) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::uint64_t bytes = 0;
+        for (const std::uint64_t hash : hashes) {
+            const auto it = page_index_.find(hash);
+            if (it != page_index_.end() && !pins_.contains(hash)) {
+                bytes += aligned_bytes(it->second);
+            }
+        }
+        return bytes;
+    }
+
     // Retires `hashes` and every record whose bytes lie past the end of the pool. Returns
     // nullopt and retires nothing when the pool was rewritten since `expected_generation`: the
     // failed read then used offsets that no longer apply.
@@ -592,6 +617,10 @@ private:
         return past_end.size();
     }
 
+    [[nodiscard]] static std::uint64_t aligned_bytes(const PageIndexRecord& rec) noexcept {
+        return (static_cast<std::uint64_t>(rec.page_bytes) + 4095ULL) & ~4095ULL;
+    }
+
     [[nodiscard]] bool pages_stored_locked(std::span<const std::uint64_t> hashes) const {
         return std::all_of(hashes.begin(), hashes.end(),
                            [this](std::uint64_t hash) { return page_index_.contains(hash); });
@@ -940,12 +969,13 @@ public:
     void prune_lru() {
         std::size_t evicted_count = 0;
         std::uint64_t evicted_bytes = 0;
+        std::uint64_t released_page_bytes = 0;
         std::uint64_t pool_bytes = 0;
         bool should_compact = false;
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            std::uint64_t total_bytes = 0;
+            std::uint64_t manifest_bytes = 0;
             std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> entries;
 
             std::error_code ec;
@@ -953,14 +983,13 @@ public:
             for (const auto& entry : std::filesystem::directory_iterator(manifest_dir, ec)) {
                 if (entry.is_regular_file() && entry.path().extension() == ".ninfer_manifest") {
                     const auto sz = entry.file_size(ec);
-                    total_bytes += sz;
+                    manifest_bytes += sz;
                     entries.emplace_back(entry.last_write_time(ec), entry.path());
                 }
             }
 
             if (std::filesystem::exists(journal_.pool_data_path(), ec)) {
                 pool_bytes = std::filesystem::file_size(journal_.pool_data_path(), ec);
-                total_bytes += pool_bytes;
             }
 
             // High Watermark: 100% of max_cache_bytes
@@ -968,16 +997,47 @@ public:
             const std::uint64_t high_watermark = config_.max_cache_bytes;
             const std::uint64_t low_watermark  = config_.max_cache_bytes * 3 / 4;
 
-            if (total_bytes > high_watermark) {
+            if (manifest_bytes + pool_bytes > high_watermark && entries.size() > 1) {
+                // Evicting a manifest shrinks the pool only through the compaction below, and only by
+                // the pages no remaining snapshot or lease references. Eviction therefore stops on
+                // the size that compaction would leave, not on the pool file as it is now: that file
+                // alone can exceed the low watermark and would otherwise take every manifest with it.
+                std::map<std::filesystem::path, std::vector<std::uint64_t>> manifest_pages;
+                std::unordered_map<std::uint64_t, std::uint32_t> page_refs;
+                for (const auto& [path, header] : index_) {
+                    std::unordered_set<std::uint64_t> hashes;
+                    read_manifest_page_hashes(path, header, hashes);
+                    for (const std::uint64_t hash : hashes) {
+                        ++page_refs[hash];
+                    }
+                    manifest_pages.emplace(path, std::vector<std::uint64_t>(hashes.begin(), hashes.end()));
+                }
+                std::uint64_t projected_bytes = manifest_bytes + journal_.retained_bytes(page_refs);
+
                 std::sort(entries.begin(), entries.end()); // Oldest first
-                for (const auto& [time, path] : entries) {
-                    if (total_bytes <= low_watermark) { break; }
+                // The newest manifest is kept: it is normally the snapshot the writer just saved.
+                for (std::size_t i = 0; i + 1 < entries.size() && projected_bytes > low_watermark; ++i) {
+                    const auto& path = entries[i].second;
                     const auto sz = std::filesystem::file_size(path, ec);
-                    std::filesystem::remove(path, ec);
-                    total_bytes -= sz;
+                    if (ec || !std::filesystem::remove(path, ec)) { continue; }
+                    projected_bytes -= std::min(projected_bytes, sz);
                     evicted_bytes += sz;
                     ++evicted_count;
                     index_.erase(path);
+
+                    const auto pages = manifest_pages.find(path);
+                    if (pages == manifest_pages.end()) { continue; }
+                    std::vector<std::uint64_t> released;
+                    for (const std::uint64_t hash : pages->second) {
+                        const auto ref = page_refs.find(hash);
+                        if (--ref->second == 0) {
+                            page_refs.erase(ref);
+                            released.push_back(hash);
+                        }
+                    }
+                    const std::uint64_t freed = journal_.releasable_bytes(released);
+                    projected_bytes -= std::min(projected_bytes, freed);
+                    released_page_bytes += freed;
                 }
             }
 
@@ -986,10 +1046,12 @@ public:
 
         if (evicted_count > 0) {
             const double evicted_mb = static_cast<double>(evicted_bytes) / (1024.0 * 1024.0);
+            const double released_mb = static_cast<double>(released_page_bytes) / (1024.0 * 1024.0);
             const double limit_gb = static_cast<double>(config_.max_cache_bytes) / (1024.0 * 1024.0 * 1024.0);
             std::cout << "[info] ninfer: [prompt-cache] LRU bulk evicted " << evicted_count
                       << " manifest(s) (" << std::fixed << std::setprecision(1) << evicted_mb
-                      << "MB freed, limit=" << limit_gb << "GB)\n" << std::flush;
+                      << "MB freed, " << released_mb << "MB of pool pages unreferenced, limit="
+                      << limit_gb << "GB)\n" << std::flush;
         }
 
         // Perform Mark-and-Sweep compaction only if dead space >= 2.0 GiB AND fragmentation >= 25%

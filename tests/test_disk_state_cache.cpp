@@ -783,6 +783,90 @@ void test_bulk_lru_watermark_eviction() {
     std::filesystem::remove_all(test_dir, ec);
 }
 
+// A pool above the low watermark stays there after eviction until a compaction runs, so eviction
+// must count the pages each manifest frees instead of evicting until the pool file itself shrinks.
+void test_lru_eviction_counts_shared_pool_pages() {
+    const std::filesystem::path test_dir = "./.test_ninfer_cache_lru_shared_pages";
+    std::error_code ec;
+    std::filesystem::remove_all(test_dir, ec);
+
+    constexpr std::uint32_t page_bytes = 64U << 10;
+    constexpr std::size_t prefix_pages = 4;
+    constexpr std::size_t branch_pages = 4;
+    constexpr std::size_t branch_count = 4;
+
+    // Four branches of one shared 4-page prefix, each with 4 pages of its own: 20 pages, 1280 KiB.
+    // 1100 KiB puts that pool above the high watermark (the writer prunes after the fourth save,
+    // not the third: 16 pages plus 3 manifests of ~10 KiB fit) and above the 825 KiB low
+    // watermark. Evicting the two oldest branches frees 512 KiB of pages, which leaves 768 KiB
+    // plus two manifests after compaction.
+    DiskStateCacheConfig config;
+    config.cache_dir       = test_dir;
+    config.max_cache_bytes = 1100ULL << 10;
+    config.enabled         = true;
+
+    const std::uint64_t model_hash = 0x5A4ED9A6E5ULL;
+    const auto prefix = generate_tokens(prefix_pages * 64, 7);
+    const auto gdn_state = generate_deterministic_bytes(2048, 601);
+    const auto mtp_state = generate_deterministic_bytes(1024, 602);
+    const auto tail_state = generate_deterministic_bytes(1024, 603);
+
+    std::vector<std::vector<TokenId>> branches;
+    std::vector<std::filesystem::path> manifests;
+    {
+        DiskStateCache cache(config);
+        for (std::size_t b = 0; b < branch_count; ++b) {
+            auto tokens = prefix;
+            const auto suffix = generate_tokens(branch_pages * 64, 700 + static_cast<std::uint32_t>(b));
+            tokens.insert(tokens.end(), suffix.begin(), suffix.end());
+            const auto kv = generate_deterministic_bytes((prefix_pages + branch_pages) * page_bytes,
+                                                         610 + static_cast<std::uint32_t>(b));
+            cache.enqueue_save(model_hash, tokens, static_cast<std::uint32_t>(b + 1), 0, gdn_state, kv,
+                               static_cast<std::uint32_t>(prefix_pages + branch_pages), mtp_state, 1, tail_state);
+            const auto match = wait_for_match(cache, model_hash, tokens);
+            expect(match.has_value() && match->matched_tokens == tokens.size(),
+                   "Each branch snapshot must be indexed before the next save");
+            manifests.push_back(match ? match->file_path : std::filesystem::path{});
+            branches.push_back(std::move(tokens));
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+
+        cache.prune_lru();
+
+        const std::uint64_t pool_size = std::filesystem::file_size(test_dir / "pool_data.ninfer_pages", ec);
+        expect(pool_size == (prefix_pages + branch_count * branch_pages) * page_bytes,
+               "The pool must stay uncompacted (below the dead-space threshold) for this check");
+        expect(!std::filesystem::exists(manifests[0]) && !std::filesystem::exists(manifests[1]),
+               "The two oldest branches must be evicted");
+        expect(std::filesystem::exists(manifests[2]) && std::filesystem::exists(manifests[3]),
+               "Eviction must stop once the pages still referenced fit under the low watermark");
+        for (std::size_t b = 2; b < branch_count; ++b) {
+            const auto match = cache.find_longest_matching_prefix(model_hash, branches[b]);
+            expect(match.has_value() && match->matched_tokens == branches[b].size(),
+                   "The kept branches must remain restorable");
+        }
+
+        // The eviction is settled: a repeated prune evicts nothing more.
+        cache.prune_lru();
+        expect(std::filesystem::exists(manifests[2]) && std::filesystem::exists(manifests[3]),
+               "A repeated prune must keep the newest branches");
+    }
+
+    // When even the newest snapshot's pages exceed the low watermark, it is still kept.
+    config.max_cache_bytes = 256ULL << 10;
+    {
+        DiskStateCache cache(config);
+        cache.prune_lru();
+        expect(!std::filesystem::exists(manifests[2]), "The older branch must be evicted under a smaller limit");
+        expect(std::filesystem::exists(manifests[3]), "The newest manifest must never be evicted");
+        const auto match = cache.find_longest_matching_prefix(model_hash, branches[3]);
+        expect(match.has_value() && match->matched_tokens == branches[3].size(),
+               "The newest snapshot must remain restorable");
+    }
+
+    std::filesystem::remove_all(test_dir, ec);
+}
+
 void test_paged_kv_gather_scatter_page_major_layout_verification() {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
@@ -1960,6 +2044,7 @@ int main() {
     test_mark_and_sweep_pool_compaction();
     test_compaction_fragmentation_thresholds();
     test_bulk_lru_watermark_eviction();
+    test_lru_eviction_counts_shared_pool_pages();
     test_concurrent_compaction_and_non_blocking_lookup();
     test_pages_appended_during_compaction_survive();
     test_leased_pages_survive_compaction();
