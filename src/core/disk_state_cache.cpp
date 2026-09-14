@@ -559,8 +559,8 @@ public:
                                                     DiskStateHeader& out_header,
                                                     std::vector<TokenId>& out_tokens,
                                                     cudaStream_t stream,
-                                                    void*& out_d_staging_ptr,
-                                                    std::size_t& out_text_bytes,
+                                                    std::span<const std::uint64_t> gdn_unit_bytes,
+                                                    const DirectStorageRestoreConsumer& consumer,
                                                     std::uint32_t expected_text_page_bytes) {
         std::error_code ec;
         const auto file_size = std::filesystem::file_size(path, ec);
@@ -594,30 +594,82 @@ public:
         }
         if (!file) { return false; }
 
-        std::vector<core::PageRestoreEntry> text_pages;
-        text_pages.reserve(header.text_page_count);
-        for (std::uint64_t phash : page_hashes) {
-            auto page_rec = journal_.get_page(phash);
+        // Segment list in file order, with the kind and per-kind index of each segment.
+        std::vector<core::DirectStorageSegment> segments;
+        std::vector<DirectStorageRestoreSlice> slice_meta;
+        segments.reserve(header.text_page_count + gdn_unit_bytes.size() + header.mtp_page_count + 2);
+        slice_meta.reserve(segments.capacity());
+        const auto add_segment = [&](core::DirectStorageSource source, std::uint64_t file_offset,
+                                     std::uint64_t bytes, DirectStorageRestoreKind kind, std::uint32_t index) {
+            segments.push_back({source, file_offset, bytes});
+            slice_meta.push_back({kind, index, nullptr, static_cast<std::size_t>(bytes)});
+        };
+
+        for (std::uint32_t i = 0; i < header.text_page_count; ++i) {
+            auto page_rec = journal_.get_page(page_hashes[i]);
             if (!page_rec) {
                 return false; // Incomplete journal
             }
             if (page_rec->page_bytes != header.text_page_bytes) {
                 return false; // Journal page geometry disagrees with header
             }
-            text_pages.push_back({page_rec->file_offset, page_rec->page_bytes});
+            add_segment(core::DirectStorageSource::Pool, page_rec->file_offset, page_rec->page_bytes,
+                        DirectStorageRestoreKind::TextPage, i);
         }
 
-        if (!core::DirectStorageEngine::instance().available()) {
+        std::uint64_t manifest_offset = header.payload_offset_bytes;
+        if (header.gdn_state_bytes > 0) {
+            if (gdn_unit_bytes.empty()) {
+                add_segment(core::DirectStorageSource::Manifest, manifest_offset, header.gdn_state_bytes,
+                            DirectStorageRestoreKind::Gdn, 0);
+            } else {
+                std::uint64_t gdn_sum = 0;
+                for (std::size_t i = 0; i < gdn_unit_bytes.size(); ++i) {
+                    if (gdn_unit_bytes[i] == 0) { return false; }
+                    add_segment(core::DirectStorageSource::Manifest, manifest_offset + gdn_sum, gdn_unit_bytes[i],
+                                DirectStorageRestoreKind::Gdn, static_cast<std::uint32_t>(i));
+                    gdn_sum += gdn_unit_bytes[i];
+                }
+                if (gdn_sum != header.gdn_state_bytes) {
+                    return false; // Live GDN layout disagrees with the snapshot
+                }
+            }
+            manifest_offset += header.gdn_state_bytes;
+        }
+        if (header.mtp_kv_bytes > 0) {
+            const std::uint32_t mtp_pages = std::max<std::uint32_t>(header.mtp_page_count, 1);
+            if (header.mtp_kv_bytes % mtp_pages != 0) { return false; }
+            const std::uint64_t mtp_page_bytes = header.mtp_kv_bytes / mtp_pages;
+            for (std::uint32_t i = 0; i < mtp_pages; ++i) {
+                add_segment(core::DirectStorageSource::Manifest, manifest_offset + i * mtp_page_bytes, mtp_page_bytes,
+                            DirectStorageRestoreKind::MtpPage, i);
+            }
+            manifest_offset += header.mtp_kv_bytes;
+        }
+        if (header.tail_hidden_bytes > 0) {
+            add_segment(core::DirectStorageSource::Manifest, manifest_offset, header.tail_hidden_bytes,
+                        DirectStorageRestoreKind::Tail, 0);
+        }
+
+        if (segments.empty() || !core::DirectStorageEngine::instance().available()) {
             return false;
         }
 
         const std::uint64_t manifest_payload_bytes = header.gdn_state_bytes + header.mtp_kv_bytes + header.tail_hidden_bytes;
         const auto t_load_0 = std::chrono::steady_clock::now();
 
-        const bool ok = core::DirectStorageEngine::instance().restore_snapshot_cow(
-            journal_.pool_data_path(), text_pages, path, header.payload_offset_bytes,
-            manifest_payload_bytes, stream, out_d_staging_ptr, out_text_bytes
-        );
+        std::vector<DirectStorageRestoreSlice> batch;
+        const bool ok = core::DirectStorageEngine::instance().restore_segments(
+            journal_.pool_data_path(), path, segments, stream,
+            [&](const std::byte* staging, std::size_t first, std::span<const std::size_t> offsets) {
+                batch.clear();
+                for (std::size_t i = 0; i < offsets.size(); ++i) {
+                    DirectStorageRestoreSlice slice = slice_meta[first + i];
+                    slice.data = staging + offsets[i];
+                    batch.push_back(slice);
+                }
+                return consumer(std::span<const DirectStorageRestoreSlice>(batch.data(), batch.size()));
+            });
         if (!ok) { return false; }
 
         const auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_load_0).count();
@@ -1086,10 +1138,10 @@ bool DiskStateCache::load_snapshot_direct_storage(const std::filesystem::path& p
                                                   DiskStateHeader& out_header,
                                                   std::vector<TokenId>& out_tokens,
                                                   cudaStream_t stream,
-                                                  void*& out_d_staging_ptr,
-                                                  std::size_t& out_text_bytes,
+                                                  std::span<const std::uint64_t> gdn_unit_bytes,
+                                                  const DirectStorageRestoreConsumer& consumer,
                                                   std::uint32_t expected_text_page_bytes) {
-    return impl_->load_snapshot_direct_storage(path, out_header, out_tokens, stream, out_d_staging_ptr, out_text_bytes, expected_text_page_bytes);
+    return impl_->load_snapshot_direct_storage(path, out_header, out_tokens, stream, gdn_unit_bytes, consumer, expected_text_page_bytes);
 }
 #endif
 

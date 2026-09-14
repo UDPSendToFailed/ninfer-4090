@@ -811,20 +811,26 @@ void test_cow_multi_turn_delta_splicing_live_gpu() {
 
         DiskStateHeader loaded_header;
         std::vector<TokenId> loaded_tokens;
-        void* d_ds_staging = nullptr;
         std::size_t text_staging_bytes = 0;
-
-        const bool ok = restarted_cache.load_snapshot_direct_storage(
-            match_t3->file_path, loaded_header, loaded_tokens, ctx.stream, d_ds_staging, text_staging_bytes);
-        expect(ok, "DirectStorage multi-turn delta restore must succeed");
-        expect(loaded_header.text_page_count == 24, "Restored text page count must be 24");
-        expect(text_staging_bytes == single_page_bytes * 24, "Staging bytes must match 24 full pages");
 
         // Scatter the restored 24 pages into physical pages 0..23
         std::vector<std::int32_t> restore_phys_pages;
         for (int i = 0; i < 24; ++i) restore_phys_pages.push_back(i);
-        kv_pool.scatter_from_contiguous_device(restore_phys_pages, d_ds_staging, ctx.stream);
+        const bool ok = restarted_cache.load_snapshot_direct_storage(
+            match_t3->file_path, loaded_header, loaded_tokens, ctx.stream, {},
+            [&](std::span<const DirectStorageRestoreSlice> slices) {
+                for (const auto& s : slices) {
+                    if (s.kind != DirectStorageRestoreKind::TextPage) { continue; }
+                    kv_pool.scatter_from_contiguous_device(
+                        std::span<const std::int32_t>(&restore_phys_pages[s.index], 1), s.data, ctx.stream);
+                    text_staging_bytes += s.bytes;
+                }
+                return true;
+            });
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        expect(ok, "DirectStorage multi-turn delta restore must succeed");
+        expect(loaded_header.text_page_count == 24, "Restored text page count must be 24");
+        expect(text_staging_bytes == single_page_bytes * 24, "Staging bytes must match 24 full pages");
 
         // Read back each physical page and assert 100% bit-exact parity across all 24 pages and all 4 planes
         for (std::size_t i = 0; i < 24; ++i) {
@@ -839,8 +845,6 @@ void test_cow_multi_turn_delta_splicing_live_gpu() {
             expect(readback_page == all_ground_truth_pages[i],
                    "DirectStorage spliced multi-turn page " + std::to_string(i) + " must be 100% bit-exact across all 4 planes");
         }
-
-        ninfer::core::DirectStorageEngine::instance().release_staging();
     }
 
     std::filesystem::remove_all(test_dir, ec);
@@ -970,35 +974,43 @@ void test_full_state_direct_storage_restore_live_gpu() {
         // Restore entire state via DirectStorage DMA
         DiskStateHeader loaded_header;
         std::vector<TokenId> loaded_tokens;
-        void* d_ds_staging = nullptr;
-        std::size_t text_staging_bytes = 0;
-        const bool load_ok = cache.load_snapshot_direct_storage(match->file_path, loaded_header,
-                                                               loaded_tokens, ctx.stream, d_ds_staging,
-                                                               text_staging_bytes);
-        expect(load_ok, "load_snapshot_direct_storage must succeed");
-        expect(loaded_header.rope_delta == 42, "RoPE delta matches");
 
-        const std::byte* d_staging_bytes = static_cast<const std::byte*>(d_ds_staging);
+        // GDN units in file order: recurrent slot tensors, then conv slot tensors
+        std::vector<Tensor> gdn_units;
+        for (const auto& t : gdn_pool.recurrent) { gdn_units.push_back(t.slice(3, active_slot, 1)); }
+        for (const auto& t : gdn_pool.conv) { gdn_units.push_back(t.slice(2, active_slot, 1)); }
+        std::vector<std::uint64_t> gdn_unit_bytes;
+        for (const auto& u : gdn_units) { gdn_unit_bytes.push_back(u.bytes()); }
 
-        // 1. Scatter Text KV
-        kv_pool.scatter_from_contiguous_device(valid_page_ids, d_staging_bytes, ctx.stream);
-
-        // 2. Restore GDN state
-        std::size_t offset = text_staging_bytes;
-        for (const auto& t : gdn_pool.recurrent) {
-            Tensor slot_t = t.slice(3, active_slot, 1);
-            CUDA_CHECK(cudaMemcpyAsync(slot_t.data, d_staging_bytes + offset, slot_t.bytes(), cudaMemcpyDeviceToDevice, ctx.stream));
-            offset += slot_t.bytes();
-        }
-        for (const auto& t : gdn_pool.conv) {
-            Tensor slot_t = t.slice(2, active_slot, 1);
-            CUDA_CHECK(cudaMemcpyAsync(slot_t.data, d_staging_bytes + offset, slot_t.bytes(), cudaMemcpyDeviceToDevice, ctx.stream));
-            offset += slot_t.bytes();
-        }
-
-        // 3. Restore Tail Hidden
-        CUDA_CHECK(cudaMemcpyAsync(tail_hidden.data, d_staging_bytes + offset, tail_hidden.bytes(), cudaMemcpyDeviceToDevice, ctx.stream));
+        bool slices_ok = true;
+        const bool load_ok = cache.load_snapshot_direct_storage(
+            match->file_path, loaded_header, loaded_tokens, ctx.stream, gdn_unit_bytes,
+            [&](std::span<const DirectStorageRestoreSlice> slices) {
+                for (const auto& s : slices) {
+                    switch (s.kind) {
+                    case DirectStorageRestoreKind::TextPage:
+                        kv_pool.scatter_from_contiguous_device(
+                            std::span<const std::int32_t>(&valid_page_ids[s.index], 1), s.data, ctx.stream);
+                        break;
+                    case DirectStorageRestoreKind::Gdn:
+                        slices_ok = slices_ok && s.bytes == gdn_units[s.index].bytes();
+                        CUDA_CHECK(cudaMemcpyAsync(gdn_units[s.index].data, s.data, s.bytes, cudaMemcpyDeviceToDevice, ctx.stream));
+                        break;
+                    case DirectStorageRestoreKind::Tail:
+                        CUDA_CHECK(cudaMemcpyAsync(tail_hidden.data, s.data, std::min(s.bytes, tail_hidden.bytes()),
+                                                   cudaMemcpyDeviceToDevice, ctx.stream));
+                        break;
+                    default:
+                        slices_ok = false;
+                        break;
+                    }
+                }
+                return true;
+            });
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        expect(load_ok, "load_snapshot_direct_storage must succeed");
+        expect(slices_ok, "DirectStorage slices must match the live GDN layout and carry no MTP pages");
+        expect(loaded_header.rope_delta == 42, "RoPE delta matches");
 
         // Verify GDN parity
         std::vector<std::byte> readback_gdn;
@@ -1036,8 +1048,6 @@ void test_full_state_direct_storage_restore_live_gpu() {
         CUDA_CHECK(cudaMemcpyAsync(readback_tail.data(), tail_hidden.data, tail_hidden.bytes(), cudaMemcpyDeviceToHost, ctx.stream));
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
         expect(readback_tail == original_tail, "DirectStorage restored Tail hidden state must match original bytes");
-
-        ninfer::core::DirectStorageEngine::instance().release_staging();
     }
 
     std::filesystem::remove_all(test_dir, ec);
@@ -1079,30 +1089,44 @@ void test_direct_storage_rapid_restore_and_teardown_stress() {
     {
         DiskStateCache cache(config);
 
-        // Perform 10 rapid back-to-back restore and immediate teardown cycles
+        // Perform 10 rapid back-to-back restores; each slice is read back to host and checked
         for (int iter = 0; iter < 10; ++iter) {
             DiskStateHeader loaded_header;
             std::vector<TokenId> loaded_tokens;
-            void* d_ds_staging = nullptr;
-            std::size_t text_staging_bytes = 0;
+            std::vector<std::byte> text_readback(original_kv.size());
+            std::vector<std::byte> gdn_readback(original_gdn.size());
+            std::vector<std::byte> mtp_readback(original_mtp.size());
+            std::vector<std::byte> tail_readback(original_tail.size());
+            bool slices_ok = true;
 
-            const bool ok = cache.load_snapshot_direct_storage(manifest_path, loaded_header, loaded_tokens,
-                                                              ctx.stream, d_ds_staging, text_staging_bytes);
+            const bool ok = cache.load_snapshot_direct_storage(
+                manifest_path, loaded_header, loaded_tokens, ctx.stream, {},
+                [&](std::span<const DirectStorageRestoreSlice> slices) {
+                    for (const auto& s : slices) {
+                        std::vector<std::byte>* dst = nullptr;
+                        std::size_t dst_offset = 0;
+                        switch (s.kind) {
+                        case DirectStorageRestoreKind::TextPage: dst = &text_readback; dst_offset = s.index * page_bytes; break;
+                        case DirectStorageRestoreKind::Gdn: dst = &gdn_readback; break;
+                        case DirectStorageRestoreKind::MtpPage: dst = &mtp_readback; dst_offset = s.index * s.bytes; break;
+                        case DirectStorageRestoreKind::Tail: dst = &tail_readback; break;
+                        }
+                        if (dst_offset + s.bytes > dst->size()) {
+                            slices_ok = false;
+                            continue;
+                        }
+                        CUDA_CHECK(cudaMemcpyAsync(dst->data() + dst_offset, s.data, s.bytes,
+                                                   cudaMemcpyDeviceToHost, ctx.stream));
+                    }
+                    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+                    return true;
+                });
             expect(ok, "DirectStorage restore iteration " + std::to_string(iter) + " must succeed");
-            expect(d_ds_staging != nullptr, "Staging pointer must be valid");
-
-            // Copy back staging payload to verify byte-exact parity
-            const std::size_t total_payload_sz = text_staging_bytes + loaded_header.gdn_state_bytes + loaded_header.tail_hidden_bytes;
-            std::vector<std::byte> readback(total_payload_sz);
-            CUDA_CHECK(cudaMemcpyAsync(readback.data(), d_ds_staging, total_payload_sz, cudaMemcpyDeviceToHost, ctx.stream));
-            CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
-
-            // Immediate teardown: tests CPU D3D12 fence synchronization handshake and driver safety
-            ninfer::core::DirectStorageEngine::instance().release_staging();
-
-            // Verify payload prefix matches original Text KV bytes
-            expect(std::memcmp(readback.data(), original_kv.data(), original_kv.size()) == 0,
+            expect(slices_ok, "DirectStorage slices must fit the snapshot layout");
+            expect(text_readback == original_kv,
                    "Text KV data in iteration " + std::to_string(iter) + " must be bit-exact");
+            expect(gdn_readback == original_gdn && mtp_readback == original_mtp && tail_readback == original_tail,
+                   "Manifest payload in iteration " + std::to_string(iter) + " must be bit-exact");
         }
     }
 
@@ -1155,23 +1179,23 @@ void test_disk_state_layout_mismatch_rejected() {
         DiskStateCache cache(config);
         DiskStateHeader hdr;
         std::vector<TokenId> toks;
-        void* ptr = nullptr;
-        std::size_t bytes = 0;
-        const bool ok = cache.load_snapshot_direct_storage(manifest_path, hdr, toks, /*stream=*/nullptr, ptr, bytes,
-                                                           /*expected_text_page_bytes=*/page_bytes + 4096);
+        int consumer_calls = 0;
+        const bool ok = cache.load_snapshot_direct_storage(
+            manifest_path, hdr, toks, /*stream=*/nullptr, {},
+            [&](std::span<const DirectStorageRestoreSlice>) { ++consumer_calls; return true; },
+            /*expected_text_page_bytes=*/page_bytes + 4096);
         expect(!ok, "load_snapshot_direct_storage must reject a mismatched page geometry");
-        expect(ptr == nullptr, "Staging pointer must remain null when geometry rejection occurs");
+        expect(consumer_calls == 0, "Consumer must not run when geometry rejection occurs");
     }
 
     std::filesystem::remove_all(test_dir, ec);
 }
 
-// Criterion 2: drives allocate_staging_vram's fast-reuse branch under an in-flight,
+// Criterion 2: drives reuse of the persistent staging buffer under an in-flight,
 // unsynchronized consumer. Distinct from test_direct_storage_rapid_restore_and_teardown_stress
-// above, which syncs and tears down every iteration and is blind to this bug by construction --
+// above, which syncs inside every consumer call and is blind to this bug by construction --
 // here the consumer copy for iteration N is still in flight on ctx.stream when the restore for
-// iteration N+1 reuses the same staging allocation without a sync or a release_staging() in
-// between.
+// iteration N+1 reuses the same staging buffer without a sync in between.
 void test_direct_storage_reuse_without_teardown_race() {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
@@ -1312,38 +1336,38 @@ void test_direct_storage_reuse_without_teardown_race() {
 
             DiskStateHeader loaded_header;
             std::vector<TokenId> loaded_tokens;
-            void* d_ds_staging = nullptr;
-            std::size_t text_staging_bytes = 0;
+            const std::byte* d_ds_staging = nullptr;
 
-            const bool ok = cache.load_snapshot_direct_storage(manifest_path[iter], loaded_header, loaded_tokens,
-                                                              ctx.stream, d_ds_staging, text_staging_bytes);
+            // Consumer: copy each Text KV page into a persistent scratch buffer on ctx.stream.
+            // Deliberately no cudaStreamSynchronize here -- the next restore must reuse the
+            // same persistent staging buffer while this device-to-device copy is still in flight.
+            const bool ok = cache.load_snapshot_direct_storage(
+                manifest_path[iter], loaded_header, loaded_tokens, ctx.stream, {},
+                [&](std::span<const DirectStorageRestoreSlice> slices) {
+                    for (const auto& s : slices) {
+                        if (d_ds_staging == nullptr) { d_ds_staging = s.data; }
+                        if (s.kind != DirectStorageRestoreKind::TextPage) { continue; }
+                        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(scratch[iter]) + s.index * page_bytes,
+                                                  s.data, s.bytes, cudaMemcpyDeviceToDevice, ctx.stream));
+                    }
+                    return true;
+                });
             expect(ok, "Reuse-race restore iteration " + std::to_string(iter) + " must succeed");
             expect(d_ds_staging != nullptr, "Reuse-race staging pointer must be valid");
 
-            // Prove the fast-reuse branch is actually exercised: a changed staging pointer
-            // means allocate_staging_vram's fast-reuse branch was not taken and this fixture
-            // does not verify the race, regardless of the FAIL/PASS outcome below.
+            // Prove the staging buffer is actually reused: a changed pointer means this
+            // fixture does not verify the race, regardless of the FAIL/PASS outcome below.
             if (iter == 0) {
-                first_ds_staging = d_ds_staging;
+                first_ds_staging = const_cast<void*>(d_ds_staging);
             } else {
                 expect(d_ds_staging == first_ds_staging,
                        "Reuse-race staging pointer must stay identical across iterations "
                        "(iteration " + std::to_string(iter) + ")");
             }
-
-            // Consumer: copy the staging payload's Text KV region into a persistent scratch
-            // buffer on ctx.stream. Deliberately no cudaStreamSynchronize and no
-            // release_staging() here -- the next loop iteration's restore call below must
-            // reuse the same staging allocation (allocate_staging_vram's fast-reuse branch)
-            // while this device-to-device copy is still in flight.
-            CUDA_CHECK(cudaMemcpyAsync(scratch[iter], d_ds_staging, text_staging_bytes,
-                                      cudaMemcpyDeviceToDevice, ctx.stream));
         }
 
         // Single sync after the whole loop, once every restore + consumer copy has been issued.
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
-
-        ninfer::core::DirectStorageEngine::instance().release_staging();
     }
 
     for (int iter = 0; iter < kIterations; ++iter) {

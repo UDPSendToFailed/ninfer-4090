@@ -510,81 +510,90 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             std::vector<std::byte> loaded_tail;
 
 #if defined(_WIN32)
-            void* d_ds_staging = nullptr;
-            std::size_t text_staging_bytes = 0;
+            // DirectStorage VRAM restore, delivered in bounded staging batches.
+            // GDN units in manifest order: recurrent slot tensors, then conv slot tensors.
+            const std::int32_t ds_slot = LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
+            std::vector<Tensor> ds_gdn_units;
+            std::vector<std::uint64_t> ds_gdn_unit_bytes;
+            for (const auto& t : decoder->linear_attention.recurrent) { ds_gdn_units.push_back(t.slice(3, ds_slot, 1)); }
+            for (const auto& t : decoder->linear_attention.conv) { ds_gdn_units.push_back(t.slice(2, ds_slot, 1)); }
+            for (const auto& u : ds_gdn_units) { ds_gdn_unit_bytes.push_back(u.bytes()); }
+
+            std::span<const std::int32_t> ds_text_page_ids;
+            if (sequence.kv && sequence.kv->text.valid()) { ds_text_page_ids = sequence.kv->text.page_ids(); }
+            const bool ds_mtp = speculative_backend == SpeculativeBackend::Mtp;
+            std::span<const std::int32_t> ds_mtp_page_ids;
+            if (ds_mtp && decoder->mtp_cache() && sequence.kv && sequence.kv->backend && sequence.kv->backend->valid()) {
+                ds_mtp_page_ids = sequence.kv->backend->page_ids();
+            }
+            bool ds_tail_restored = false;
+
+            // Scatters each contiguous run of `kind` pages that has a live page id.
+            std::vector<std::int32_t> ds_run_ids;
+            const auto ds_scatter_pages = [&](std::span<const DirectStorageRestoreSlice> slices,
+                                              DirectStorageRestoreKind kind,
+                                              std::span<const std::int32_t> page_ids,
+                                              PagedKVPool& pool) {
+                const std::byte* run_start = nullptr;
+                const std::byte* run_next  = nullptr;
+                const auto flush = [&] {
+                    if (!ds_run_ids.empty()) {
+                        pool.scatter_from_contiguous_device(ds_run_ids, run_start, device.stream);
+                        ds_run_ids.clear();
+                    }
+                };
+                for (const auto& s : slices) {
+                    if (s.kind != kind) { continue; }
+                    if (s.bytes != pool.total_page_bytes()) { return false; }
+                    if (s.index >= page_ids.size() || page_ids[s.index] < 0) {
+                        flush();
+                        continue;
+                    }
+                    if (ds_run_ids.empty() || s.data != run_next) {
+                        flush();
+                        run_start = s.data;
+                    }
+                    ds_run_ids.push_back(page_ids[s.index]);
+                    run_next = s.data + s.bytes;
+                }
+                flush();
+                return true;
+            };
+
             if (disk_state_cache &&
-                disk_state_cache->load_snapshot_direct_storage(request_plan.disk_snapshot_path, header,
-                                                               loaded_tokens, device.stream, d_ds_staging,
-                                                               text_staging_bytes,
-                                                               static_cast<std::uint32_t>(decoder->text_kv.pool().total_page_bytes()))) {
-                // DirectStorage VRAM restore
-                const std::byte* d_staging_bytes = static_cast<const std::byte*>(d_ds_staging);
-
-                // 1. Restore Text KV cache pages
-                if (sequence.kv && sequence.kv->text.valid() && header.text_page_count > 0 && text_staging_bytes > 0) {
-                    auto page_ids = sequence.kv->text.page_ids();
-                    const std::uint32_t pages_to_restore =
-                        std::min<std::uint32_t>(header.text_page_count,
-                                                static_cast<std::uint32_t>(page_ids.size()));
-                    std::vector<std::int32_t> valid_page_ids;
-                    for (std::uint32_t i = 0; i < pages_to_restore; ++i) {
-                        if (page_ids[i] >= 0) { valid_page_ids.push_back(page_ids[i]); }
-                    }
-                    if (!valid_page_ids.empty()) {
-                        auto& pool = decoder->text_kv.pool();
-                        pool.scatter_from_contiguous_device(valid_page_ids, const_cast<std::byte*>(d_staging_bytes), device.stream);
-                    }
-                }
-
-                // 2. Restore GDN state from manifest payload (located immediately after text staging)
-                std::size_t offset = text_staging_bytes;
-                const std::int32_t slot = LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
-                for (const auto& t : decoder->linear_attention.recurrent) {
-                    Tensor slot_t = t.slice(3, slot, 1);
-                    if (offset + slot_t.bytes() <= text_staging_bytes + header.gdn_state_bytes) {
-                        CUDA_CHECK(cudaMemcpyAsync(slot_t.data, d_staging_bytes + offset, slot_t.bytes(),
-                                                   cudaMemcpyDeviceToDevice, device.stream));
-                        offset += slot_t.bytes();
-                    }
-                }
-                for (const auto& t : decoder->linear_attention.conv) {
-                    Tensor slot_t = t.slice(2, slot, 1);
-                    if (offset + slot_t.bytes() <= text_staging_bytes + header.gdn_state_bytes) {
-                        CUDA_CHECK(cudaMemcpyAsync(slot_t.data, d_staging_bytes + offset, slot_t.bytes(),
-                                                   cudaMemcpyDeviceToDevice, device.stream));
-                        offset += slot_t.bytes();
-                    }
-                }
-
-                // 3. Restore MTP KV cache and tail hidden
-                offset = text_staging_bytes + header.gdn_state_bytes;
-                if (speculative_backend == SpeculativeBackend::Mtp) {
-                    if (decoder->mtp_cache() && sequence.kv && sequence.kv->backend &&
-                        sequence.kv->backend->valid() && header.mtp_kv_bytes > 0) {
-                        auto mtp_page_ids = sequence.kv->backend->page_ids();
-                        const std::uint32_t mtp_pages_to_restore =
-                            std::min<std::uint32_t>(header.mtp_page_count,
-                                                    static_cast<std::uint32_t>(mtp_page_ids.size()));
-                        std::vector<std::int32_t> valid_mtp_page_ids;
-                        for (std::uint32_t i = 0; i < mtp_pages_to_restore; ++i) {
-                            if (mtp_page_ids[i] >= 0) { valid_mtp_page_ids.push_back(mtp_page_ids[i]); }
+                disk_state_cache->load_snapshot_direct_storage(
+                    request_plan.disk_snapshot_path, header, loaded_tokens, device.stream, ds_gdn_unit_bytes,
+                    [&](std::span<const DirectStorageRestoreSlice> slices) {
+                        if (!ds_scatter_pages(slices, DirectStorageRestoreKind::TextPage, ds_text_page_ids,
+                                              decoder->text_kv.pool())) {
+                            return false;
                         }
-                        if (!valid_mtp_page_ids.empty()) {
-                            auto& mtp_pool = decoder->mtp_cache()->pool();
-                            mtp_pool.scatter_from_contiguous_device(valid_mtp_page_ids, const_cast<std::byte*>(d_staging_bytes + offset), device.stream);
+                        if (!ds_mtp_page_ids.empty() &&
+                            !ds_scatter_pages(slices, DirectStorageRestoreKind::MtpPage, ds_mtp_page_ids,
+                                              decoder->mtp_cache()->pool())) {
+                            return false;
                         }
-                        offset += header.mtp_kv_bytes;
-                    }
-                    if (sequence.tail_hidden.data != nullptr && header.tail_hidden_bytes > 0) {
-                        CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, d_staging_bytes + offset,
-                                                   std::min(sequence.tail_hidden.bytes(),
-                                                            static_cast<std::size_t>(header.tail_hidden_bytes)),
-                                                   cudaMemcpyDeviceToDevice, device.stream));
-                        sequence.tail_hidden_valid = true;
-                        offset += header.tail_hidden_bytes;
-                    }
-                    sequence.mtp_kv_valid = base > 0 ? base - 1 : 0;
-                }
+                        for (const auto& s : slices) {
+                            if (s.kind == DirectStorageRestoreKind::Gdn) {
+                                if (ds_gdn_units.empty()) { continue; }
+                                if (s.index >= ds_gdn_units.size() || s.bytes != ds_gdn_units[s.index].bytes()) {
+                                    return false;
+                                }
+                                CUDA_CHECK(cudaMemcpyAsync(ds_gdn_units[s.index].data, s.data, s.bytes,
+                                                           cudaMemcpyDeviceToDevice, device.stream));
+                            } else if (s.kind == DirectStorageRestoreKind::Tail && ds_mtp &&
+                                       sequence.tail_hidden.data != nullptr) {
+                                CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, s.data,
+                                                           std::min(sequence.tail_hidden.bytes(), s.bytes),
+                                                           cudaMemcpyDeviceToDevice, device.stream));
+                                ds_tail_restored = true;
+                            }
+                        }
+                        return true;
+                    },
+                    static_cast<std::uint32_t>(decoder->text_kv.pool().total_page_bytes()))) {
+                if (ds_tail_restored) { sequence.tail_hidden_valid = true; }
+                if (ds_mtp) { sequence.mtp_kv_valid = base > 0 ? base - 1 : 0; }
 
                 sequence.text_kv_valid      = base;
                 sequence.rope_delta         = header.rope_delta;
@@ -594,8 +603,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 sequence.retained           = true;
                 set_device_i32(io.rope_delta, sequence.rope_delta);
 
+                // The staging buffer is persistent; only wait for the copies out of it.
                 CUDA_CHECK(cudaStreamSynchronize(device.stream));
-                ::ninfer::core::DirectStorageEngine::instance().release_staging();
             } else
 #endif
             if (disk_state_cache &&
@@ -1064,9 +1073,6 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
 void ProgramImplCore::abort_lane(std::uint32_t lane) noexcept {
     if (lane >= max_concurrency) { return; }
     clear_lane(sequences[lane], requests[lane]);
-#if defined(_WIN32)
-    ::ninfer::core::DirectStorageEngine::instance().release_staging();
-#endif
 }
 
 bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {

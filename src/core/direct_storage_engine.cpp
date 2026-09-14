@@ -3,12 +3,21 @@
 #include "core/direct_storage_engine.h"
 
 #include <algorithm>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <span>
 #include <stdexcept>
+#include <vector>
 
 namespace ninfer::core {
+
+namespace {
+
+// Largest single DirectStorage request; matches the queue staging buffer size below.
+constexpr std::uint64_t kMaxRequestBytes = 32ULL * 1024 * 1024;
+
+} // namespace
 
 DirectStorageEngine& DirectStorageEngine::instance() {
     static DirectStorageEngine engine;
@@ -65,6 +74,7 @@ bool DirectStorageEngine::init_d3d12_and_fence() {
     // Create D3D12 shared fence for DirectStorage to CUDA stream synchronization
     hr = d3d12_device_->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&d3d12_fence_));
     if (FAILED(hr)) { return false; }
+    fence_value_ = 0;
 
     HANDLE fence_shared_handle = nullptr;
     hr = d3d12_device_->CreateSharedHandle(d3d12_fence_.Get(), nullptr, GENERIC_ALL, nullptr, &fence_shared_handle);
@@ -101,16 +111,24 @@ bool DirectStorageEngine::init_direct_storage() {
     return true;
 }
 
-void DirectStorageEngine::recreate_queue() {
-    if (!ds_factory_ || !d3d12_device_) { return; }
-    ds_queue_.Reset();
-    DSTORAGE_QUEUE_DESC queue_desc{};
-    queue_desc.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
-    queue_desc.Capacity   = DSTORAGE_MAX_QUEUE_CAPACITY;
-    queue_desc.Priority   = DSTORAGE_PRIORITY_NORMAL;
-    queue_desc.Name       = "NInferPromptCacheQueue";
-    queue_desc.Device     = d3d12_device_.Get();
-    ds_factory_->CreateQueue(&queue_desc, IID_PPV_ARGS(&ds_queue_));
+bool DirectStorageEngine::ensure_device_alive() {
+    if (initialized_ && d3d12_device_) {
+        const HRESULT remove_reason = d3d12_device_->GetDeviceRemovedReason();
+        if (SUCCEEDED(remove_reason)) {
+            return true;
+        }
+        std::cerr << "[warn] ninfer: [directstorage] D3D12 device was removed (reason=0x"
+                  << std::hex << remove_reason << std::dec << "), re-initializing\n" << std::flush;
+    }
+    cleanup();
+    if (!init_d3d12_and_fence() || !init_direct_storage()) {
+        std::cerr << "[warn] ninfer: [directstorage] re-initialization failed, DirectStorage disabled\n"
+                  << std::flush;
+        cleanup();
+        return false;
+    }
+    initialized_ = true;
+    return true;
 }
 
 void DirectStorageEngine::sync_last_consumer() noexcept {
@@ -125,30 +143,26 @@ void DirectStorageEngine::sync_last_consumer() noexcept {
     last_consumer_stream_ = nullptr;
 }
 
-bool DirectStorageEngine::allocate_staging_vram(std::size_t required_bytes) {
-    if (staging_resource_ && current_capacity_ >= required_bytes) {
-        sync_last_consumer();
+void DirectStorageEngine::wait_fence_on_cpu() noexcept {
+    if (!d3d12_fence_ || fence_value_ == 0 || d3d12_fence_->GetCompletedValue() >= fence_value_) {
+        return;
+    }
+    HANDLE event = CreateEventEx(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
+    if (event) {
+        if (SUCCEEDED(d3d12_fence_->SetEventOnCompletion(fence_value_, event))) {
+            WaitForSingleObject(event, 5000); // 5s safety timeout
+        }
+        CloseHandle(event);
+    }
+}
+
+bool DirectStorageEngine::ensure_staging_vram() {
+    if (staging_resource_) {
         return true;
     }
 
-    release_staging();
-
-    // Check if D3D12 device was removed by driver and re-initialize if needed
-    if (d3d12_device_) {
-        const HRESULT remove_reason = d3d12_device_->GetDeviceRemovedReason();
-        if (FAILED(remove_reason)) {
-            std::cerr << "[warn] ninfer: [directstorage] D3D12 device was removed (reason=0x"
-                      << std::hex << remove_reason << std::dec << "), re-initializing...\n";
-            cleanup();
-            if (!init_d3d12_and_fence() || !init_direct_storage()) {
-                cleanup();
-                return false;
-            }
-        }
-    }
-
     // Round up to 64KB placement alignment
-    const std::size_t aligned_bytes = (required_bytes + 65535ULL) & ~65535ULL;
+    const std::size_t aligned_bytes = (kStagingCapacityBytes + 65535ULL) & ~65535ULL;
 
     D3D12_HEAP_PROPERTIES heap_props{};
     heap_props.Type                 = D3D12_HEAP_TYPE_DEFAULT;
@@ -177,7 +191,7 @@ bool DirectStorageEngine::allocate_staging_vram(std::size_t required_bytes) {
         IID_PPV_ARGS(&staging_resource_)
     );
     if (FAILED(hr) || !staging_resource_) {
-        std::cerr << "[error] ninfer: [directstorage] failed to allocate dynamic D3D12 staging buffer ("
+        std::cerr << "[error] ninfer: [directstorage] failed to allocate D3D12 staging buffer ("
                   << (aligned_bytes / (1024 * 1024)) << " MB, HRESULT=0x" << std::hex << hr << std::dec << ")\n";
         return false;
     }
@@ -216,226 +230,149 @@ bool DirectStorageEngine::allocate_staging_vram(std::size_t required_bytes) {
     return true;
 }
 
+// Only for teardown (process exit, device removal, failed allocation). Never call it
+// between restores: see kStagingCapacityBytes.
 void DirectStorageEngine::release_staging() noexcept {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
 
     sync_last_consumer();
+    wait_fence_on_cpu();
 
-    // 1. Ensure D3D12 / DirectStorage queue has 100% finished retiring all DMA requests
-    if (d3d12_fence_ && fence_value_ > 0) {
-        if (d3d12_fence_->GetCompletedValue() < fence_value_) {
-            HANDLE event = CreateEventEx(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
-            if (event) {
-                if (SUCCEEDED(d3d12_fence_->SetEventOnCompletion(fence_value_, event))) {
-                    WaitForSingleObject(event, 5000); // 5s safety timeout
-                }
-                CloseHandle(event);
-            }
-        }
-    }
-
-    // 2. Safely tear down CUDA external memory mappings
     if (cuda_ext_mem_) {
         cudaDestroyExternalMemory(cuda_ext_mem_);
         cuda_ext_mem_ = nullptr;
     }
     d_staging_ptr_ = nullptr;
 
-    // 3. Safely reset D3D12 COM resources
     staging_resource_.Reset();
-    pool_file_.Reset();
-    manifest_file_.Reset();
     current_capacity_ = 0;
 }
 
-bool DirectStorageEngine::restore_snapshot_payload(const std::filesystem::path& path,
-                                                  std::uint64_t file_offset_4k_aligned,
-                                                  std::uint64_t payload_bytes,
-                                                  cudaStream_t stream,
-                                                  void*& out_d_staging_ptr) {
+bool DirectStorageEngine::restore_segments(const std::filesystem::path& pool_path,
+                                          const std::filesystem::path& manifest_path,
+                                          std::span<const DirectStorageSegment> segments,
+                                          cudaStream_t stream,
+                                          const DirectStorageBatchConsumer& consumer) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    if (!initialized_ || payload_bytes == 0) {
+    if (!initialized_ || segments.empty()) {
         return false;
     }
 
-    // Dynamically allocate the exact staging capacity in VRAM with zero permanent reservation
-    if (!allocate_staging_vram(payload_bytes)) {
+    // The previous restore's consumer may still be reading the staging buffer.
+    sync_last_consumer();
+
+    if (!ensure_device_alive() || !ensure_staging_vram()) {
         return false;
     }
 
-    manifest_file_.Reset();
-    HRESULT hr = ds_factory_->OpenFile(path.wstring().c_str(), IID_PPV_ARGS(&manifest_file_));
-    if (FAILED(hr) || !manifest_file_) {
-        release_staging();
-        return false;
-    }
-
-    constexpr UINT32 kChunkSize = 32 * 1024 * 1024; // 32 MiB staging chunk
-    UINT64 bytes_remaining = payload_bytes;
-    UINT64 curr_file_offset = file_offset_4k_aligned;
-    UINT64 curr_dst_offset = 0;
-
-    while (bytes_remaining > 0) {
-        const UINT32 chunk = static_cast<UINT32>(std::min<UINT64>(bytes_remaining, kChunkSize));
-
-        DSTORAGE_REQUEST request{};
-        request.Options.SourceType        = DSTORAGE_REQUEST_SOURCE_FILE;
-        request.Options.DestinationType   = DSTORAGE_REQUEST_DESTINATION_BUFFER;
-        request.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
-
-        request.Source.File.Source        = manifest_file_.Get();
-        request.Source.File.Offset        = curr_file_offset;
-        request.Source.File.Size          = chunk;
-        request.UncompressedSize          = chunk;
-
-        request.Destination.Buffer.Resource = staging_resource_.Get();
-        request.Destination.Buffer.Offset   = curr_dst_offset;
-        request.Destination.Buffer.Size     = chunk;
-
-        ds_queue_->EnqueueRequest(&request);
-
-        curr_file_offset += chunk;
-        curr_dst_offset  += chunk;
-        bytes_remaining  -= chunk;
-    }
-
-    const std::uint64_t signal_val = ++fence_value_;
-    ds_queue_->EnqueueSignal(d3d12_fence_.Get(), signal_val);
-    ds_queue_->Submit();
-
-    // Enqueue non-blocking hardware fence wait directly onto caller's CUDA stream
-    cudaExternalSemaphoreWaitParams wait_params{};
-    wait_params.flags              = 0;
-    wait_params.params.fence.value = signal_val;
-    cudaError_t cuda_err = cudaWaitExternalSemaphoresAsync(&cuda_fence_sem_, &wait_params, 1, stream);
-    if (cuda_err != cudaSuccess) {
-        release_staging();
-        return false;
-    }
-
-    last_consumer_stream_ = stream;
-    out_d_staging_ptr = d_staging_ptr_;
-    return true;
-}
-
-bool DirectStorageEngine::restore_snapshot_cow(const std::filesystem::path& pool_path,
-                                              std::span<const PageRestoreEntry> text_pages,
-                                              const std::filesystem::path& manifest_path,
-                                              std::uint64_t manifest_payload_offset,
-                                              std::uint64_t manifest_payload_bytes,
-                                              cudaStream_t stream,
-                                              void*& out_d_staging_ptr,
-                                              std::size_t& out_text_bytes) {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-    if (!initialized_) {
-        return false;
-    }
-
-    std::size_t total_text_bytes = 0;
-    for (const auto& p : text_pages) {
-        total_text_bytes += p.page_bytes;
-    }
-
-    const std::size_t total_staging_bytes = total_text_bytes + static_cast<std::size_t>(manifest_payload_bytes);
-    if (total_staging_bytes == 0) {
-        return false;
-    }
-
-    if (!allocate_staging_vram(total_staging_bytes)) {
-        return false;
-    }
-
-    // 1. Enqueue Text KV pages from shared pool_data.ninfer_pages
-    if (!text_pages.empty()) {
-        pool_file_.Reset();
-        HRESULT hr = ds_factory_->OpenFile(pool_path.wstring().c_str(), IID_PPV_ARGS(&pool_file_));
-        if (FAILED(hr) || !pool_file_) {
-            release_staging();
+    bool need_pool = false;
+    bool need_manifest = false;
+    for (const auto& seg : segments) {
+        if (seg.bytes == 0 || seg.bytes > current_capacity_) {
             return false;
         }
-
-        std::uint64_t curr_dst_offset = 0;
-        for (const auto& p : text_pages) {
-            DSTORAGE_REQUEST request{};
-            request.Options.SourceType        = DSTORAGE_REQUEST_SOURCE_FILE;
-            request.Options.DestinationType   = DSTORAGE_REQUEST_DESTINATION_BUFFER;
-            request.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
-
-            request.Source.File.Source        = pool_file_.Get();
-            request.Source.File.Offset        = p.file_offset;
-            request.Source.File.Size          = p.page_bytes;
-            request.UncompressedSize          = p.page_bytes;
-
-            request.Destination.Buffer.Resource = staging_resource_.Get();
-            request.Destination.Buffer.Offset   = curr_dst_offset;
-            request.Destination.Buffer.Size     = p.page_bytes;
-
-            ds_queue_->EnqueueRequest(&request);
-            curr_dst_offset += p.page_bytes;
-        }
+        (seg.source == DirectStorageSource::Pool ? need_pool : need_manifest) = true;
     }
 
-    // 2. Enqueue Manifest Payload (GDN state, MTP KV, tail hidden) from .ninfer_manifest
-    if (manifest_payload_bytes > 0) {
-        manifest_file_.Reset();
-        HRESULT hr = ds_factory_->OpenFile(manifest_path.wstring().c_str(), IID_PPV_ARGS(&manifest_file_));
-        if (FAILED(hr) || !manifest_file_) {
-            release_staging();
-            return false;
-        }
-
-        constexpr UINT32 kChunkSize = 32 * 1024 * 1024; // 32 MiB chunk
-        UINT64 bytes_remaining = manifest_payload_bytes;
-        UINT64 curr_file_offset = manifest_payload_offset;
-        UINT64 curr_dst_offset = total_text_bytes;
-
-        while (bytes_remaining > 0) {
-            const UINT32 chunk = static_cast<UINT32>(std::min<UINT64>(bytes_remaining, kChunkSize));
-
-            DSTORAGE_REQUEST request{};
-            request.Options.SourceType        = DSTORAGE_REQUEST_SOURCE_FILE;
-            request.Options.DestinationType   = DSTORAGE_REQUEST_DESTINATION_BUFFER;
-            request.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
-
-            request.Source.File.Source        = manifest_file_.Get();
-            request.Source.File.Offset        = curr_file_offset;
-            request.Source.File.Size          = chunk;
-            request.UncompressedSize          = chunk;
-
-            request.Destination.Buffer.Resource = staging_resource_.Get();
-            request.Destination.Buffer.Offset   = curr_dst_offset;
-            request.Destination.Buffer.Size     = chunk;
-
-            ds_queue_->EnqueueRequest(&request);
-
-            curr_file_offset += chunk;
-            curr_dst_offset  += chunk;
-            bytes_remaining  -= chunk;
-        }
+    ComPtr<IDStorageFile> pool_file;
+    ComPtr<IDStorageFile> manifest_file;
+    if (need_pool) {
+        HRESULT hr = ds_factory_->OpenFile(pool_path.wstring().c_str(), IID_PPV_ARGS(&pool_file));
+        if (FAILED(hr) || !pool_file) { return false; }
+    }
+    if (need_manifest) {
+        HRESULT hr = ds_factory_->OpenFile(manifest_path.wstring().c_str(), IID_PPV_ARGS(&manifest_file));
+        if (FAILED(hr) || !manifest_file) { return false; }
     }
 
-    const std::uint64_t signal_val = ++fence_value_;
-    ds_queue_->EnqueueSignal(d3d12_fence_.Get(), signal_val);
-    ds_queue_->Submit();
+    // Drop failures recorded before this restore; the count resets on each retrieval.
+    DSTORAGE_ERROR_RECORD stale_record{};
+    ds_queue_->RetrieveErrorRecord(&stale_record);
 
-    // Enqueue non-blocking hardware fence wait directly onto caller's CUDA stream
-    cudaExternalSemaphoreWaitParams wait_params{};
-    wait_params.flags              = 0;
-    wait_params.params.fence.value = signal_val;
-    cudaError_t cuda_err = cudaWaitExternalSemaphoresAsync(&cuda_fence_sem_, &wait_params, 1, stream);
-    if (cuda_err != cudaSuccess) {
-        release_staging();
-        return false;
+    const std::byte* staging = static_cast<const std::byte*>(d_staging_ptr_);
+    std::vector<std::size_t> offsets;
+    offsets.reserve(std::min<std::size_t>(segments.size(), 4096));
+
+    bool ok = true;
+    std::size_t first = 0;
+    while (first < segments.size()) {
+        // Pack consecutive whole segments into one staging batch.
+        offsets.clear();
+        std::size_t batch_bytes = 0;
+        std::size_t end = first;
+        while (end < segments.size() && batch_bytes + segments[end].bytes <= current_capacity_) {
+            offsets.push_back(batch_bytes);
+            batch_bytes += static_cast<std::size_t>(segments[end].bytes);
+            ++end;
+        }
+
+        // Earlier batch consumers must be done before this batch overwrites staging.
+        sync_last_consumer();
+
+        for (std::size_t i = first; i < end; ++i) {
+            const auto& seg = segments[i];
+            IDStorageFile* file = seg.source == DirectStorageSource::Pool ? pool_file.Get() : manifest_file.Get();
+            std::uint64_t done = 0;
+            while (done < seg.bytes) {
+                const UINT32 chunk = static_cast<UINT32>(std::min<std::uint64_t>(seg.bytes - done, kMaxRequestBytes));
+
+                DSTORAGE_REQUEST request{};
+                request.Options.SourceType        = DSTORAGE_REQUEST_SOURCE_FILE;
+                request.Options.DestinationType   = DSTORAGE_REQUEST_DESTINATION_BUFFER;
+                request.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
+
+                request.Source.File.Source = file;
+                request.Source.File.Offset = seg.file_offset + done;
+                request.Source.File.Size   = chunk;
+                request.UncompressedSize   = chunk;
+
+                request.Destination.Buffer.Resource = staging_resource_.Get();
+                request.Destination.Buffer.Offset   = offsets[i - first] + done;
+                request.Destination.Buffer.Size     = chunk;
+
+                ds_queue_->EnqueueRequest(&request);
+                done += chunk;
+            }
+        }
+
+        const std::uint64_t signal_val = ++fence_value_;
+        ds_queue_->EnqueueSignal(d3d12_fence_.Get(), signal_val);
+        ds_queue_->Submit();
+
+        // Non-blocking fence wait queued on the consumer's CUDA stream
+        cudaExternalSemaphoreWaitParams wait_params{};
+        wait_params.flags              = 0;
+        wait_params.params.fence.value = signal_val;
+        if (cudaWaitExternalSemaphoresAsync(&cuda_fence_sem_, &wait_params, 1, stream) != cudaSuccess) {
+            ok = false;
+            break;
+        }
+
+        last_consumer_stream_ = stream;
+        if (!consumer(staging, first, std::span<const std::size_t>(offsets.data(), offsets.size()))) {
+            ok = false;
+            break;
+        }
+        first = end;
     }
 
-    last_consumer_stream_ = stream;
-    out_d_staging_ptr = d_staging_ptr_;
-    out_text_bytes    = total_text_bytes;
-    return true;
+    // The files must outlive every request that references them.
+    wait_fence_on_cpu();
+
+    DSTORAGE_ERROR_RECORD record{};
+    ds_queue_->RetrieveErrorRecord(&record);
+    if (record.FailureCount > 0) {
+        std::cerr << "[warn] ninfer: [directstorage] " << record.FailureCount
+                  << " read request(s) failed (HRESULT=0x" << std::hex << record.FirstFailure.HResult
+                  << std::dec << ")\n" << std::flush;
+        ok = false;
+    }
+    return ok;
 }
 
 void DirectStorageEngine::cleanup() {
     release_staging();
+    last_consumer_stream_ = nullptr;
     if (cuda_fence_sem_) {
         cudaDestroyExternalSemaphore(cuda_fence_sem_);
         cuda_fence_sem_ = nullptr;
@@ -447,6 +384,7 @@ void DirectStorageEngine::cleanup() {
     ds_queue_.Reset();
     ds_factory_.Reset();
     d3d12_fence_.Reset();
+    fence_value_ = 0;
     d3d12_device_.Reset();
     dxgi_factory_.Reset();
     initialized_ = false;

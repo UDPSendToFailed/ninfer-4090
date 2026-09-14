@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -64,6 +65,23 @@ struct DiskStateMatch {
 // unchecked (always accepted).
 [[nodiscard]] bool disk_state_layout_matches(const DiskStateHeader& h,
                                              std::uint32_t live_text_page_bytes) noexcept;
+
+enum class DirectStorageRestoreKind : std::uint8_t {
+    TextPage,
+    Gdn,
+    MtpPage,
+    Tail,
+};
+
+// A device-side view of one restored unit inside the DirectStorage staging buffer.
+struct DirectStorageRestoreSlice {
+    DirectStorageRestoreKind kind  = DirectStorageRestoreKind::TextPage;
+    std::uint32_t            index = 0; // page or unit index within its kind
+    const std::byte*         data  = nullptr;
+    std::size_t              bytes = 0;
+};
+
+using DirectStorageRestoreConsumer = std::function<bool(std::span<const DirectStorageRestoreSlice>)>;
 
 inline std::string current_utc_timestamp_compact() {
     auto now = std::chrono::system_clock::now();
@@ -133,12 +151,19 @@ public:
 
 #if defined(_WIN32)
     // DirectStorage kernel-bypass DMA restore directly into VRAM staging buffer
+    // Restores a snapshot through DirectStorage in bounded staging batches. Each batch
+    // is handed to `consumer` as device-side slices that stay valid only until the
+    // consumer's work on `stream` completes. The manifest payload is sliced as
+    // [GDN units][MTP pages][tail]; `gdn_unit_bytes` gives the GDN unit sizes in file
+    // order (empty means one unit) and must sum to header.gdn_state_bytes.
+    // `out_header` and `out_tokens` are filled before the first consumer call.
+    // On false, part of the destination may already be written.
     [[nodiscard]] bool load_snapshot_direct_storage(const std::filesystem::path& path,
                                                     DiskStateHeader& out_header,
                                                     std::vector<TokenId>& out_tokens,
                                                     cudaStream_t stream,
-                                                    void*& out_d_staging_ptr,
-                                                    std::size_t& out_text_bytes,
+                                                    std::span<const std::uint64_t> gdn_unit_bytes,
+                                                    const DirectStorageRestoreConsumer& consumer,
                                                     std::uint32_t expected_text_page_bytes = 0);
 #endif
 
