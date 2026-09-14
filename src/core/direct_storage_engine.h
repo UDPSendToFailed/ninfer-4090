@@ -66,8 +66,9 @@ public:
     // post-completion GPU work on the resource and ends in a GPU context reset
     // (nvlddmkm 153, DXGI_ERROR_DEVICE_HUNG) followed by an access violation on the
     // worker thread. A fixed capacity bounds VRAM and commit charge regardless of
-    // snapshot size.
-    static constexpr std::size_t kStagingCapacityBytes = 256ULL * 1024 * 1024;
+    // snapshot size. The capacity comes out of KV capacity auto's budget, so it is kept
+    // small: the largest segment the server hands over is one GDN layer or one KV page.
+    static constexpr std::size_t kStagingCapacityBytes = 64ULL * 1024 * 1024;
 
     static DirectStorageEngine& instance();
 
