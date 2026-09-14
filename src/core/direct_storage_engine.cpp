@@ -138,16 +138,25 @@ bool DirectStorageEngine::ensure_device_alive() {
     return true;
 }
 
-void DirectStorageEngine::sync_last_consumer() noexcept {
-    if (last_consumer_stream_ == nullptr) {
+// Call while `stream` is known to be alive: right after the consumer enqueued its work.
+void DirectStorageEngine::record_consumer(cudaStream_t stream) noexcept {
+    if (!consumer_event_ &&
+        cudaEventCreateWithFlags(&consumer_event_, cudaEventDisableTiming) != cudaSuccess) {
+        consumer_event_ = nullptr;
+        cudaStreamSynchronize(stream);
+        consumer_pending_ = false;
         return;
     }
-    if (!consumer_event_) {
-        cudaEventCreateWithFlags(&consumer_event_, cudaEventDisableTiming);
+    cudaEventRecord(consumer_event_, stream);
+    consumer_pending_ = true;
+}
+
+void DirectStorageEngine::sync_last_consumer() noexcept {
+    if (!consumer_pending_) {
+        return;
     }
-    cudaEventRecord(consumer_event_, last_consumer_stream_);
     cudaEventSynchronize(consumer_event_);
-    last_consumer_stream_ = nullptr;
+    consumer_pending_ = false;
 }
 
 // Blocks until DirectStorage has retired every request up to fence_value_. There is no
@@ -384,15 +393,16 @@ bool DirectStorageEngine::restore_segments(const std::filesystem::path& pool_pat
             break;
         }
 
-        last_consumer_stream_ = stream;
         bool consumed = false;
         try {
             consumed = consumer(staging, first, std::span<const std::size_t>(offsets.data(), offsets.size()));
         } catch (...) {
+            record_consumer(stream);
             // The files are about to be released by unwinding.
             wait_fence_on_cpu();
             throw;
         }
+        record_consumer(stream);
         if (!consumed) {
             ok = false;
             break;
@@ -427,7 +437,7 @@ void DirectStorageEngine::cleanup() {
         ds_queue_.Reset();
     }
     release_staging();
-    last_consumer_stream_ = nullptr;
+    consumer_pending_ = false;
     if (cuda_fence_sem_) {
         cudaDestroyExternalSemaphore(cuda_fence_sem_);
         cuda_fence_sem_ = nullptr;

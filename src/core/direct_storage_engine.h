@@ -91,6 +91,7 @@ private:
     bool ensure_staging_vram();
     void release_staging() noexcept;
     void cleanup();
+    void record_consumer(cudaStream_t stream) noexcept;
     void sync_last_consumer() noexcept;
     bool wait_fence_on_cpu() noexcept;
 
@@ -113,8 +114,10 @@ private:
     cudaExternalMemory_t cuda_ext_mem_ = nullptr;
     cudaExternalSemaphore_t cuda_fence_sem_ = nullptr;
     void* d_staging_ptr_ = nullptr;
-    cudaStream_t last_consumer_stream_ = nullptr;
+    // Marks the end of the last consumer's work. The caller's stream may be destroyed once
+    // restore_segments returns, so only this event (owned by the context) outlives the call.
     cudaEvent_t consumer_event_ = nullptr;
+    bool consumer_pending_ = false;
 };
 
 } // namespace ninfer::core
