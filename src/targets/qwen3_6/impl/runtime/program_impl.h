@@ -488,6 +488,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             sequence.kv.reset();
             ordered_reset(sequence);
             sequence.ledger.clear();
+            sequence.last_disk_snapshot_tokens = 0;
             sequence.text_kv_valid = 0;
             sequence.mtp_kv_valid  = 0;
             reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
@@ -496,6 +497,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             sequence.kv.reset();
             ordered_reset(sequence);
             sequence.ledger.clear();
+            // The ledger is replaced, so the growth throttle of snapshot_lane_to_disk starts over.
+            sequence.last_disk_snapshot_tokens = 0;
             sequence.text_kv_valid = 0;
             sequence.mtp_kv_valid  = 0;
             reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
@@ -764,7 +767,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
                                     request_plan.backend_kv_page_entitlement);
                 qwen3_6::detail::degrade_disk_restore_to_full_reset(
-                    request_plan, speculative_backend == SpeculativeBackend::Mtp);
+                    request_plan, speculative_backend == SpeculativeBackend::Mtp,
+                    prompt.identity.turn_rewrite_boundary);
                 base = 0;
                 // The executor admitted the request with the work of the short suffix; prefill
                 // from 0 takes more steps and would exhaust that projection mid-request.

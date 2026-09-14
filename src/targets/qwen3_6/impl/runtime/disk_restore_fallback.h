@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <span>
 
 namespace ninfer::targets::qwen3_6::detail {
@@ -9,16 +10,26 @@ namespace ninfer::targets::qwen3_6::detail {
 // A planned disk restore whose snapshot cannot be loaded (missing or corrupt journal page,
 // checksum or layout mismatch, DirectStorage unavailable) must not prefill from the matched
 // base over unrestored KV and GDN state. The request is rewritten into the FullReset shape the
-// planner would have produced without a disk match. Turn checkpoint action stays Drop, which the
-// planner always assigns to disk restores and which is valid for FullReset.
+// planner would have produced without a disk match. That includes capturing the turn checkpoint
+// at the rewrite boundary: the planner assigns Drop to disk restores, and keeping it would leave
+// the fallback without the checkpoint whose disk snapshot replaces the bad one.
 template <class Plan>
-void degrade_disk_restore_to_full_reset(Plan& plan, bool mtp_backend) {
+void degrade_disk_restore_to_full_reset(Plan& plan, bool mtp_backend,
+                                        std::optional<std::uint32_t> turn_rewrite_boundary) {
     using Reuse  = decltype(plan.reuse);
     using Bridge = decltype(plan.mtp_bridge);
+    using Action = decltype(plan.turn_checkpoint_action);
     plan.reuse      = Reuse::FullReset;
     plan.reuse_base = 0;
     plan.disk_snapshot_path.clear();
     plan.summary.reusable_prompt_tokens = 0;
+    if (turn_rewrite_boundary && *turn_rewrite_boundary > 0) {
+        plan.turn_checkpoint_action           = Action::CaptureNew;
+        plan.turn_checkpoint_capture_frontier = turn_rewrite_boundary;
+    } else {
+        plan.turn_checkpoint_action = Action::Drop;
+        plan.turn_checkpoint_capture_frontier.reset();
+    }
     if (mtp_backend) {
         plan.prepare_mtp = true;
         plan.mtp_bridge  = Bridge::None;

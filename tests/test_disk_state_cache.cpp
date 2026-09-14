@@ -1463,6 +1463,7 @@ void test_failed_disk_restore_degrades_to_full_reset() {
     enum class Reuse { FullReset, AppendAtFrontier, RestoreTurnCheckpoint, RestoreDiskCheckpoint };
     enum class Bridge { None, BeforeSuffix, AfterExactHit };
     struct Summary { std::uint32_t reusable_prompt_tokens = 0; };
+    enum class Action { KeepExisting, Drop, CaptureNew };
     struct Plan {
         Summary summary;
         Reuse reuse          = Reuse::FullReset;
@@ -1470,6 +1471,8 @@ void test_failed_disk_restore_degrades_to_full_reset() {
         Bridge mtp_bridge    = Bridge::None;
         bool prepare_mtp     = false;
         std::filesystem::path disk_snapshot_path;
+        Action turn_checkpoint_action = Action::Drop;
+        std::optional<std::uint32_t> turn_checkpoint_capture_frontier;
     };
     const Plan disk_plan{.summary            = {.reusable_prompt_tokens = 192},
                          .reuse              = Reuse::RestoreDiskCheckpoint,
@@ -1479,19 +1482,24 @@ void test_failed_disk_restore_degrades_to_full_reset() {
                          .disk_snapshot_path = "gone.ninf"};
 
     Plan mtp = disk_plan;
-    targets::qwen3_6::detail::degrade_disk_restore_to_full_reset(mtp, true);
+    targets::qwen3_6::detail::degrade_disk_restore_to_full_reset(mtp, true, 120U);
     expect(mtp.reuse == Reuse::FullReset && mtp.reuse_base == 0 &&
                mtp.summary.reusable_prompt_tokens == 0 && mtp.disk_snapshot_path.empty(),
            "Failed restore must report FullReset from base 0");
     expect(mtp.prepare_mtp && mtp.mtp_bridge == Bridge::None,
            "MTP FullReset prefills the draft cache without a suffix bridge");
+    expect(mtp.turn_checkpoint_action == Action::CaptureNew && mtp.turn_checkpoint_capture_frontier == 120U,
+           "Fallback must capture the turn checkpoint a cold FullReset would capture");
 
     Plan plain = disk_plan;
     plain.prepare_mtp = false;
     plain.mtp_bridge  = Bridge::None;
-    targets::qwen3_6::detail::degrade_disk_restore_to_full_reset(plain, false);
+    plain.turn_checkpoint_capture_frontier = 64U;
+    targets::qwen3_6::detail::degrade_disk_restore_to_full_reset(plain, false, std::nullopt);
     expect(plain.reuse == Reuse::FullReset && !plain.prepare_mtp && plain.mtp_bridge == Bridge::None,
            "Non-MTP fallback must leave MTP fields untouched");
+    expect(plain.turn_checkpoint_action == Action::Drop && !plain.turn_checkpoint_capture_frontier,
+           "Fallback without a rewrite boundary must not capture a turn checkpoint");
 
     const std::vector<std::uint8_t> text_only(256, 0);
     std::vector<std::uint8_t> media_prefix(256, 0);
