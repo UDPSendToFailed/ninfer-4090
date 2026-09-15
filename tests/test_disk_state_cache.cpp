@@ -666,6 +666,81 @@ void test_leased_pages_survive_compaction() {
     std::filesystem::remove_all(test_dir, ec);
 }
 
+// A process stopped during a compaction's swap leaves temporaries next to the pool. Opening the
+// cache must finish a swap that already replaced the pool, and otherwise keep the old pair.
+void test_interrupted_compaction_swap_recovers() {
+    const std::filesystem::path test_dir = "./.test_ninfer_cache_interrupted_swap";
+    std::error_code ec;
+    std::filesystem::remove_all(test_dir, ec);
+
+    DiskStateCacheConfig config;
+    config.cache_dir       = test_dir;
+    config.max_cache_bytes = 100ULL << 20;
+    config.enabled         = true;
+
+    const std::uint64_t model_hash = 0xFEEDFACE12345678ULL;
+    const auto tokens = generate_tokens(128, 7);
+    const auto kv     = generate_deterministic_bytes(2 * 8192, 301);
+    const auto gdn    = generate_deterministic_bytes(4096, 302);
+    const auto mtp    = generate_deterministic_bytes(2048, 303);
+    const auto tail   = generate_deterministic_bytes(1024, 304);
+
+    std::filesystem::path manifest_path;
+    {
+        DiskStateCache cache(config);
+        cache.enqueue_save(model_hash, tokens, 1, 0, gdn, kv, 2, mtp, 1, tail);
+        const auto match = wait_for_match(cache, model_hash, tokens);
+        expect(match.has_value(), "Snapshot must be indexed before the swap scenarios");
+        if (!match) { return; }
+        manifest_path = match->file_path;
+    }
+
+    const auto pool       = test_dir / "pool_data.ninfer_pages";
+    const auto index      = test_dir / "pool_index.ninfer_idx";
+    const auto temp_pool  = test_dir / "pool_data.ninfer_pages.tmp";
+    const auto temp_index = test_dir / "pool_index.ninfer_idx.tmp";
+    const auto read_file = [](const std::filesystem::path& path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::vector<char>((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    const auto write_file = [](const std::filesystem::path& path, const std::vector<char>& bytes) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    };
+    const auto pool_bytes  = read_file(pool);
+    const auto index_bytes = read_file(index);
+    const std::vector<char> garbage(4096, '\x5A');
+
+    const auto check = [&](const std::string& scenario) {
+        DiskStateCache cache(config);
+        DiskStateHeader out_h;
+        std::vector<TokenId> out_toks;
+        std::vector<std::byte> out_gdn, out_kv, out_mtp, out_tail;
+        const bool ok = cache.load_snapshot(manifest_path, out_h, out_toks, out_gdn, out_kv, out_mtp, out_tail);
+        expect(ok && out_kv == kv, scenario + ": snapshot must load bit-exact after reopening");
+        expect(!std::filesystem::exists(temp_pool) && !std::filesystem::exists(temp_index),
+               scenario + ": reopening must remove the compaction temporaries");
+    };
+
+    // Stopped while copying: the temporaries are partial and the old pair is intact.
+    write_file(temp_pool, garbage);
+    write_file(temp_index, garbage);
+    check("copy never reached the swap");
+
+    // Stopped between the renames: the pool is already the new one, its index is still a temporary.
+    write_file(index, garbage);
+    write_file(temp_index, index_bytes);
+    check("stopped between the pool and index renames");
+
+    // A build that removed the pool before renaming stopped in between.
+    std::filesystem::remove(pool, ec);
+    write_file(temp_pool, pool_bytes);
+    write_file(temp_index, index_bytes);
+    check("pool removed before its rename");
+
+    std::filesystem::remove_all(test_dir, ec);
+}
+
 void test_compaction_fragmentation_thresholds() {
     const std::filesystem::path test_dir = "./.test_ninfer_cache_frag_thresholds";
     std::error_code ec;
@@ -2050,6 +2125,7 @@ int main() {
     test_cancel_in_flight();
     test_mark_and_sweep_pool_compaction();
     test_compaction_fragmentation_thresholds();
+    test_interrupted_compaction_swap_recovers();
     test_bulk_lru_watermark_eviction();
     test_lru_eviction_counts_shared_pool_pages();
     test_concurrent_compaction_and_non_blocking_lookup();

@@ -537,10 +537,27 @@ public:
                 return abandon();
             }
 
-            std::filesystem::remove(pool_data_path_, ec);
+            // rename replaces the destination in one step, so the old pool stays whole until the
+            // new one takes its name. Removing first lost the pool when the process stopped
+            // between the two calls, and removing a pool a restore still had open left its name
+            // pending deletion, so the rename failed and the new index described a missing file.
             std::filesystem::rename(temp_data_path, pool_data_path_, ec);
-            std::filesystem::remove(pool_index_path_, ec);
+            if (ec) {
+                return abandon();
+            }
+            // The pool is swapped, so the new index must take effect even if its rename fails;
+            // a leftover index temporary alone is promoted by load_index on the next start.
             std::filesystem::rename(temp_index_path, pool_index_path_, ec);
+            if (ec) {
+                std::ofstream index_file(pool_index_path_, std::ios::binary | std::ios::trunc);
+                for (const auto& [hash, rec] : new_page_index) {
+                    index_file.write(reinterpret_cast<const char*>(&rec), sizeof(rec));
+                }
+                index_file.flush();
+                if (index_file.good()) {
+                    std::filesystem::remove(temp_index_path, ec);
+                }
+            }
 
             page_index_ = std::move(new_page_index);
             known_pool_bytes_ = new_file_size;
@@ -568,6 +585,7 @@ private:
     void load_index() {
         std::lock_guard<std::mutex> lock(mutex_);
         page_index_.clear();
+        recover_interrupted_swap_locked();
         {
             std::ifstream index_file(pool_index_path_, std::ios::binary);
             if (!index_file.is_open()) {
@@ -593,6 +611,38 @@ private:
                       << " pool page record(s) past the end of " << pool_data_path_.filename().string() << "\n"
                       << std::flush;
         }
+    }
+
+    // A compaction closes both temporaries, renames the pool, then renames the index. Only the
+    // index temporary left means it stopped between the renames and that index belongs to the
+    // pool on disk. No pool but both temporaries means a build that removed the pool before
+    // renaming stopped in between; its temporaries were complete. Anything else left over is a
+    // copy that never reached the swap, and the old pair is intact.
+    void recover_interrupted_swap_locked() {
+        const std::filesystem::path temp_data_path  = pool_data_path_.string() + ".tmp";
+        const std::filesystem::path temp_index_path = pool_index_path_.string() + ".tmp";
+        std::error_code ec;
+        const bool pool       = std::filesystem::exists(pool_data_path_, ec);
+        const bool temp_data  = std::filesystem::exists(temp_data_path, ec);
+        const bool temp_index = std::filesystem::exists(temp_index_path, ec);
+        if (!temp_data && !temp_index) {
+            return;
+        }
+        bool promoted = false;
+        if (temp_index && (!temp_data || !pool)) {
+            if (temp_data) {
+                std::filesystem::rename(temp_data_path, pool_data_path_, ec);
+            }
+            if (!ec) {
+                std::filesystem::rename(temp_index_path, pool_index_path_, ec);
+                promoted = !ec;
+            }
+        }
+        std::filesystem::remove(temp_data_path, ec);
+        std::filesystem::remove(temp_index_path, ec);
+        std::cout << "[info] ninfer: [prompt-cache] "
+                  << (promoted ? "finished" : "discarded") << " an interrupted page pool compaction\n"
+                  << std::flush;
     }
 
     // Later appends reuse the offsets past the end of a shortened pool, so these records are
