@@ -2,6 +2,9 @@
 #if defined(_WIN32)
 #include "core/direct_storage_engine.h"
 #endif
+#if defined(NINFER_DISK_STATE_CACHE_TEST_SEAMS)
+#include "core/disk_state_cache_test_seams.h"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -110,6 +113,33 @@ void read_manifest_page_hashes(const std::filesystem::path& path,
 constexpr std::uint32_t kPageRecordTombstone = 0x42544F4DU; // "MOTB"
 
 } // namespace
+
+#if defined(NINFER_DISK_STATE_CACHE_TEST_SEAMS)
+namespace test_seams {
+namespace {
+
+std::mutex g_disk_load_hook_mutex;
+std::function<void(DiskLoadPoint, bool)> g_disk_load_hook;
+
+} // namespace
+
+void set_disk_load_hook(std::function<void(DiskLoadPoint point, bool direct_storage)> hook) {
+    std::lock_guard<std::mutex> lock(g_disk_load_hook_mutex);
+    g_disk_load_hook = std::move(hook);
+}
+
+// Runs the installed hook, if any, without holding the hook mutex so the hook may compact.
+static void run_disk_load_hook(DiskLoadPoint point, bool direct_storage) {
+    std::function<void(DiskLoadPoint, bool)> hook;
+    {
+        std::lock_guard<std::mutex> lock(g_disk_load_hook_mutex);
+        hook = g_disk_load_hook;
+    }
+    if (hook) { hook(point, direct_storage); }
+}
+
+} // namespace test_seams
+#endif
 
 bool disk_state_layout_matches(const DiskStateHeader& h, std::uint32_t live_text_page_bytes) noexcept {
     if (h.text_page_count > 0 && live_text_page_bytes != 0 && h.text_page_bytes != live_text_page_bytes) {
@@ -816,8 +846,12 @@ public:
                                      std::vector<std::byte>& out_tail_hidden) {
         const std::uint64_t journal_generation = journal_.generation();
         LoadFailure failure;
-        const bool ok = load_snapshot_host(path, out_header, out_tokens, out_gdn_state, out_text_kv_payload,
-                                           out_mtp_kv_payload, out_tail_hidden, failure);
+        bool ok = load_snapshot_host(path, out_header, out_tokens, out_gdn_state, out_text_kv_payload,
+                                     out_mtp_kv_payload, out_tail_hidden, failure);
+        // A compaction after the capture may have moved the pool under the page reads.
+        if (ok && journal_.generation() != journal_generation) {
+            ok = fail(failure, LoadFault::Transient, "page pool compacted during the load");
+        }
         if (!ok) { discard_after_failed_load(path, failure, journal_generation); }
         return ok;
     }
@@ -832,8 +866,12 @@ public:
                                                     std::uint32_t expected_text_page_bytes) {
         const std::uint64_t journal_generation = journal_.generation();
         LoadFailure failure;
-        const bool ok = load_snapshot_ds(path, out_header, out_tokens, stream, gdn_unit_bytes, consumer,
-                                         expected_text_page_bytes, failure);
+        bool ok = load_snapshot_ds(path, out_header, out_tokens, stream, gdn_unit_bytes, consumer,
+                                   expected_text_page_bytes, failure);
+        // The consumer has already written the pages; a compaction since the capture makes them suspect.
+        if (ok && journal_.generation() != journal_generation) {
+            ok = fail(failure, LoadFault::Transient, "page pool compacted during the load");
+        }
         if (!ok) { discard_after_failed_load(path, failure, journal_generation); }
         return ok;
     }
@@ -1280,11 +1318,17 @@ private:
         if (header.text_page_count > 0 && header.text_page_bytes > 0) {
             std::vector<PageIndexRecord> page_records;
             if (!resolve_pages(page_hashes, header.text_page_bytes, page_records, failure)) { return false; }
+#if defined(NINFER_DISK_STATE_CACHE_TEST_SEAMS)
+            test_seams::run_disk_load_hook(test_seams::DiskLoadPoint::AfterResolvePages, false);
+#endif
 
             std::ifstream pool_file(journal_.pool_data_path(), std::ios::binary);
             if (!pool_file.is_open()) {
                 return fail(failure, LoadFault::Transient, "page pool file could not be opened");
             }
+#if defined(NINFER_DISK_STATE_CACHE_TEST_SEAMS)
+            test_seams::run_disk_load_hook(test_seams::DiskLoadPoint::AfterPoolOpen, false);
+#endif
 
             for (std::uint32_t i = 0; i < header.text_page_count; ++i) {
                 pool_file.seekg(static_cast<std::streamoff>(page_records[i].file_offset));
@@ -1395,6 +1439,9 @@ private:
 
         std::vector<PageIndexRecord> page_records;
         if (!resolve_pages(page_hashes, header.text_page_bytes, page_records, failure)) { return false; }
+#if defined(NINFER_DISK_STATE_CACHE_TEST_SEAMS)
+        test_seams::run_disk_load_hook(test_seams::DiskLoadPoint::AfterResolvePages, true);
+#endif
 
         // Segment list in file order, with the kind and per-kind index of each segment.
         std::vector<core::DirectStorageSegment> segments;

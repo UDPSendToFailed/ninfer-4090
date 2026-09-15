@@ -1,4 +1,5 @@
 #include "core/disk_state_cache.h"
+#include "core/disk_state_cache_test_seams.h"
 #include "core/device.h"
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
@@ -2115,6 +2116,382 @@ void test_bad_snapshot_dropped_and_resaved() {
 #endif
 }
 
+namespace {
+
+std::uint64_t pool_file_size(const std::filesystem::path& path) {
+    std::error_code ec;
+    const std::uint64_t size = std::filesystem::file_size(path, ec);
+    return ec ? 0 : size;
+}
+
+std::vector<char> read_file_bytes(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::vector<char>((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+const char* load_result_label(bool ok, bool identical) {
+    return !ok ? "rejected" : (identical ? "loaded-identical" : "loaded-foreign");
+}
+
+// A dead snapshot D, then S1 (2 pages) and S2 (6 pages), each with its own pages. D's manifest
+// is removed while no cache is open, so a cache opened afterwards indexes only S1 and S2, and a
+// forced compaction drops D's pages and moves the rest. D's 4 pages were picked by a layout search
+// over 1 to 6 dead pages (seeds 2210 and 2220): with fewer, the copy order, which follows
+// unordered_map iteration, put an S1 page back at its old offset and hid foreign bytes. That is
+// what those seeds did, not a guarantee; the "compacted pool must hold different bytes at the old
+// offsets" expect inside the seam fails the fixture if the layout ever drifts.
+struct CompactionSwapFixture {
+    static constexpr std::uint32_t kPageBytes = 8192;
+    static constexpr std::uint32_t kDeadPages = 4;
+    static constexpr std::uint64_t kLivePages = 8;
+    std::filesystem::path dir;
+    std::filesystem::path pool_path;
+    DiskStateCacheConfig config;
+    std::uint64_t model_hash = 0;
+    std::uint32_t seed = 0;
+    std::vector<TokenId> s1_tokens;
+    std::vector<std::byte> s1_kv;
+    std::filesystem::path s1_manifest;
+    std::uint64_t pool_size_before_load = 0;
+    std::vector<std::uint64_t> s1_old_offsets;
+
+    CompactionSwapFixture(std::filesystem::path test_dir, std::uint64_t hash, std::uint32_t fixture_seed)
+        : dir(std::move(test_dir)), pool_path(dir / "pool_data.ninfer_pages"), model_hash(hash), seed(fixture_seed),
+          s1_tokens(generate_tokens(2 * 64, fixture_seed + 1)),
+          s1_kv(generate_deterministic_bytes(2 * kPageBytes, fixture_seed + 11)) {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+        config.cache_dir       = dir;
+        config.max_cache_bytes = 100ULL << 20;
+        config.enabled         = true;
+    }
+
+    ~CompactionSwapFixture() {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+
+    // Saves D, S1 and S2, then removes D's manifest. False when a manifest was not written.
+    [[nodiscard]] bool prepare() {
+        const auto d_tokens  = generate_tokens(kDeadPages * 64, seed);
+        const auto d_kv      = generate_deterministic_bytes(kDeadPages * kPageBytes, seed + 10);
+        const auto s2_tokens = generate_tokens(6 * 64, seed + 2);
+        const auto s2_kv     = generate_deterministic_bytes(6 * kPageBytes, seed + 12);
+        const auto gdn       = generate_deterministic_bytes(1024, seed + 20);
+        const auto tail      = generate_deterministic_bytes(512, seed + 21);
+
+        std::filesystem::path d_manifest;
+        {
+            DiskStateCache cache(config);
+            cache.enqueue_save(model_hash, d_tokens, 1, 0, gdn, d_kv, kDeadPages, {}, 0, tail);
+            const auto d_match = wait_for_match(cache, model_hash, d_tokens);
+            cache.enqueue_save(model_hash, s1_tokens, 1, 0, gdn, s1_kv, 2, {}, 0, tail);
+            const auto s1_match = wait_for_match(cache, model_hash, s1_tokens);
+            cache.enqueue_save(model_hash, s2_tokens, 1, 0, gdn, s2_kv, 6, {}, 0, tail);
+            const auto s2_match = wait_for_match(cache, model_hash, s2_tokens);
+            expect(d_match.has_value() && s1_match.has_value() && s2_match.has_value(),
+                   "Load-across-compaction fixture snapshots must be written");
+            if (!d_match || !s1_match || !s2_match) { return false; }
+            d_manifest  = d_match->file_path;
+            s1_manifest = s1_match->file_path;
+        }
+        std::error_code ec;
+        std::filesystem::remove(d_manifest, ec);
+        expect(!ec, "Load-across-compaction fixture must remove the dead snapshot's manifest");
+        return !ec;
+    }
+
+    // Finds each S1 page at a 4096-aligned position of the pool. Call before any load.
+    [[nodiscard]] bool record_s1_offsets() {
+        const auto bytes = read_file_bytes(pool_path);
+        pool_size_before_load = bytes.size();
+        expect(pool_size_before_load == (kDeadPages + kLivePages) * kPageBytes,
+               "fixture: pool must hold every saved page before the load");
+        s1_old_offsets.clear();
+        for (std::size_t i = 0; i < 2; ++i) {
+            const auto* page = reinterpret_cast<const char*>(s1_kv.data() + i * kPageBytes);
+            for (std::size_t offset = 0; offset + kPageBytes <= bytes.size(); offset += 4096) {
+                if (std::memcmp(bytes.data() + offset, page, kPageBytes) == 0) {
+                    s1_old_offsets.push_back(offset);
+                    break;
+                }
+            }
+        }
+        expect(s1_old_offsets.size() == 2, "fixture: every S1 page must be found in the pool before the load");
+        return s1_old_offsets.size() == 2;
+    }
+
+    // The checks made right after the forced compaction inside the load seam.
+    void check_compaction_in_load_seam() const {
+        const std::uint64_t new_size = pool_file_size(pool_path);
+        expect(new_size < pool_size_before_load, "forced compaction in the load seam must shrink the pool");
+        const auto bytes = read_file_bytes(pool_path);
+        bool inside    = true;
+        bool different = true;
+        for (std::size_t i = 0; i < s1_old_offsets.size(); ++i) {
+            const std::uint64_t offset = s1_old_offsets[i];
+            if (offset + kPageBytes > new_size || offset + kPageBytes > bytes.size()) {
+                inside = false;
+                continue;
+            }
+            if (std::memcmp(bytes.data() + offset, s1_kv.data() + i * kPageBytes, kPageBytes) == 0) {
+                different = false;
+            }
+        }
+        if (!inside || !different) {
+            // Shows the layout that defeated the fixture, so the page counts can be tuned.
+            std::cout << "[diag] ninfer-test: compacted pool " << new_size << " bytes; S1 old offsets";
+            for (const std::uint64_t offset : s1_old_offsets) { std::cout << ' ' << offset; }
+            std::cout << "; S1 new offsets";
+            for (std::size_t i = 0; i < 2; ++i) {
+                const auto* page = reinterpret_cast<const char*>(s1_kv.data() + i * kPageBytes);
+                for (std::size_t offset = 0; offset + kPageBytes <= bytes.size(); offset += 4096) {
+                    if (std::memcmp(bytes.data() + offset, page, kPageBytes) == 0) { std::cout << ' ' << offset; }
+                }
+            }
+            std::cout << "\n";
+        }
+        expect(inside, "fixture: loaded page offsets must lie inside the compacted pool");
+        expect(different, "fixture: compacted pool must hold different bytes at the old offsets");
+    }
+};
+
+#if defined(_WIN32)
+// Copies the TextPage slices of one DirectStorage batch into `readback` and waits for the copies.
+void copy_text_pages_to_host(std::span<const DirectStorageRestoreSlice> slices, std::vector<std::byte>& readback,
+                             cudaStream_t stream) {
+    for (const auto& s : slices) {
+        if (s.kind != DirectStorageRestoreKind::TextPage) { continue; }
+        const std::size_t offset = static_cast<std::size_t>(s.index) * CompactionSwapFixture::kPageBytes;
+        if (offset + s.bytes > readback.size()) { continue; }
+        CUDA_CHECK(cudaMemcpyAsync(readback.data() + offset, s.data, s.bytes, cudaMemcpyDeviceToHost, stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+bool cuda_device_available() {
+    int count = 0;
+    return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
+}
+#endif
+
+} // namespace
+
+// A compaction that swaps the pool between resolving a snapshot's page offsets and reading them
+// must not hand back whatever the new pool holds at the old offsets.
+void test_host_load_across_compaction_swap() {
+    std::cout << "[run] ninfer-test: host load across compaction swap fixture executed\n";
+    CompactionSwapFixture f("./.test_ninfer_cache_load_compaction_host", 0xC0FFEE0012345601ULL, 2210);
+    if (!f.prepare()) { return; }
+    DiskStateCache cache(f.config);
+    if (!f.record_s1_offsets()) { return; }
+
+    int hook_calls = 0;
+    test_seams::set_disk_load_hook([&](test_seams::DiskLoadPoint point, bool direct_storage) {
+        if (point != test_seams::DiskLoadPoint::AfterResolvePages || direct_storage) { return; }
+        if (++hook_calls != 1) { return; }
+        cache.compact_pool(/*force=*/true);
+        f.check_compaction_in_load_seam();
+    });
+    DiskStateHeader out_h;
+    std::vector<TokenId> out_toks;
+    std::vector<std::byte> out_gdn, out_kv, out_mtp, out_tail;
+    const bool ok = cache.load_snapshot(f.s1_manifest, out_h, out_toks, out_gdn, out_kv, out_mtp, out_tail);
+    expect(hook_calls == 1, "seam hook must fire exactly once in the load across compaction swap fixture");
+    test_seams::set_disk_load_hook({});
+
+    const bool identical = out_kv == f.s1_kv;
+    expect(!ok || identical, "host load across compaction swap returned foreign page bytes");
+    std::cout << "[result] host load across compaction swap: " << load_result_label(ok, identical) << "\n";
+}
+
+#if defined(_WIN32)
+void test_direct_storage_load_across_compaction_swap_live_gpu() {
+    if (!cuda_device_available()) {
+        std::cout << "[skip] ninfer-test: no CUDA device, direct-storage load across compaction swap fixture not executed\n";
+        return;
+    }
+    std::cout << "[run] ninfer-test: direct-storage load across compaction swap fixture executed\n";
+    DeviceContext ctx(0);
+
+    CompactionSwapFixture f("./.test_ninfer_cache_load_compaction_ds", 0xC0FFEE0012345602ULL, 2220);
+    if (!f.prepare()) { return; }
+    DiskStateCache cache(f.config);
+    if (!f.record_s1_offsets()) { return; }
+
+    int hook_calls = 0;
+    test_seams::set_disk_load_hook([&](test_seams::DiskLoadPoint point, bool direct_storage) {
+        if (point != test_seams::DiskLoadPoint::AfterResolvePages || !direct_storage) { return; }
+        if (++hook_calls != 1) { return; }
+        cache.compact_pool(/*force=*/true);
+        f.check_compaction_in_load_seam();
+    });
+    DiskStateHeader loaded_header;
+    std::vector<TokenId> loaded_tokens;
+    std::vector<std::byte> readback(f.s1_kv.size());
+    const bool ok = cache.load_snapshot_direct_storage(
+        f.s1_manifest, loaded_header, loaded_tokens, ctx.stream, {},
+        [&](std::span<const DirectStorageRestoreSlice> slices) {
+            copy_text_pages_to_host(slices, readback, ctx.stream);
+            return true;
+        });
+    expect(hook_calls == 1, "seam hook must fire exactly once in the load across compaction swap fixture");
+    test_seams::set_disk_load_hook({});
+
+    const bool identical = readback == f.s1_kv;
+    expect(!ok || identical, "direct-storage load across compaction swap returned foreign page bytes");
+    std::cout << "[result] direct-storage load across compaction swap: " << load_result_label(ok, identical) << "\n";
+}
+#endif
+
+// Records whether Windows lets a rename replace the pool while a load holds it open. The copy is
+// byte-identical, so the load must succeed with the saved bytes either way.
+void test_rename_over_open_pool_probe() {
+    {
+        CompactionSwapFixture f("./.test_ninfer_cache_rename_probe_host", 0xC0FFEE0012345603ULL, 2230);
+        if (f.prepare()) {
+            const auto copy_path = f.dir / "pool_copy.ninfer_pages";
+            std::error_code ec;
+            std::filesystem::copy_file(f.pool_path, copy_path, std::filesystem::copy_options::overwrite_existing, ec);
+            expect(!ec, "Rename probe must copy the pool");
+            DiskStateCache cache(f.config);
+
+            bool renamed = false;
+            std::error_code rename_ec;
+            test_seams::set_disk_load_hook([&](test_seams::DiskLoadPoint point, bool direct_storage) {
+                if (point != test_seams::DiskLoadPoint::AfterPoolOpen || direct_storage || renamed) { return; }
+                renamed = true;
+                std::filesystem::rename(copy_path, f.pool_path, rename_ec);
+            });
+            DiskStateHeader out_h;
+            std::vector<TokenId> out_toks;
+            std::vector<std::byte> out_gdn, out_kv, out_mtp, out_tail;
+            const bool ok = cache.load_snapshot(f.s1_manifest, out_h, out_toks, out_gdn, out_kv, out_mtp, out_tail);
+            test_seams::set_disk_load_hook({});
+
+            expect(renamed, "Rename probe must run while the host load holds the pool open");
+            if (renamed) {
+                std::cout << "[probe] rename over open ifstream pool: " << (rename_ec ? "refused" : "replaced")
+                          << " (ec=" << rename_ec.value() << ")\n";
+            }
+            expect(ok && out_kv == f.s1_kv, "Host load must return the saved bytes after a rename over its open pool");
+        }
+    }
+#if defined(_WIN32)
+    if (!cuda_device_available()) {
+        std::cout << "[skip] ninfer-test: no CUDA device, direct-storage rename probe fixture not executed\n";
+        return;
+    }
+    std::cout << "[run] ninfer-test: direct-storage rename probe fixture executed\n";
+    DeviceContext ctx(0);
+    CompactionSwapFixture f("./.test_ninfer_cache_rename_probe_ds", 0xC0FFEE0012345604ULL, 2240);
+    if (!f.prepare()) { return; }
+    const auto copy_path = f.dir / "pool_copy.ninfer_pages";
+    std::error_code ec;
+    std::filesystem::copy_file(f.pool_path, copy_path, std::filesystem::copy_options::overwrite_existing, ec);
+    expect(!ec, "Rename probe must copy the pool");
+    DiskStateCache cache(f.config);
+
+    bool renamed = false;
+    std::error_code rename_ec;
+    DiskStateHeader loaded_header;
+    std::vector<TokenId> loaded_tokens;
+    std::vector<std::byte> readback(f.s1_kv.size());
+    const bool ok = cache.load_snapshot_direct_storage(
+        f.s1_manifest, loaded_header, loaded_tokens, ctx.stream, {},
+        [&](std::span<const DirectStorageRestoreSlice> slices) {
+            if (!renamed) {
+                renamed = true;
+                std::filesystem::rename(copy_path, f.pool_path, rename_ec);
+            }
+            copy_text_pages_to_host(slices, readback, ctx.stream);
+            return true;
+        });
+
+    expect(renamed, "Rename probe must run while the DirectStorage load holds the pool open");
+    if (renamed) {
+        std::cout << "[probe] rename over open DirectStorage pool: " << (rename_ec ? "refused" : "replaced")
+                  << " (ec=" << rename_ec.value() << ")\n";
+    }
+    expect(ok && readback == f.s1_kv,
+           "DirectStorage load must return the saved bytes after a rename over its open pool");
+#endif
+}
+
+// A compaction that runs while a load holds the pool open either swaps or gives up; once the load
+// has finished, the next compaction must reclaim the dead pages in full.
+void test_compaction_after_overlapping_load_reclaims() {
+    {
+        CompactionSwapFixture f("./.test_ninfer_cache_overlap_compaction_host", 0xC0FFEE0012345605ULL, 2250);
+        if (f.prepare()) {
+            DiskStateCache cache(f.config);
+            const std::uint64_t size_before = pool_file_size(f.pool_path);
+            bool compacted = false;
+            std::uint64_t size_after_first = 0;
+            test_seams::set_disk_load_hook([&](test_seams::DiskLoadPoint point, bool direct_storage) {
+                if (point != test_seams::DiskLoadPoint::AfterPoolOpen || direct_storage || compacted) { return; }
+                compacted = true;
+                cache.compact_pool(/*force=*/true);
+                size_after_first = pool_file_size(f.pool_path);
+            });
+            DiskStateHeader out_h;
+            std::vector<TokenId> out_toks;
+            std::vector<std::byte> out_gdn, out_kv, out_mtp, out_tail;
+            const bool ok = cache.load_snapshot(f.s1_manifest, out_h, out_toks, out_gdn, out_kv, out_mtp, out_tail);
+            test_seams::set_disk_load_hook({});
+
+            expect(compacted, "Overlapping compaction must run while the host load holds the pool open");
+            if (compacted) {
+                std::cout << "[result] compaction during open host load: "
+                          << (size_after_first < size_before ? "swapped" : "abandoned") << "\n";
+            }
+            expect(!ok || out_kv == f.s1_kv, "Host load overlapping a compaction returned foreign page bytes");
+            cache.compact_pool(/*force=*/true);
+            expect(pool_file_size(f.pool_path) == CompactionSwapFixture::kLivePages * CompactionSwapFixture::kPageBytes,
+                   "pool must shrink to exactly the live pages once the overlapping load finished");
+        }
+    }
+#if defined(_WIN32)
+    if (!cuda_device_available()) {
+        std::cout << "[skip] ninfer-test: no CUDA device, direct-storage overlapping compaction fixture not executed\n";
+        return;
+    }
+    std::cout << "[run] ninfer-test: direct-storage overlapping compaction fixture executed\n";
+    DeviceContext ctx(0);
+    CompactionSwapFixture f("./.test_ninfer_cache_overlap_compaction_ds", 0xC0FFEE0012345606ULL, 2260);
+    if (!f.prepare()) { return; }
+    DiskStateCache cache(f.config);
+    const std::uint64_t size_before = pool_file_size(f.pool_path);
+
+    bool compacted = false;
+    std::uint64_t size_after_first = 0;
+    DiskStateHeader loaded_header;
+    std::vector<TokenId> loaded_tokens;
+    std::vector<std::byte> readback(f.s1_kv.size());
+    const bool ok = cache.load_snapshot_direct_storage(
+        f.s1_manifest, loaded_header, loaded_tokens, ctx.stream, {},
+        [&](std::span<const DirectStorageRestoreSlice> slices) {
+            if (!compacted) {
+                compacted = true;
+                cache.compact_pool(/*force=*/true);
+                size_after_first = pool_file_size(f.pool_path);
+            }
+            copy_text_pages_to_host(slices, readback, ctx.stream);
+            return true;
+        });
+
+    expect(compacted, "Overlapping compaction must run while the DirectStorage load holds the pool open");
+    if (compacted) {
+        std::cout << "[result] compaction during open direct-storage load: "
+                  << (size_after_first < size_before ? "swapped" : "abandoned") << "\n";
+    }
+    expect(!ok || readback == f.s1_kv, "DirectStorage load overlapping a compaction returned foreign page bytes");
+    cache.compact_pool(/*force=*/true);
+    expect(pool_file_size(f.pool_path) == CompactionSwapFixture::kLivePages * CompactionSwapFixture::kPageBytes,
+           "pool must shrink to exactly the live pages once the overlapping load finished");
+#endif
+}
+
 int main() {
     std::cout << "Starting Comprehensive DiskStateCache & DirectStorage test suite...\n";
     test_prompt_hashing();
@@ -2135,11 +2512,15 @@ int main() {
     test_snapshot_longer_than_prompt_not_matched();
     test_failed_disk_restore_degrades_to_full_reset();
     test_bad_snapshot_dropped_and_resaved();
+    test_host_load_across_compaction_swap();
+    test_rename_over_open_pool_probe();
+    test_compaction_after_overlapping_load_reclaims();
 #if defined(_WIN32)
     test_cow_multi_turn_delta_splicing_live_gpu();
     test_full_state_direct_storage_restore_live_gpu();
     test_direct_storage_rapid_restore_and_teardown_stress();
     test_disk_state_layout_mismatch_rejected();
+    test_direct_storage_load_across_compaction_swap_live_gpu();
     test_direct_storage_reuse_without_teardown_race();
 #endif
 
