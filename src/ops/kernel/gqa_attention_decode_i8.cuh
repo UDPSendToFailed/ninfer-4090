@@ -407,6 +407,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         store_vec(reinterpret_cast<int4*>(q_i8) + i, make_int4(0, 0, 0, 0));
     }
     for (int i = tid; i < Br * Groups; i += Threads) { q_scale_tmp[i] = 0.0f; }
+    // Quantizing warps must not race other warps still clearing Q or its scales.
+    __syncthreads();
 
     for (int unit = warp; unit < RowCount * Groups; unit += Wc) {
         const int row = unit / Groups;
@@ -460,6 +462,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             q_scale_r1[g] = q_scale_tmp[(producer_row0 + 8) * Groups + g];
         }
     }
+    // q_scale_tmp aliases p_s. Every producer must finish its scale loads before
+    // any producer starts writing probabilities into that shared-memory region.
+    __syncthreads();
 
     float acc[PVNtPerWarp][4];
 #pragma unroll
