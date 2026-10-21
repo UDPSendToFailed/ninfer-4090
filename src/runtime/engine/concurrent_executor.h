@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <cstdio>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -1381,7 +1382,21 @@ private:
                     previous_unit_was_decode = true;
                     continue;
                 }
+            } catch (const std::exception& e) {
+                // A worker-loop escape permanently latches the executor (failed_ is never
+                // cleared). Log the reason before latching — the 2026-10-02 incident on the
+                // 27B Blackwell stack latched with no record of the trigger, so the 65-minute
+                // outage looked unrecoverable when a single restart would have fixed it.
+                fprintf(stderr, "ninfer-serve: FATAL engine worker loop escaped exception: %s "
+                                "(engine latched unavailable until restart)\n",
+                        e.what());
+                std::fflush(stderr);
+                fail_all(std::current_exception());
+                return;
             } catch (...) {
+                fprintf(stderr, "ninfer-serve: FATAL engine worker loop escaped "
+                                "non-standard exception (engine latched unavailable until restart)\n");
+                std::fflush(stderr);
                 fail_all(std::current_exception());
                 return;
             }
