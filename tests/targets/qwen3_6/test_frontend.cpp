@@ -980,6 +980,48 @@ int test_thinking_budget_control(const Frontend& frontend) {
     const auto raw_output = raw_session.commit_preview();
     failures += check(channel_text(raw_output, ninfer::OutputChannel::Content) == kThinkingControl,
                       "raw output did not preserve the inserted control representation");
+
+    // Live force_end_requested with unlimited budget closes thinking mid-stream when flagged.
+    auto force_end_flag  = std::make_shared<std::atomic<bool>>(false);
+    auto live_prompt     = thinking_prompt(frontend);
+    auto live_session    = frontend.make_output_session(
+        live_prompt, stop, {}, {},
+        ninfer::ThinkingControlOptions{.budget = std::nullopt,
+                                       .force_end_requested = force_end_flag});
+    const auto before_flag = live_session.preview_model(
+        std::array<ninfer::TokenId, 1>{0}, 10, ninfer::FinishReason::OutputLimit);
+    failures += check(before_flag.continuation == ninfer::runtime::ContinuationAction::Decode,
+                      "force_end_requested closed thinking before the flag was set");
+    (void)live_session.commit_preview();
+    force_end_flag->store(true, std::memory_order_release);
+    const auto tight_budget = live_session.preview_model(
+        std::array<ninfer::TokenId, 1>{0},
+        static_cast<std::uint32_t>(control.size() + 1), ninfer::FinishReason::OutputLimit);
+    failures += check(tight_budget.continuation == ninfer::runtime::ContinuationAction::Decode,
+                      "force_end_requested triggered without room for control suffix + 1 token");
+    (void)live_session.commit_preview();
+    const auto triggered = live_session.preview_model(
+        std::array<ninfer::TokenId, 1>{0},
+        static_cast<std::uint32_t>(control.size() + 2), ninfer::FinishReason::OutputLimit);
+    failures +=
+        check(triggered.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+              "force_end_requested did not trigger target thinking control");
+    (void)live_session.commit_preview();
+    const auto live_control = live_session.preview_control(
+        control, static_cast<std::uint32_t>(control.size() + 1));
+    failures += check(live_control.accepted_tokens == control.size(),
+                      "live force_end_requested control span was not accepted");
+    const auto closed = live_session.commit_preview();
+    failures += check(channel_text(closed, ninfer::OutputChannel::Reasoning) ==
+                              kThinkingControlGuidance &&
+                          channel_text(closed, ninfer::OutputChannel::Content).empty(),
+                      "live force_end_requested control output was unexpected");
+    const auto after_close = live_session.preview_model(
+        std::array<ninfer::TokenId, 1>{0}, 1, ninfer::FinishReason::OutputLimit);
+    failures += check(after_close.continuation == ninfer::runtime::ContinuationAction::Decode &&
+                          after_close.finish_reason == ninfer::FinishReason::OutputLimit,
+                      "post-close token did not route to answer channel");
+    (void)live_session.commit_preview();
     return failures;
 }
 

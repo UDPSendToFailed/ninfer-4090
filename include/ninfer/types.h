@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -163,6 +164,8 @@ struct ThinkingControlOptions {
     // Omitted means unlimited. Injected target-control tokens consume the total output budget but
     // not this model-origin budget.
     std::optional<std::uint32_t> budget;
+    // Optional live control flag polled at step boundaries to close thinking early mid-request.
+    std::shared_ptr<const std::atomic<bool>> force_end_requested;
 };
 
 struct ExecutionOptions {

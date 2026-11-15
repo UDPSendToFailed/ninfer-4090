@@ -23,9 +23,11 @@ namespace ninfer::serve {
 namespace {
 
 struct StreamingRequest {
-    explicit StreamingRequest(PreparedRequest request) : prepared(std::move(request)) {}
+    explicit StreamingRequest(PreparedRequest request, std::shared_ptr<void> control_guard_ = {})
+        : prepared(std::move(request)), control_guard(std::move(control_guard_)) {}
 
     PreparedRequest prepared;
+    std::shared_ptr<void> control_guard;
     std::atomic<bool> cancelled{false};
     bool started = false;
 };
@@ -360,6 +362,10 @@ void HttpServer::register_routes() {
                   [this](const httplib::Request& req, httplib::Response& res) {
                       handle_chat_completions(req, res);
                   });
+    register_post("/chat/completions/control",
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_chat_completions_control(req, res);
+                  });
     register_post("/responses", [this](const httplib::Request& req, httplib::Response& res) {
         handle_responses(req, res);
     });
@@ -468,6 +474,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
     GenerationRequest request;
     PreparedRequest prepared;
+    auto force_end_reasoning = std::make_shared<std::atomic<bool>>(false);
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
@@ -475,6 +482,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         if (request.model.empty()) {
             request.model = public_model_id_;
         }
+        request.force_end_reasoning = force_end_reasoning;
         prepared = service_->prepare(
             request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
     } catch (const ApiException& e) {
@@ -485,6 +493,14 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     const std::string id       = new_chat_completion_id();
     const std::int64_t created = unix_time_now();
     const std::string model    = request.model;
+    {
+        std::lock_guard lock(chat_controls_mutex_);
+        active_chat_controls_[id] = std::move(force_end_reasoning);
+    }
+    std::shared_ptr<void> control_guard(nullptr, [this, id](void*) {
+        std::lock_guard lock(chat_controls_mutex_);
+        active_chat_controls_.erase(id);
+    });
 
     const std::uint64_t req_id = ++request_seq_;
     const RequestLogContext log_context =
@@ -517,7 +533,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         return;
     }
 
-    auto stream              = std::make_shared<StreamingRequest>(std::move(prepared));
+    auto stream              = std::make_shared<StreamingRequest>(std::move(prepared), std::move(control_guard));
     const bool include_usage = stream->prepared.include_usage;
     const bool tool_capable  = stream->prepared.tool_capable;
 
@@ -662,6 +678,56 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             }
         },
         [stream](bool) { stream->cancelled.store(true, std::memory_order_release); });
+}
+
+void HttpServer::handle_chat_completions_control(const httplib::Request& req,
+                                                 httplib::Response& res) {
+    nlohmann::json body;
+    try {
+        body = nlohmann::json::parse(req.body);
+    } catch (const std::exception&) {
+        ApiError error;
+        error.status  = 400;
+        error.message = "request body is not valid JSON";
+        write_error(res, error);
+        return;
+    }
+
+    if (!body.is_object() || !body.contains("id") || !body.at("id").is_string() ||
+        !body.contains("action") || !body.at("action").is_string()) {
+        ApiError error;
+        error.status  = 400;
+        error.message = "control request requires string 'id' and 'action' fields";
+        write_error(res, error);
+        return;
+    }
+
+    const std::string id     = body.at("id").get<std::string>();
+    const std::string action = body.at("action").get<std::string>();
+    if (id.empty() || action != "reasoning_end") {
+        ApiError error;
+        error.status  = 400;
+        error.message = "unsupported control action or empty completion id";
+        write_error(res, error);
+        return;
+    }
+
+    std::shared_ptr<std::atomic<bool>> force_end;
+    {
+        std::lock_guard lock(chat_controls_mutex_);
+        const auto it = active_chat_controls_.find(id);
+        if (it != active_chat_controls_.end()) { force_end = it->second; }
+    }
+    if (force_end == nullptr) {
+        res.status = 404;
+        res.set_content(R"({"success":false,"error":"active completion not found"})",
+                        "application/json");
+        return;
+    }
+
+    force_end->store(true, std::memory_order_release);
+    res.status = 200;
+    res.set_content(R"({"success":true})", "application/json");
 }
 
 void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Response& res) {

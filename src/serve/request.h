@@ -9,8 +9,10 @@
 // by Engine; media sources remain unresolved until the product service acquires
 // owning bytes.
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -209,6 +211,7 @@ struct GenerationRequest {
     std::string reasoning_effort_param = "reasoning_effort";
     std::optional<bool> preserve_thinking;
     bool preserve_thinking_semantic_change = false;
+    std::shared_ptr<const std::atomic<bool>> force_end_reasoning;
     SamplingParams sampling;
     ResponseFormat response_format;
 

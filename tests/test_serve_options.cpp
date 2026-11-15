@@ -210,6 +210,17 @@ int main() {
     failures +=
         check(!to_request_options(request, thinking_budget, non_thinking).execution.thinking.budget,
               "non-thinking request inherited the server thinking budget");
+    auto force_end = std::make_shared<std::atomic<bool>>(false);
+    request.force_end_reasoning = force_end;
+    failures += check(
+        to_request_options(request, thinking_budget, semantics).execution.thinking.force_end_requested ==
+            force_end,
+        "thinking-enabled request did not forward force_end_reasoning");
+    failures += check(
+        to_request_options(request, thinking_budget, non_thinking)
+                .execution.thinking.force_end_requested == nullptr,
+        "non-thinking request forwarded force_end_reasoning");
+    request.force_end_reasoning.reset();
     request.enable_thinking.reset();
     failures +=
         check(resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,

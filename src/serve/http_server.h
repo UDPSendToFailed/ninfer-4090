@@ -12,9 +12,11 @@
 #include <condition_variable>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 namespace ninfer::serve {
 
@@ -34,6 +36,7 @@ public:
 private:
     void register_routes();
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
+    void handle_chat_completions_control(const httplib::Request& req, httplib::Response& res);
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
     void handle_responses(const httplib::Request& req, httplib::Response& res);
@@ -67,6 +70,8 @@ private:
     std::condition_variable stats_cv_;
     std::thread stats_thread_;
     bool stats_stopping_ = false;
+    std::mutex chat_controls_mutex_;
+    std::unordered_map<std::string, std::shared_ptr<std::atomic<bool>>> active_chat_controls_;
 };
 
 } // namespace ninfer::serve

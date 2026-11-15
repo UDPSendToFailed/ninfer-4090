@@ -706,6 +706,7 @@ public:
          std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens_)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
           thinking_control_tokens(std::move(thinking_control_tokens_)),
+          force_end_requested(std::move(thinking.force_end_requested)),
           preserve_special(output.raw || output.preserve_special_tokens),
           split_reasoning(starts_in_reasoning && !output.raw && !structured.enabled()) {
         if (thinking.budget && *thinking.budget == 0) {
@@ -716,10 +717,12 @@ public:
         state.in_reasoning = split_reasoning;
         semantic.budget    = thinking.budget;
         // The presentation decoder already tracks normal reasoning output. Keep the independent
-        // semantic tracker dormant unless a cap needs it, so the default unlimited path does not
-        // decode every model token twice.
+        // semantic tracker dormant unless a budget or live force-end control needs it, so the
+        // default unlimited path does not decode every model token twice.
         semantic.in_reasoning =
-            starts_in_reasoning && thinking.budget.has_value() && !structured.enabled();
+            starts_in_reasoning &&
+            (thinking.budget.has_value() || force_end_requested != nullptr) &&
+            !structured.enabled();
         if (structured.enabled()) {
             xgrammar::CompiledGrammar grammar =
                 structured.mode == StructuredOutputMode::JsonObject
@@ -736,6 +739,7 @@ public:
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     StopPolicy policy;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
+    std::shared_ptr<const std::atomic<bool>> force_end_requested;
     bool preserve_special = false;
     bool split_reasoning  = false;
     DecoderState state;
@@ -915,10 +919,23 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
         return complete(count, limit_reason);
     }
-    if (impl_->preview_semantic.in_reasoning && impl_->preview_semantic.budget &&
-        impl_->preview_semantic.model_thinking_tokens == *impl_->preview_semantic.budget) {
-        impl_->preview_semantic.control_pending = true;
-        return complete(count, FinishReason::None, runtime::ContinuationAction::ApplyTargetControl);
+    if (impl_->preview_semantic.in_reasoning) {
+        const bool budget_exhausted =
+            impl_->preview_semantic.budget &&
+            impl_->preview_semantic.model_thinking_tokens == *impl_->preview_semantic.budget;
+        const bool force_end =
+            !impl_->preview_semantic.applied && impl_->force_end_requested &&
+            impl_->force_end_requested->load(std::memory_order_acquire) &&
+            impl_->thinking_control_tokens != nullptr &&
+            !impl_->thinking_control_tokens->empty() &&
+            total_budget_remaining >=
+                static_cast<std::uint64_t>(tokens.size()) +
+                    impl_->thinking_control_tokens->size() + 1U;
+        if (budget_exhausted || force_end) {
+            impl_->preview_semantic.control_pending = true;
+            return complete(count, FinishReason::None,
+                            runtime::ContinuationAction::ApplyTargetControl);
+        }
     }
     return complete(count, FinishReason::None);
 }
