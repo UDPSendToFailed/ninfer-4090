@@ -12,6 +12,10 @@ if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(86|89)$")
     "'${CMAKE_CUDA_ARCHITECTURES}'")
 endif()
 
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 project(ninfer LANGUAGES C CXX CUDA)
 
 include(FetchContent)
@@ -73,10 +77,6 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "86")
   add_compile_definitions(NINFER_SM86=1)
 elseif(CMAKE_CUDA_ARCHITECTURES STREQUAL "89")
   add_compile_definitions(NINFER_SM89=1)
-endif()
-
-if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE Release)
 endif()
 
 if(CMAKE_GENERATOR MATCHES "Ninja")
