@@ -2,12 +2,16 @@
 #if defined(_WIN32)
 #include "core/direct_storage_engine.h"
 #endif
+#if defined(NINFER_DISK_STATE_CACHE_TEST_SEAMS)
+#include "core/disk_state_cache_test_seams.h"
+#endif
 
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -19,6 +23,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace ninfer {
 
@@ -103,7 +108,45 @@ void read_manifest_page_hashes(const std::filesystem::path& path,
     }
 }
 
+// PageIndexRecord::reserved value of a record that retires its page_hash. The pool index is
+// append-only; the last record for a hash wins when the index is loaded.
+constexpr std::uint32_t kPageRecordTombstone = 0x42544F4DU; // "MOTB"
+
 } // namespace
+
+#if defined(NINFER_DISK_STATE_CACHE_TEST_SEAMS)
+namespace test_seams {
+namespace {
+
+std::mutex g_disk_load_hook_mutex;
+std::function<void(DiskLoadPoint, bool)> g_disk_load_hook;
+
+} // namespace
+
+void set_disk_load_hook(std::function<void(DiskLoadPoint point, bool direct_storage)> hook) {
+    std::lock_guard<std::mutex> lock(g_disk_load_hook_mutex);
+    g_disk_load_hook = std::move(hook);
+}
+
+// Runs the installed hook, if any, without holding the hook mutex so the hook may compact.
+static void run_disk_load_hook(DiskLoadPoint point, bool direct_storage) {
+    std::function<void(DiskLoadPoint, bool)> hook;
+    {
+        std::lock_guard<std::mutex> lock(g_disk_load_hook_mutex);
+        hook = g_disk_load_hook;
+    }
+    if (hook) { hook(point, direct_storage); }
+}
+
+} // namespace test_seams
+#endif
+
+bool disk_state_layout_matches(const DiskStateHeader& h, std::uint32_t live_text_page_bytes) noexcept {
+    if (h.text_page_count > 0 && live_text_page_bytes != 0 && h.text_page_bytes != live_text_page_bytes) {
+        return false;
+    }
+    return true;
+}
 
 std::uint64_t DiskStateCache::hash_prompt_prefix(std::span<const TokenId> tokens) {
     return fnv1a_64(tokens.data(), tokens.size_bytes());
@@ -134,24 +177,112 @@ public:
 
     [[nodiscard]] const std::filesystem::path& pool_data_path() const noexcept { return pool_data_path_; }
 
-    void append_missing_pages(std::span<const std::uint64_t> missing_hashes,
-                              std::span<const std::byte> missing_data,
-                              std::uint32_t single_page_bytes) {
+    // Changes whenever the pool file is rewritten or removed, which moves or invalidates offsets.
+    [[nodiscard]] std::uint64_t generation() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return generation_;
+    }
+
+    // Leases `hashes` against compaction and reports which were stored at that moment. A page
+    // stored then stays stored until unpin_pages, unless it is retired as unreadable.
+    [[nodiscard]] std::vector<bool> pin_pages(std::span<const std::uint64_t> hashes) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<bool> stored(hashes.size());
+        for (std::size_t i = 0; i < hashes.size(); ++i) {
+            ++pins_[hashes[i]];
+            if (compacting_) {
+                referenced_while_compacting_.insert(hashes[i]);
+            }
+            stored[i] = page_index_.contains(hashes[i]);
+        }
+        return stored;
+    }
+
+    void unpin_pages(std::span<const std::uint64_t> hashes) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const std::uint64_t hash : hashes) {
+            const auto it = pins_.find(hash);
+            if (it != pins_.end() && --it->second == 0) {
+                pins_.erase(it);
+            }
+        }
+    }
+
+    // Pool bytes a compaction would keep: the stored pages in `referenced` plus every leased one.
+    [[nodiscard]] std::uint64_t retained_bytes(const std::unordered_map<std::uint64_t, std::uint32_t>& referenced) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::uint64_t bytes = 0;
+        for (const auto& [hash, rec] : page_index_) {
+            if (referenced.contains(hash) || pins_.contains(hash)) {
+                bytes += aligned_bytes(rec);
+            }
+        }
+        return bytes;
+    }
+
+    // Pool bytes a compaction would free once nothing references `hashes`: the stored, unleased ones.
+    [[nodiscard]] std::uint64_t releasable_bytes(std::span<const std::uint64_t> hashes) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::uint64_t bytes = 0;
+        for (const std::uint64_t hash : hashes) {
+            const auto it = page_index_.find(hash);
+            if (it != page_index_.end() && !pins_.contains(hash)) {
+                bytes += aligned_bytes(it->second);
+            }
+        }
+        return bytes;
+    }
+
+    // Retires `hashes` and every record whose bytes lie past the end of the pool. Returns
+    // nullopt and retires nothing when the pool was rewritten since `expected_generation`: the
+    // failed read then used offsets that no longer apply.
+    [[nodiscard]] std::optional<std::size_t>
+    drop_unreadable_pages(std::span<const std::uint64_t> hashes, std::uint64_t expected_generation) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (generation_ != expected_generation) {
+            return std::nullopt;
+        }
+        std::vector<std::uint64_t> retired;
+        for (const std::uint64_t hash : hashes) {
+            if (page_index_.contains(hash)) {
+                retired.push_back(hash);
+            }
+        }
+        retire_locked(retired);
+        return retired.size() + drop_records_past_end_locked();
+    }
+
+    // `referenced_hashes` are all pages the snapshot being saved uses. Returns whether every one
+    // of them is stored once the missing ones are appended; its manifest must not be written
+    // otherwise.
+    [[nodiscard]] bool append_missing_pages(std::span<const std::uint64_t> referenced_hashes,
+                                            std::span<const std::uint64_t> missing_hashes,
+                                            std::span<const std::byte> missing_data,
+                                            std::uint32_t single_page_bytes) {
+        std::lock_guard<std::mutex> lock(mutex_);
         if (missing_hashes.empty() || single_page_bytes == 0) {
-            return;
+            return pages_stored_locked(referenced_hashes);
         }
 
-        std::lock_guard<std::mutex> lock(mutex_);
         std::error_code ec;
         std::uint64_t curr_file_size = 0;
         if (std::filesystem::exists(pool_data_path_, ec)) {
             curr_file_size = std::filesystem::file_size(pool_data_path_, ec);
         }
 
+        // A pool that shrank behind the journal's back would take the new pages at offsets that
+        // older records still claim, and those records would then read another page's bytes.
+        if (curr_file_size < known_pool_bytes_) {
+            const std::size_t retired = drop_records_past_end_locked();
+            std::cerr << "[warn] ninfer: [prompt-cache] " << pool_data_path_.filename().string()
+                      << " shrank outside the cache, retired " << retired << " pool page record(s)\n"
+                      << std::flush;
+        }
+
         std::ofstream data_file(pool_data_path_, std::ios::binary | std::ios::app);
         std::ofstream index_file(pool_index_path_, std::ios::binary | std::ios::app);
         if (!data_file.is_open() || !index_file.is_open()) {
-            return;
+            return pages_stored_locked(referenced_hashes);
         }
 
         const std::uint64_t aligned_page_bytes = (static_cast<std::uint64_t>(single_page_bytes) + 4095ULL) & ~4095ULL;
@@ -162,6 +293,9 @@ public:
             const std::uint64_t hash = missing_hashes[i];
             if (page_index_.find(hash) != page_index_.end()) {
                 continue; // Already stored
+            }
+            if ((i + 1) * static_cast<std::size_t>(single_page_bytes) > missing_data.size()) {
+                break; // No bytes for the rest; the check below reports them missing.
             }
 
             const std::uint64_t page_offset = curr_file_size;
@@ -182,10 +316,18 @@ public:
 
             index_file.write(reinterpret_cast<const char*>(&rec), sizeof(rec));
             page_index_[hash] = rec;
+            if (compacting_) {
+                // Stored again after a retirement: the new record, not the retirement, is the latest,
+                // and the compaction must copy it even if it copied the retired bytes already.
+                retired_while_compacting_.erase(hash);
+                referenced_while_compacting_.insert(hash);
+            }
         }
 
         data_file.flush();
         index_file.flush();
+        known_pool_bytes_ = curr_file_size;
+        return pages_stored_locked(referenced_hashes);
     }
 
     struct CompactStats {
@@ -200,7 +342,10 @@ public:
         return page_index_.size();
     }
 
-    CompactStats compact(const std::unordered_set<std::uint64_t>& live_hashes,
+    // Keeps the pages in `collect_live_hashes` and every page leased while the compaction runs.
+    // The collection runs after the leases are recorded, and a save holds its lease until its
+    // manifest is indexed, so each save is either already in the collection or still leased.
+    CompactStats compact(const std::function<std::unordered_set<std::uint64_t>()>& collect_live_hashes,
                          std::size_t min_dead_pages = 256,
                          std::uint64_t min_dead_bytes = 2ULL << 30, // 2 GiB minimum dead space
                          double min_dead_ratio = 0.25,              // 25% minimum fragmentation ratio
@@ -209,13 +354,38 @@ public:
         CompactStats stats{};
         std::error_code ec;
 
+        std::lock_guard<std::mutex> compact_lock(compact_mutex_);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            compacting_ = true;
+            retired_while_compacting_.clear();
+            referenced_while_compacting_.clear();
+            for (const auto& [hash, count] : pins_) {
+                referenced_while_compacting_.insert(hash);
+            }
+        }
+        struct CompactingReset {
+            PageStoreJournal& journal;
+            ~CompactingReset() {
+                std::lock_guard<std::mutex> lock(journal.mutex_);
+                journal.compacting_ = false;
+                journal.retired_while_compacting_.clear();
+                journal.referenced_while_compacting_.clear();
+            }
+        } compacting_reset{*this};
+
+        std::unordered_set<std::uint64_t> live_hashes = collect_live_hashes();
+
         std::unordered_map<std::uint64_t, PageIndexRecord> local_index;
         std::uint64_t old_file_size = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            live_hashes.insert(referenced_while_compacting_.begin(), referenced_while_compacting_.end());
             if (!std::filesystem::exists(pool_data_path_, ec)) {
                 page_index_.clear();
                 std::filesystem::remove(pool_index_path_, ec);
+                known_pool_bytes_ = 0;
+                ++generation_;
                 return stats;
             }
             old_file_size = std::filesystem::file_size(pool_data_path_, ec);
@@ -225,6 +395,8 @@ public:
                 page_index_.clear();
                 std::filesystem::remove(pool_data_path_, ec);
                 std::filesystem::remove(pool_index_path_, ec);
+                known_pool_bytes_ = 0;
+                ++generation_;
                 return stats;
             }
             local_index = page_index_;
@@ -278,18 +450,74 @@ public:
         new_page_index.reserve(live_hashes.size());
         std::uint64_t new_file_size = 0;
         std::vector<char> buffer;
+        // Old pool offset each copied page came from; a page stored again since has a new one.
+        std::unordered_map<std::uint64_t, std::uint64_t> copied_from;
+
+        const auto cancelled = [cancel_token] {
+            return cancel_token && cancel_token->load(std::memory_order_acquire);
+        };
+        // Leaves the old pool and index untouched. Does not take mutex_, so the swap may call it.
+        const auto abandon = [&] {
+            src_data.close();
+            dst_data.close();
+            dst_index.close();
+            std::filesystem::remove(temp_data_path, ec);
+            std::filesystem::remove(temp_index_path, ec);
+            stats.dead_pages_purged   = 0;
+            stats.bytes_freed         = 0;
+            stats.live_pages_retained = local_index.size();
+            return stats;
+        };
+        // Appends the page `old_rec` points to in the old pool; false when its bytes cannot be read.
+        const auto copy_page = [&](const PageIndexRecord& old_rec) {
+            const std::uint64_t aligned_page_bytes =
+                (static_cast<std::uint64_t>(old_rec.page_bytes) + 4095ULL) & ~4095ULL;
+            if (buffer.size() < aligned_page_bytes) {
+                buffer.resize(aligned_page_bytes);
+            }
+
+            src_data.clear(); // A failed read or EOF would otherwise fail every later read.
+            src_data.seekg(static_cast<std::streamoff>(old_rec.file_offset));
+            if (!src_data.read(buffer.data(), static_cast<std::streamsize>(aligned_page_bytes))) {
+                return false;
+            }
+
+            dst_data.write(buffer.data(), static_cast<std::streamsize>(aligned_page_bytes));
+
+            PageIndexRecord new_rec;
+            new_rec.page_hash   = old_rec.page_hash;
+            new_rec.file_offset = new_file_size;
+            new_rec.page_bytes  = old_rec.page_bytes;
+            new_rec.reserved    = 0;
+
+            dst_index.write(reinterpret_cast<const char*>(&new_rec), sizeof(new_rec));
+            new_page_index[old_rec.page_hash] = new_rec;
+            copied_from[old_rec.page_hash] = old_rec.file_offset;
+            new_file_size += aligned_page_bytes;
+            ++stats.live_pages_retained;
+            return true;
+        };
+        // Records leased or stored since the snapshot that the new pool lacks in their current
+        // form: pages appended to the old pool after the snapshot, snapshot pages that looked
+        // dead but a save now depends on, and pages stored again after a retirement.
+        const auto uncopied_references_locked = [&] {
+            std::vector<PageIndexRecord> records;
+            for (const std::uint64_t hash : referenced_while_compacting_) {
+                const auto it = page_index_.find(hash);
+                if (it == page_index_.end()) {
+                    continue;
+                }
+                const auto copied = copied_from.find(hash);
+                if (copied == copied_from.end() || copied->second != it->second.file_offset) {
+                    records.push_back(it->second);
+                }
+            }
+            return records;
+        };
 
         for (const auto& [hash, old_rec] : local_index) {
-            if (cancel_token && cancel_token->load(std::memory_order_acquire)) {
-                src_data.close();
-                dst_data.close();
-                dst_index.close();
-                std::filesystem::remove(temp_data_path, ec);
-                std::filesystem::remove(temp_index_path, ec);
-                stats.dead_pages_purged = 0;
-                stats.bytes_freed       = 0;
-                stats.live_pages_retained = local_index.size();
-                return stats;
+            if (cancelled()) {
+                return abandon();
             }
 
             if (!live_hashes.contains(hash)) {
@@ -297,55 +525,84 @@ public:
                 continue;
             }
 
-            const std::uint64_t aligned_page_bytes =
-                (static_cast<std::uint64_t>(old_rec.page_bytes) + 4095ULL) & ~4095ULL;
-            if (buffer.size() < aligned_page_bytes) {
-                buffer.resize(aligned_page_bytes);
-            }
-
-            src_data.seekg(static_cast<std::streamoff>(old_rec.file_offset));
-            if (!src_data.read(buffer.data(), static_cast<std::streamsize>(aligned_page_bytes))) {
-                continue;
-            }
-
-            dst_data.write(buffer.data(), static_cast<std::streamsize>(aligned_page_bytes));
-
-            PageIndexRecord new_rec;
-            new_rec.page_hash   = hash;
-            new_rec.file_offset = new_file_size;
-            new_rec.page_bytes  = old_rec.page_bytes;
-            new_rec.reserved    = 0;
-
-            dst_index.write(reinterpret_cast<const char*>(&new_rec), sizeof(new_rec));
-            new_page_index[hash] = new_rec;
-            new_file_size += aligned_page_bytes;
-            ++stats.live_pages_retained;
+            copy_page(old_rec);
         }
 
-        dst_data.flush();
-        dst_index.flush();
-        src_data.close();
-        dst_data.close();
-        dst_index.close();
+        if (cancelled()) {
+            return abandon();
+        }
 
-        if (cancel_token && cancel_token->load(std::memory_order_acquire)) {
-            std::filesystem::remove(temp_data_path, ec);
-            std::filesystem::remove(temp_index_path, ec);
-            stats.dead_pages_purged = 0;
-            stats.bytes_freed       = 0;
-            stats.live_pages_retained = local_index.size();
-            return stats;
+        // Most pages saved during the copy are carried over here without the lock; the swap below
+        // copies the few saved after this pass, so no append can land in the old files unseen.
+        std::vector<PageIndexRecord> carried_over;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            carried_over = uncopied_references_locked();
+        }
+        for (const auto& rec : carried_over) {
+            if (!copy_page(rec)) {
+                return abandon();
+            }
+        }
+
+        if (cancelled()) {
+            return abandon();
         }
 
         // Atomic swap under journal lock
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            std::filesystem::remove(pool_data_path_, ec);
+            for (const auto& rec : uncopied_references_locked()) {
+                if (!copy_page(rec)) {
+                    return abandon();
+                }
+            }
+            dst_data.flush();
+            dst_index.flush();
+            const bool written = dst_data.good() && dst_index.good();
+            src_data.close();
+            dst_data.close();
+            dst_index.close();
+            if (!written) {
+                return abandon();
+            }
+
+            // rename replaces the destination in one step, so the old pool stays whole until the
+            // new one takes its name. Removing first lost the pool when the process stopped
+            // between the two calls, and removing a pool a restore still had open left its name
+            // pending deletion, so the rename failed and the new index described a missing file.
             std::filesystem::rename(temp_data_path, pool_data_path_, ec);
-            std::filesystem::remove(pool_index_path_, ec);
+            if (ec) {
+                return abandon();
+            }
+            // The pool is swapped, so the new index must take effect even if its rename fails;
+            // a leftover index temporary alone is promoted by load_index on the next start.
             std::filesystem::rename(temp_index_path, pool_index_path_, ec);
+            if (ec) {
+                std::ofstream index_file(pool_index_path_, std::ios::binary | std::ios::trunc);
+                for (const auto& [hash, rec] : new_page_index) {
+                    index_file.write(reinterpret_cast<const char*>(&rec), sizeof(rec));
+                }
+                index_file.flush();
+                if (index_file.good()) {
+                    std::filesystem::remove(temp_index_path, ec);
+                }
+            }
 
             page_index_ = std::move(new_page_index);
+            known_pool_bytes_ = new_file_size;
+            ++generation_;
+
+            // Pages retired while the copy ran came from the old index snapshot and may have
+            // been copied into the new files; retire them again against the new index.
+            compacting_ = false;
+            const std::vector<std::uint64_t> retired(retired_while_compacting_.begin(),
+                                                     retired_while_compacting_.end());
+            retired_while_compacting_.clear();
+            for (const std::uint64_t hash : retired) {
+                page_index_.erase(hash);
+            }
+            append_tombstones_locked(retired);
         }
 
         stats.bytes_freed = (old_file_size > new_file_size) ? (old_file_size - new_file_size) : 0;
@@ -358,21 +615,141 @@ private:
     void load_index() {
         std::lock_guard<std::mutex> lock(mutex_);
         page_index_.clear();
-        std::ifstream index_file(pool_index_path_, std::ios::binary);
+        recover_interrupted_swap_locked();
+        {
+            std::ifstream index_file(pool_index_path_, std::ios::binary);
+            if (!index_file.is_open()) {
+                return;
+            }
+
+            PageIndexRecord rec;
+            while (index_file.read(reinterpret_cast<char*>(&rec), sizeof(rec))) {
+                if (rec.reserved == kPageRecordTombstone) {
+                    page_index_.erase(rec.page_hash);
+                } else {
+                    page_index_[rec.page_hash] = rec;
+                }
+            }
+        }
+
+        // A pool shorter than its index (truncated or replaced while the process was down) leaves
+        // records whose bytes are gone. The manifests referencing them are then removed by
+        // scan_cache_dir.
+        const std::size_t retired = drop_records_past_end_locked();
+        if (retired > 0) {
+            std::cout << "[info] ninfer: [prompt-cache] retired " << retired
+                      << " pool page record(s) past the end of " << pool_data_path_.filename().string() << "\n"
+                      << std::flush;
+        }
+    }
+
+    // A compaction closes both temporaries, renames the pool, then renames the index. Only the
+    // index temporary left means it stopped between the renames and that index belongs to the
+    // pool on disk. No pool but both temporaries means a build that removed the pool before
+    // renaming stopped in between; its temporaries were complete. Anything else left over is a
+    // copy that never reached the swap, and the old pair is intact.
+    void recover_interrupted_swap_locked() {
+        const std::filesystem::path temp_data_path  = pool_data_path_.string() + ".tmp";
+        const std::filesystem::path temp_index_path = pool_index_path_.string() + ".tmp";
+        std::error_code ec;
+        const bool pool       = std::filesystem::exists(pool_data_path_, ec);
+        const bool temp_data  = std::filesystem::exists(temp_data_path, ec);
+        const bool temp_index = std::filesystem::exists(temp_index_path, ec);
+        if (!temp_data && !temp_index) {
+            return;
+        }
+        bool promoted = false;
+        if (temp_index && (!temp_data || !pool)) {
+            if (temp_data) {
+                std::filesystem::rename(temp_data_path, pool_data_path_, ec);
+            }
+            if (!ec) {
+                std::filesystem::rename(temp_index_path, pool_index_path_, ec);
+                promoted = !ec;
+            }
+        }
+        std::filesystem::remove(temp_data_path, ec);
+        std::filesystem::remove(temp_index_path, ec);
+        std::cout << "[info] ninfer: [prompt-cache] "
+                  << (promoted ? "finished" : "discarded") << " an interrupted page pool compaction\n"
+                  << std::flush;
+    }
+
+    // Later appends reuse the offsets past the end of a shortened pool, so these records are
+    // retired on disk, not only in memory.
+    std::size_t drop_records_past_end_locked() {
+        std::error_code ec;
+        std::uint64_t pool_bytes = std::filesystem::file_size(pool_data_path_, ec);
+        if (ec) {
+            if (std::filesystem::exists(pool_data_path_, ec) || ec) {
+                return 0; // Present but not measurable right now.
+            }
+            pool_bytes = 0;
+        }
+        known_pool_bytes_ = pool_bytes;
+        std::vector<std::uint64_t> past_end;
+        for (const auto& [hash, rec] : page_index_) {
+            if (rec.file_offset + rec.page_bytes > pool_bytes) {
+                past_end.push_back(hash);
+            }
+        }
+        retire_locked(past_end);
+        return past_end.size();
+    }
+
+    [[nodiscard]] static std::uint64_t aligned_bytes(const PageIndexRecord& rec) noexcept {
+        return (static_cast<std::uint64_t>(rec.page_bytes) + 4095ULL) & ~4095ULL;
+    }
+
+    [[nodiscard]] bool pages_stored_locked(std::span<const std::uint64_t> hashes) const {
+        return std::all_of(hashes.begin(), hashes.end(),
+                           [this](std::uint64_t hash) { return page_index_.contains(hash); });
+    }
+
+    void retire_locked(std::span<const std::uint64_t> hashes) {
+        for (const std::uint64_t hash : hashes) {
+            page_index_.erase(hash);
+            if (compacting_) {
+                retired_while_compacting_.insert(hash);
+                referenced_while_compacting_.erase(hash);
+            }
+        }
+        append_tombstones_locked(hashes);
+    }
+
+    void append_tombstones_locked(std::span<const std::uint64_t> hashes) {
+        if (hashes.empty()) {
+            return;
+        }
+        std::ofstream index_file(pool_index_path_, std::ios::binary | std::ios::app);
         if (!index_file.is_open()) {
             return;
         }
-
-        PageIndexRecord rec;
-        while (index_file.read(reinterpret_cast<char*>(&rec), sizeof(rec))) {
-            page_index_[rec.page_hash] = rec;
+        for (const std::uint64_t hash : hashes) {
+            PageIndexRecord rec;
+            rec.page_hash = hash;
+            rec.reserved  = kPageRecordTombstone;
+            index_file.write(reinterpret_cast<const char*>(&rec), sizeof(rec));
         }
+        index_file.flush();
     }
 
     std::filesystem::path pool_data_path_;
     std::filesystem::path pool_index_path_;
     mutable std::mutex mutex_;
+    // Held for a whole compaction: two would share the temporary files and swap each other's pools.
+    std::mutex compact_mutex_;
     std::unordered_map<std::uint64_t, PageIndexRecord> page_index_;
+    std::uint64_t generation_ = 0;
+    // Pool size as of the journal's last write or measurement; a smaller file means truncation.
+    std::uint64_t known_pool_bytes_ = 0;
+    bool compacting_          = false;
+    std::unordered_set<std::uint64_t> retired_while_compacting_;
+    // Pages leased or stored while a compaction ran; disjoint from retired_while_compacting_, the
+    // later event for a hash wins.
+    std::unordered_set<std::uint64_t> referenced_while_compacting_;
+    // Lease count per page hash, see pin_pages.
+    std::unordered_map<std::uint64_t, std::uint32_t> pins_;
 };
 
 struct QueuedSaveTask {
@@ -386,6 +763,8 @@ struct QueuedSaveTask {
     std::vector<std::byte> gdn_state;
     std::vector<std::byte> mtp_kv_payload;
     std::vector<std::byte> tail_hidden;
+    // Held until the manifest is indexed or the task is dropped.
+    DiskStateCache::PageLease lease;
 };
 
 class DiskStateCache::Impl {
@@ -417,6 +796,18 @@ public:
 
     [[nodiscard]] bool has_page(std::uint64_t page_hash) const {
         return journal_.has_page(page_hash);
+    }
+
+    [[nodiscard]] PageLease lease_pages(std::span<const std::uint64_t> page_hashes) {
+        PageLease lease;
+        lease.stored_ = journal_.pin_pages(page_hashes);
+        lease.hashes_.assign(page_hashes.begin(), page_hashes.end());
+        lease.owner_ = this;
+        return lease;
+    }
+
+    void unpin_pages(std::span<const std::uint64_t> page_hashes) {
+        journal_.unpin_pages(page_hashes);
     }
 
     [[nodiscard]] std::optional<DiskStateMatch>
@@ -453,98 +844,16 @@ public:
                                      std::vector<std::byte>& out_text_kv_payload,
                                      std::vector<std::byte>& out_mtp_kv_payload,
                                      std::vector<std::byte>& out_tail_hidden) {
-        std::error_code ec;
-        const auto file_size = std::filesystem::file_size(path, ec);
-        if (ec) { return false; }
-
-        std::ifstream file(path, std::ios::binary);
-        if (!file.is_open()) { return false; }
-
-        DiskStateHeader header;
-        file.read(reinterpret_cast<char*>(&header), sizeof(header));
-        if (!file || !is_valid_header(header, file_size)) {
-            return false;
+        const std::uint64_t journal_generation = journal_.generation();
+        LoadFailure failure;
+        bool ok = load_snapshot_host(path, out_header, out_tokens, out_gdn_state, out_text_kv_payload,
+                                     out_mtp_kv_payload, out_tail_hidden, failure);
+        // A compaction after the capture may have moved the pool under the page reads.
+        if (ok && journal_.generation() != journal_generation) {
+            ok = fail(failure, LoadFault::Transient, "page pool compacted during the load");
         }
-
-        out_header = header;
-        out_tokens.resize(header.token_count);
-        if (header.token_count > 0) {
-            file.read(reinterpret_cast<char*>(out_tokens.data()), header.token_count * sizeof(TokenId));
-        }
-
-        std::vector<std::uint64_t> page_hashes(header.text_page_count);
-        if (header.text_page_count > 0) {
-            file.read(reinterpret_cast<char*>(page_hashes.data()), header.text_page_count * sizeof(std::uint64_t));
-        }
-
-        const auto t_load_0 = std::chrono::steady_clock::now();
-
-        // 1. Read Text KV pages from shared pool_data.ninfer_pages
-        out_text_kv_payload.resize(header.text_page_count * header.text_page_bytes);
-        if (header.text_page_count > 0 && header.text_page_bytes > 0) {
-            std::ifstream pool_file(journal_.pool_data_path(), std::ios::binary);
-            if (!pool_file.is_open()) { return false; }
-
-            for (std::uint32_t i = 0; i < header.text_page_count; ++i) {
-                auto page_rec = journal_.get_page(page_hashes[i]);
-                if (!page_rec) { return false; }
-
-                pool_file.seekg(static_cast<std::streamoff>(page_rec->file_offset));
-                pool_file.read(reinterpret_cast<char*>(out_text_kv_payload.data() + i * header.text_page_bytes),
-                               header.text_page_bytes);
-                if (!pool_file) { return false; }
-            }
-        }
-
-        // 2. Read GDN state, MTP KV, tail hidden from manifest file
-        const std::uint64_t raw_header_bytes = sizeof(DiskStateHeader) +
-                                             static_cast<std::uint64_t>(header.token_count) * sizeof(TokenId) +
-                                             static_cast<std::uint64_t>(header.text_page_count) * sizeof(std::uint64_t);
-        const std::uint64_t payload_offset = header.payload_offset_bytes != 0
-            ? static_cast<std::uint64_t>(header.payload_offset_bytes)
-            : ((raw_header_bytes + 4095ULL) & ~4095ULL);
-        file.seekg(static_cast<std::streamoff>(payload_offset));
-
-        out_gdn_state.resize(header.gdn_state_bytes);
-        if (header.gdn_state_bytes > 0) {
-            file.read(reinterpret_cast<char*>(out_gdn_state.data()), header.gdn_state_bytes);
-        }
-
-        out_mtp_kv_payload.resize(header.mtp_kv_bytes);
-        if (header.mtp_kv_bytes > 0) {
-            file.read(reinterpret_cast<char*>(out_mtp_kv_payload.data()), header.mtp_kv_bytes);
-        }
-
-        out_tail_hidden.resize(header.tail_hidden_bytes);
-        if (header.tail_hidden_bytes > 0) {
-            file.read(reinterpret_cast<char*>(out_tail_hidden.data()), header.tail_hidden_bytes);
-        }
-
-        if (!file) { return false; }
-
-        if (header.checksum != 0) {
-            Fnv1aHasher hasher;
-            hasher.update(out_gdn_state.data(), out_gdn_state.size());
-            hasher.update(out_mtp_kv_payload.data(), out_mtp_kv_payload.size());
-            hasher.update(out_tail_hidden.data(), out_tail_hidden.size());
-            const std::uint64_t actual_checksum = hasher.finalize();
-            if (actual_checksum != header.checksum) {
-                std::cerr << "[warn] ninfer: [prompt-cache] checksum mismatch on " << path.filename().string()
-                          << " (expected 0x" << std::hex << header.checksum
-                          << ", actual 0x" << actual_checksum << std::dec << ")\n";
-                return false;
-            }
-        }
-
-        const auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_load_0).count();
-        const std::size_t total_payload_bytes = out_text_kv_payload.size() + out_gdn_state.size() +
-                                              out_mtp_kv_payload.size() + out_tail_hidden.size();
-        const double raw_mb = static_cast<double>(total_payload_bytes) / (1024.0 * 1024.0);
-        std::cout << "[info] ninfer: [prompt-cache] restored " << header.token_count
-                  << " tokens from disk (" << std::fixed << std::setprecision(1) << raw_mb
-                  << "MB in " << load_ms << "ms)\n" << std::flush;
-
-        return file.good() || file.eof();
+        if (!ok) { discard_after_failed_load(path, failure, journal_generation); }
+        return ok;
     }
 
 #if defined(_WIN32)
@@ -552,66 +861,28 @@ public:
                                                     DiskStateHeader& out_header,
                                                     std::vector<TokenId>& out_tokens,
                                                     cudaStream_t stream,
-                                                    void*& out_d_staging_ptr,
-                                                    std::size_t& out_text_bytes) {
-        std::error_code ec;
-        const auto file_size = std::filesystem::file_size(path, ec);
-        if (ec) { return false; }
-
-        std::ifstream file(path, std::ios::binary);
-        if (!file.is_open()) { return false; }
-
-        DiskStateHeader header;
-        file.read(reinterpret_cast<char*>(&header), sizeof(header));
-        if (!file || !is_valid_header(header, file_size)) {
-            return false;
+                                                    std::span<const std::uint64_t> gdn_unit_bytes,
+                                                    const DirectStorageRestoreConsumer& consumer,
+                                                    std::uint32_t expected_text_page_bytes) {
+        const std::uint64_t journal_generation = journal_.generation();
+        LoadFailure failure;
+        bool ok = load_snapshot_ds(path, out_header, out_tokens, stream, gdn_unit_bytes, consumer,
+                                   expected_text_page_bytes, failure);
+        // The consumer has already written the pages; a compaction since the capture makes them suspect.
+        if (ok && journal_.generation() != journal_generation) {
+            ok = fail(failure, LoadFault::Transient, "page pool compacted during the load");
         }
-
-        out_header = header;
-        out_tokens.resize(header.token_count);
-        if (header.token_count > 0) {
-            file.read(reinterpret_cast<char*>(out_tokens.data()), header.token_count * sizeof(TokenId));
-        }
-
-        std::vector<std::uint64_t> page_hashes(header.text_page_count);
-        if (header.text_page_count > 0) {
-            file.read(reinterpret_cast<char*>(page_hashes.data()), header.text_page_count * sizeof(std::uint64_t));
-        }
-        if (!file) { return false; }
-
-        std::vector<core::PageRestoreEntry> text_pages;
-        text_pages.reserve(header.text_page_count);
-        for (std::uint64_t phash : page_hashes) {
-            auto page_rec = journal_.get_page(phash);
-            if (!page_rec) {
-                return false; // Incomplete journal
-            }
-            text_pages.push_back({page_rec->file_offset, page_rec->page_bytes});
-        }
-
-        if (!core::DirectStorageEngine::instance().available()) {
-            return false;
-        }
-
-        const std::uint64_t manifest_payload_bytes = header.gdn_state_bytes + header.mtp_kv_bytes + header.tail_hidden_bytes;
-        const auto t_load_0 = std::chrono::steady_clock::now();
-
-        const bool ok = core::DirectStorageEngine::instance().restore_snapshot_cow(
-            journal_.pool_data_path(), text_pages, path, header.payload_offset_bytes,
-            manifest_payload_bytes, stream, out_d_staging_ptr, out_text_bytes
-        );
-        if (!ok) { return false; }
-
-        const auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_load_0).count();
-        const std::size_t total_payload_bytes = header.text_page_count * header.text_page_bytes + manifest_payload_bytes;
-        const double raw_mb = static_cast<double>(total_payload_bytes) / (1024.0 * 1024.0);
-        std::cout << "[info] ninfer: [prompt-cache] directstorage restored " << header.token_count
-                  << " tokens into VRAM (" << std::fixed << std::setprecision(1) << raw_mb
-                  << "MB in " << load_ms << "ms)\n" << std::flush;
-
-        return true;
+        if (!ok) { discard_after_failed_load(path, failure, journal_generation); }
+        return ok;
     }
 #endif
+
+    void discard_snapshot(const std::filesystem::path& path, const char* reason) {
+        LoadFailure failure;
+        failure.kind   = LoadFault::Manifest;
+        failure.reason = reason;
+        discard_after_failed_load(path, failure, journal_.generation());
+    }
 
     void enqueue_save_cow(std::uint64_t model_hash,
                           std::vector<TokenId> tokens,
@@ -624,8 +895,15 @@ public:
                           std::uint32_t single_page_bytes,
                           std::vector<std::byte> mtp_kv_payload,
                           std::uint32_t mtp_page_count,
-                          std::vector<std::byte> tail_hidden) {
+                          std::vector<std::byte> tail_hidden,
+                          PageLease lease) {
         if (!config_.enabled || tokens.empty()) { return; }
+
+        // Pages lost before this point make the writer skip the save; a lease over other pages
+        // protects nothing, so the save leases its own from here on.
+        if (lease.owner_ != this || !std::ranges::equal(lease.hashes_, all_page_hashes)) {
+            lease = lease_pages(all_page_hashes);
+        }
 
         const std::uint64_t prompt_hash = hash_prompt_prefix(tokens);
         const std::string timestamp_str = current_utc_timestamp_compact();
@@ -673,16 +951,29 @@ public:
         task.gdn_state                       = std::move(gdn_state);
         task.mtp_kv_payload                  = std::move(mtp_kv_payload);
         task.tail_hidden                     = std::move(tail_hidden);
+        task.lease                           = std::move(lease);
 
         constexpr std::size_t kMaxQueuedTasks = 8;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            for (const auto& [path, header] : index_) {
-                if (header.model_hash == task.header.model_hash &&
-                    header.prompt_hash == task.header.prompt_hash &&
-                    header.token_count == task.header.token_count) {
+            for (auto it = index_.begin(); it != index_.end(); ++it) {
+                const auto& [path, header] = *it;
+                if (header.model_hash != task.header.model_hash ||
+                    header.prompt_hash != task.header.prompt_hash ||
+                    header.token_count != task.header.token_count) {
+                    continue;
+                }
+                if (manifest_pages_stored(path, header)) {
                     return;
                 }
+                // The duplicate lost pages it references (a retired or compacted-away record) and
+                // would only fail its next load; the new save replaces it instead of being skipped.
+                std::error_code ec;
+                std::filesystem::remove(path, ec);
+                std::cerr << "[warn] ninfer: [prompt-cache] replacing snapshot " << path.filename().string()
+                          << " whose pool pages are gone\n" << std::flush;
+                index_.erase(it);
+                break;
             }
 
             if (pending_hashes_.contains({task.header.prompt_hash, task.header.token_count})) {
@@ -718,16 +1009,17 @@ public:
 
         std::vector<std::uint64_t> all_page_hashes;
         all_page_hashes.reserve(text_page_count);
-        std::vector<std::uint64_t> missing_page_hashes;
-        std::vector<std::byte> missing_pages_data;
-
         for (std::uint32_t i = 0; i < text_page_count; ++i) {
             const std::size_t span_end = std::min<std::size_t>(tokens.size(), static_cast<std::size_t>(i + 1) * 64);
-            const std::uint64_t phash = hash_prompt_prefix(std::span<const TokenId>(tokens.data(), span_end));
-            all_page_hashes.push_back(phash);
+            all_page_hashes.push_back(hash_prompt_prefix(std::span<const TokenId>(tokens.data(), span_end)));
+        }
 
-            if (!journal_.has_page(phash) && single_page_bytes > 0) {
-                missing_page_hashes.push_back(phash);
+        auto lease = lease_pages(all_page_hashes);
+        std::vector<std::uint64_t> missing_page_hashes;
+        std::vector<std::byte> missing_pages_data;
+        for (std::uint32_t i = 0; i < text_page_count; ++i) {
+            if (!lease.stored(i) && single_page_bytes > 0) {
+                missing_page_hashes.push_back(all_page_hashes[i]);
                 const std::size_t offset = i * single_page_bytes;
                 missing_pages_data.insert(missing_pages_data.end(),
                                           text_kv_payload.begin() + offset,
@@ -739,7 +1031,7 @@ public:
                          std::move(gdn_state), std::move(all_page_hashes),
                          std::move(missing_page_hashes), std::move(missing_pages_data),
                          single_page_bytes, std::move(mtp_kv_payload),
-                         mtp_page_count, std::move(tail_hidden));
+                         mtp_page_count, std::move(tail_hidden), std::move(lease));
     }
 
     void enqueue_save(std::uint64_t model_hash,
@@ -763,15 +1055,15 @@ public:
     }
 
     void prune_lru() {
-        std::unordered_set<std::uint64_t> live_hashes;
         std::size_t evicted_count = 0;
         std::uint64_t evicted_bytes = 0;
+        std::uint64_t released_page_bytes = 0;
         std::uint64_t pool_bytes = 0;
         bool should_compact = false;
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            std::uint64_t total_bytes = 0;
+            std::uint64_t manifest_bytes = 0;
             std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> entries;
 
             std::error_code ec;
@@ -779,14 +1071,13 @@ public:
             for (const auto& entry : std::filesystem::directory_iterator(manifest_dir, ec)) {
                 if (entry.is_regular_file() && entry.path().extension() == ".ninfer_manifest") {
                     const auto sz = entry.file_size(ec);
-                    total_bytes += sz;
+                    manifest_bytes += sz;
                     entries.emplace_back(entry.last_write_time(ec), entry.path());
                 }
             }
 
             if (std::filesystem::exists(journal_.pool_data_path(), ec)) {
                 pool_bytes = std::filesystem::file_size(journal_.pool_data_path(), ec);
-                total_bytes += pool_bytes;
             }
 
             // High Watermark: 100% of max_cache_bytes
@@ -794,33 +1085,61 @@ public:
             const std::uint64_t high_watermark = config_.max_cache_bytes;
             const std::uint64_t low_watermark  = config_.max_cache_bytes * 3 / 4;
 
-            if (total_bytes > high_watermark) {
+            if (manifest_bytes + pool_bytes > high_watermark && entries.size() > 1) {
+                // Evicting a manifest shrinks the pool only through the compaction below, and only by
+                // the pages no remaining snapshot or lease references. Eviction therefore stops on
+                // the size that compaction would leave, not on the pool file as it is now: that file
+                // alone can exceed the low watermark and would otherwise take every manifest with it.
+                std::map<std::filesystem::path, std::vector<std::uint64_t>> manifest_pages;
+                std::unordered_map<std::uint64_t, std::uint32_t> page_refs;
+                for (const auto& [path, header] : index_) {
+                    std::unordered_set<std::uint64_t> hashes;
+                    read_manifest_page_hashes(path, header, hashes);
+                    for (const std::uint64_t hash : hashes) {
+                        ++page_refs[hash];
+                    }
+                    manifest_pages.emplace(path, std::vector<std::uint64_t>(hashes.begin(), hashes.end()));
+                }
+                std::uint64_t projected_bytes = manifest_bytes + journal_.retained_bytes(page_refs);
+
                 std::sort(entries.begin(), entries.end()); // Oldest first
-                for (const auto& [time, path] : entries) {
-                    if (total_bytes <= low_watermark) { break; }
+                // The newest manifest is kept: it is normally the snapshot the writer just saved.
+                for (std::size_t i = 0; i + 1 < entries.size() && projected_bytes > low_watermark; ++i) {
+                    const auto& path = entries[i].second;
                     const auto sz = std::filesystem::file_size(path, ec);
-                    std::filesystem::remove(path, ec);
-                    total_bytes -= sz;
+                    if (ec || !std::filesystem::remove(path, ec)) { continue; }
+                    projected_bytes -= std::min(projected_bytes, sz);
                     evicted_bytes += sz;
                     ++evicted_count;
                     index_.erase(path);
+
+                    const auto pages = manifest_pages.find(path);
+                    if (pages == manifest_pages.end()) { continue; }
+                    std::vector<std::uint64_t> released;
+                    for (const std::uint64_t hash : pages->second) {
+                        const auto ref = page_refs.find(hash);
+                        if (--ref->second == 0) {
+                            page_refs.erase(ref);
+                            released.push_back(hash);
+                        }
+                    }
+                    const std::uint64_t freed = journal_.releasable_bytes(released);
+                    projected_bytes -= std::min(projected_bytes, freed);
+                    released_page_bytes += freed;
                 }
             }
 
-            if (evicted_count > 0 || pool_bytes > (config_.max_cache_bytes * 4 / 10)) {
-                should_compact = true;
-                for (const auto& [manifest_path, header] : index_) {
-                    read_manifest_page_hashes(manifest_path, header, live_hashes);
-                }
-            }
+            should_compact = evicted_count > 0 || pool_bytes > (config_.max_cache_bytes * 4 / 10);
         } // mutex_ released here: <1ms hold time
 
         if (evicted_count > 0) {
             const double evicted_mb = static_cast<double>(evicted_bytes) / (1024.0 * 1024.0);
+            const double released_mb = static_cast<double>(released_page_bytes) / (1024.0 * 1024.0);
             const double limit_gb = static_cast<double>(config_.max_cache_bytes) / (1024.0 * 1024.0 * 1024.0);
             std::cout << "[info] ninfer: [prompt-cache] LRU bulk evicted " << evicted_count
                       << " manifest(s) (" << std::fixed << std::setprecision(1) << evicted_mb
-                      << "MB freed, limit=" << limit_gb << "GB)\n" << std::flush;
+                      << "MB freed, " << released_mb << "MB of pool pages unreferenced, limit="
+                      << limit_gb << "GB)\n" << std::flush;
         }
 
         // Perform Mark-and-Sweep compaction only if dead space >= 2.0 GiB AND fragmentation >= 25%
@@ -828,7 +1147,8 @@ public:
             constexpr std::size_t kMinDeadPages = 256;
             constexpr std::uint64_t kMinDeadBytes = 2ULL << 30; // 2 GiB
             constexpr double kMinDeadRatio = 0.25;               // 25% fragmentation
-            const auto stats = journal_.compact(live_hashes, kMinDeadPages, kMinDeadBytes, kMinDeadRatio,
+            const auto stats = journal_.compact([this] { return collect_live_page_hashes(); },
+                                               kMinDeadPages, kMinDeadBytes, kMinDeadRatio,
                                                /*force=*/false, &cancel_requested_);
             if (stats.dead_pages_purged > 0) {
                 const double freed_mb = static_cast<double>(stats.bytes_freed) / (1024.0 * 1024.0);
@@ -842,19 +1162,23 @@ public:
         }
     }
 
-    void compact_pool(bool force = true) {
+    // Pages of indexed manifests. Saves not indexed yet keep theirs through their leases.
+    [[nodiscard]] std::unordered_set<std::uint64_t> collect_live_page_hashes() const {
         std::unordered_set<std::uint64_t> live_hashes;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            for (const auto& [manifest_path, header] : index_) {
-                read_manifest_page_hashes(manifest_path, header, live_hashes);
-            }
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [manifest_path, header] : index_) {
+            read_manifest_page_hashes(manifest_path, header, live_hashes);
         }
+        return live_hashes;
+    }
+
+    void compact_pool(bool force = true) {
         const std::size_t min_dead_pages   = force ? 1 : 256;
         const std::uint64_t min_dead_bytes = force ? 0 : (2ULL << 30);
         const double min_dead_ratio        = force ? 0.0 : 0.25;
-        const auto stats = journal_.compact(live_hashes, min_dead_pages, min_dead_bytes,
-                                           min_dead_ratio, force, &cancel_requested_);
+        const auto stats = journal_.compact([this] { return collect_live_page_hashes(); },
+                                           min_dead_pages, min_dead_bytes, min_dead_ratio,
+                                           force, &cancel_requested_);
         if (stats.dead_pages_purged > 0) {
             const double freed_mb = static_cast<double>(stats.bytes_freed) / (1024.0 * 1024.0);
             std::cout << "[info] ninfer: [prompt-cache] compacted page pool: purged "
@@ -884,6 +1208,381 @@ public:
     }
 
 private:
+    enum class LoadFault : std::uint8_t {
+        None,
+        Transient, // The files are not implicated; keep the snapshot.
+        Manifest,  // The manifest is unusable; its pool pages are intact.
+        Pages,     // Pool bytes the manifest references could not be read.
+    };
+
+    struct LoadFailure {
+        LoadFault kind     = LoadFault::None;
+        const char* reason = "";
+        // Page records to retire for LoadFault::Pages, on top of every record past the pool's end.
+        std::vector<std::uint64_t> pages;
+    };
+
+    [[nodiscard]] bool manifest_pages_stored(const std::filesystem::path& path, const DiskStateHeader& header) const {
+        if (header.text_page_count == 0) { return true; }
+        std::unordered_set<std::uint64_t> hashes;
+        read_manifest_page_hashes(path, header, hashes);
+        if (hashes.empty()) { return false; } // Page list unreadable
+        return std::all_of(hashes.begin(), hashes.end(),
+                           [this](std::uint64_t hash) { return journal_.has_page(hash); });
+    }
+
+    static bool fail(LoadFailure& failure, LoadFault kind, const char* reason) {
+        failure.kind   = kind;
+        failure.reason = reason;
+        return false;
+    }
+
+    // Distinguishes a file that is gone from one that is present but not accessible right now.
+    [[nodiscard]] static bool file_missing(const std::filesystem::path& path) {
+        std::error_code ec;
+        return !std::filesystem::exists(path, ec) && !ec;
+    }
+
+    // Resolves the manifest's page records and checks that their bytes lie inside the pool
+    // file, so a truncated pool is diagnosed before any read is issued. Records are fetched
+    // before the pool is measured: a record becomes visible only after its bytes are flushed.
+    [[nodiscard]] bool resolve_pages(std::span<const std::uint64_t> page_hashes, std::uint32_t page_bytes,
+                                     std::vector<PageIndexRecord>& out_records, LoadFailure& failure) const {
+        out_records.clear();
+        out_records.reserve(page_hashes.size());
+        for (const std::uint64_t hash : page_hashes) {
+            const auto rec = journal_.get_page(hash);
+            if (!rec) { return fail(failure, LoadFault::Manifest, "page missing from pool index"); }
+            if (rec->page_bytes != page_bytes) {
+                return fail(failure, LoadFault::Manifest, "pool page geometry disagrees with the header");
+            }
+            out_records.push_back(*rec);
+        }
+        if (out_records.empty()) { return true; }
+
+        std::error_code ec;
+        const std::uint64_t pool_bytes = std::filesystem::file_size(journal_.pool_data_path(), ec);
+        if (ec) {
+            return file_missing(journal_.pool_data_path())
+                ? fail(failure, LoadFault::Pages, "page pool file missing")
+                : fail(failure, LoadFault::Transient, "page pool file not accessible");
+        }
+        for (const auto& rec : out_records) {
+            if (rec.file_offset + rec.page_bytes > pool_bytes) {
+                return fail(failure, LoadFault::Pages, "page pool shorter than its index");
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool load_snapshot_host(const std::filesystem::path& path,
+                                          DiskStateHeader& out_header,
+                                          std::vector<TokenId>& out_tokens,
+                                          std::vector<std::byte>& out_gdn_state,
+                                          std::vector<std::byte>& out_text_kv_payload,
+                                          std::vector<std::byte>& out_mtp_kv_payload,
+                                          std::vector<std::byte>& out_tail_hidden,
+                                          LoadFailure& failure) {
+        std::error_code ec;
+        const auto file_size = std::filesystem::file_size(path, ec);
+        if (ec) {
+            return file_missing(path) ? fail(failure, LoadFault::Manifest, "manifest missing")
+                                      : fail(failure, LoadFault::Transient, "manifest not accessible");
+        }
+
+        std::ifstream file(path, std::ios::binary);
+        if (!file.is_open()) { return fail(failure, LoadFault::Transient, "manifest could not be opened"); }
+
+        DiskStateHeader header;
+        file.read(reinterpret_cast<char*>(&header), sizeof(header));
+        if (!file || !is_valid_header(header, file_size)) {
+            return fail(failure, LoadFault::Manifest, "invalid or short manifest");
+        }
+
+        out_header = header;
+        out_tokens.resize(header.token_count);
+        if (header.token_count > 0) {
+            file.read(reinterpret_cast<char*>(out_tokens.data()), header.token_count * sizeof(TokenId));
+        }
+
+        std::vector<std::uint64_t> page_hashes(header.text_page_count);
+        if (header.text_page_count > 0) {
+            file.read(reinterpret_cast<char*>(page_hashes.data()), header.text_page_count * sizeof(std::uint64_t));
+        }
+        if (!file) { return fail(failure, LoadFault::Manifest, "manifest token or page list unreadable"); }
+
+        const auto t_load_0 = std::chrono::steady_clock::now();
+
+        // 1. Read Text KV pages from shared pool_data.ninfer_pages
+        out_text_kv_payload.resize(header.text_page_count * header.text_page_bytes);
+        if (header.text_page_count > 0 && header.text_page_bytes > 0) {
+            std::vector<PageIndexRecord> page_records;
+            if (!resolve_pages(page_hashes, header.text_page_bytes, page_records, failure)) { return false; }
+#if defined(NINFER_DISK_STATE_CACHE_TEST_SEAMS)
+            test_seams::run_disk_load_hook(test_seams::DiskLoadPoint::AfterResolvePages, false);
+#endif
+
+            std::ifstream pool_file(journal_.pool_data_path(), std::ios::binary);
+            if (!pool_file.is_open()) {
+                return fail(failure, LoadFault::Transient, "page pool file could not be opened");
+            }
+#if defined(NINFER_DISK_STATE_CACHE_TEST_SEAMS)
+            test_seams::run_disk_load_hook(test_seams::DiskLoadPoint::AfterPoolOpen, false);
+#endif
+
+            for (std::uint32_t i = 0; i < header.text_page_count; ++i) {
+                pool_file.seekg(static_cast<std::streamoff>(page_records[i].file_offset));
+                pool_file.read(reinterpret_cast<char*>(out_text_kv_payload.data() + i * header.text_page_bytes),
+                               header.text_page_bytes);
+                if (!pool_file) {
+                    failure.pages = page_hashes;
+                    return fail(failure, LoadFault::Pages, "page pool read failed");
+                }
+            }
+        }
+
+        // 2. Read GDN state, MTP KV, tail hidden from manifest file
+        const std::uint64_t raw_header_bytes = sizeof(DiskStateHeader) +
+                                             static_cast<std::uint64_t>(header.token_count) * sizeof(TokenId) +
+                                             static_cast<std::uint64_t>(header.text_page_count) * sizeof(std::uint64_t);
+        const std::uint64_t payload_offset = header.payload_offset_bytes != 0
+            ? static_cast<std::uint64_t>(header.payload_offset_bytes)
+            : ((raw_header_bytes + 4095ULL) & ~4095ULL);
+        file.seekg(static_cast<std::streamoff>(payload_offset));
+
+        out_gdn_state.resize(header.gdn_state_bytes);
+        if (header.gdn_state_bytes > 0) {
+            file.read(reinterpret_cast<char*>(out_gdn_state.data()), header.gdn_state_bytes);
+        }
+
+        out_mtp_kv_payload.resize(header.mtp_kv_bytes);
+        if (header.mtp_kv_bytes > 0) {
+            file.read(reinterpret_cast<char*>(out_mtp_kv_payload.data()), header.mtp_kv_bytes);
+        }
+
+        out_tail_hidden.resize(header.tail_hidden_bytes);
+        if (header.tail_hidden_bytes > 0) {
+            file.read(reinterpret_cast<char*>(out_tail_hidden.data()), header.tail_hidden_bytes);
+        }
+
+        if (!file) { return fail(failure, LoadFault::Manifest, "manifest payload unreadable"); }
+
+        if (header.checksum != 0) {
+            Fnv1aHasher hasher;
+            hasher.update(out_gdn_state.data(), out_gdn_state.size());
+            hasher.update(out_mtp_kv_payload.data(), out_mtp_kv_payload.size());
+            hasher.update(out_tail_hidden.data(), out_tail_hidden.size());
+            const std::uint64_t actual_checksum = hasher.finalize();
+            if (actual_checksum != header.checksum) {
+                std::cerr << "[warn] ninfer: [prompt-cache] checksum mismatch on " << path.filename().string()
+                          << " (expected 0x" << std::hex << header.checksum
+                          << ", actual 0x" << actual_checksum << std::dec << ")\n";
+                return fail(failure, LoadFault::Manifest, "checksum mismatch");
+            }
+        }
+
+        const auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_load_0).count();
+        const std::size_t total_payload_bytes = out_text_kv_payload.size() + out_gdn_state.size() +
+                                              out_mtp_kv_payload.size() + out_tail_hidden.size();
+        const double raw_mb = static_cast<double>(total_payload_bytes) / (1024.0 * 1024.0);
+        std::cout << "[info] ninfer: [prompt-cache] restored " << header.token_count
+                  << " tokens from disk (" << std::fixed << std::setprecision(1) << raw_mb
+                  << "MB in " << load_ms << "ms)\n" << std::flush;
+
+        return true;
+    }
+
+#if defined(_WIN32)
+    [[nodiscard]] bool load_snapshot_ds(const std::filesystem::path& path,
+                                        DiskStateHeader& out_header,
+                                        std::vector<TokenId>& out_tokens,
+                                        cudaStream_t stream,
+                                        std::span<const std::uint64_t> gdn_unit_bytes,
+                                        const DirectStorageRestoreConsumer& consumer,
+                                        std::uint32_t expected_text_page_bytes,
+                                        LoadFailure& failure) {
+        std::error_code ec;
+        const auto file_size = std::filesystem::file_size(path, ec);
+        if (ec) {
+            return file_missing(path) ? fail(failure, LoadFault::Manifest, "manifest missing")
+                                      : fail(failure, LoadFault::Transient, "manifest not accessible");
+        }
+
+        std::ifstream file(path, std::ios::binary);
+        if (!file.is_open()) { return fail(failure, LoadFault::Transient, "manifest could not be opened"); }
+
+        DiskStateHeader header;
+        file.read(reinterpret_cast<char*>(&header), sizeof(header));
+        if (!file || !is_valid_header(header, file_size)) {
+            return fail(failure, LoadFault::Manifest, "invalid or short manifest");
+        }
+
+        if (!disk_state_layout_matches(header, expected_text_page_bytes)) {
+            std::cerr << "[warn] ninfer: [prompt-cache] layout mismatch: header.text_page_bytes="
+                      << header.text_page_bytes << " live_text_page_bytes=" << expected_text_page_bytes
+                      << "\n" << std::flush;
+            return fail(failure, LoadFault::Manifest, "page layout mismatch");
+        }
+
+        out_header = header;
+        out_tokens.resize(header.token_count);
+        if (header.token_count > 0) {
+            file.read(reinterpret_cast<char*>(out_tokens.data()), header.token_count * sizeof(TokenId));
+        }
+
+        std::vector<std::uint64_t> page_hashes(header.text_page_count);
+        if (header.text_page_count > 0) {
+            file.read(reinterpret_cast<char*>(page_hashes.data()), header.text_page_count * sizeof(std::uint64_t));
+        }
+        if (!file) { return fail(failure, LoadFault::Manifest, "manifest token or page list unreadable"); }
+        file.close();
+
+        std::vector<PageIndexRecord> page_records;
+        if (!resolve_pages(page_hashes, header.text_page_bytes, page_records, failure)) { return false; }
+#if defined(NINFER_DISK_STATE_CACHE_TEST_SEAMS)
+        test_seams::run_disk_load_hook(test_seams::DiskLoadPoint::AfterResolvePages, true);
+#endif
+
+        // Segment list in file order, with the kind and per-kind index of each segment.
+        std::vector<core::DirectStorageSegment> segments;
+        std::vector<DirectStorageRestoreSlice> slice_meta;
+        segments.reserve(header.text_page_count + gdn_unit_bytes.size() + header.mtp_page_count + 2);
+        slice_meta.reserve(segments.capacity());
+        const auto add_segment = [&](core::DirectStorageSource source, std::uint64_t file_offset,
+                                     std::uint64_t bytes, DirectStorageRestoreKind kind, std::uint32_t index) {
+            segments.push_back({source, file_offset, bytes});
+            slice_meta.push_back({kind, index, nullptr, static_cast<std::size_t>(bytes)});
+        };
+
+        for (std::uint32_t i = 0; i < header.text_page_count; ++i) {
+            add_segment(core::DirectStorageSource::Pool, page_records[i].file_offset, page_records[i].page_bytes,
+                        DirectStorageRestoreKind::TextPage, i);
+        }
+
+        std::uint64_t manifest_offset = header.payload_offset_bytes;
+        if (header.gdn_state_bytes > 0) {
+            if (gdn_unit_bytes.empty()) {
+                add_segment(core::DirectStorageSource::Manifest, manifest_offset, header.gdn_state_bytes,
+                            DirectStorageRestoreKind::Gdn, 0);
+            } else {
+                std::uint64_t gdn_sum = 0;
+                for (std::size_t i = 0; i < gdn_unit_bytes.size(); ++i) {
+                    if (gdn_unit_bytes[i] == 0) {
+                        return fail(failure, LoadFault::Transient, "live GDN unit has no bytes");
+                    }
+                    add_segment(core::DirectStorageSource::Manifest, manifest_offset + gdn_sum, gdn_unit_bytes[i],
+                                DirectStorageRestoreKind::Gdn, static_cast<std::uint32_t>(i));
+                    gdn_sum += gdn_unit_bytes[i];
+                }
+                if (gdn_sum != header.gdn_state_bytes) {
+                    return fail(failure, LoadFault::Manifest, "GDN layout disagrees with the live state");
+                }
+            }
+            manifest_offset += header.gdn_state_bytes;
+        }
+        if (header.mtp_kv_bytes > 0) {
+            const std::uint32_t mtp_pages = std::max<std::uint32_t>(header.mtp_page_count, 1);
+            if (header.mtp_kv_bytes % mtp_pages != 0) {
+                return fail(failure, LoadFault::Manifest, "MTP payload not divisible into pages");
+            }
+            const std::uint64_t mtp_page_bytes = header.mtp_kv_bytes / mtp_pages;
+            for (std::uint32_t i = 0; i < mtp_pages; ++i) {
+                add_segment(core::DirectStorageSource::Manifest, manifest_offset + i * mtp_page_bytes, mtp_page_bytes,
+                            DirectStorageRestoreKind::MtpPage, i);
+            }
+            manifest_offset += header.mtp_kv_bytes;
+        }
+        if (header.tail_hidden_bytes > 0) {
+            add_segment(core::DirectStorageSource::Manifest, manifest_offset, header.tail_hidden_bytes,
+                        DirectStorageRestoreKind::Tail, 0);
+        }
+
+        if (segments.empty()) { return fail(failure, LoadFault::Transient, "snapshot has no payload"); }
+        if (!core::DirectStorageEngine::instance().available()) {
+            return fail(failure, LoadFault::Transient, "DirectStorage unavailable");
+        }
+
+        const std::uint64_t manifest_payload_bytes = header.gdn_state_bytes + header.mtp_kv_bytes + header.tail_hidden_bytes;
+        const auto t_load_0 = std::chrono::steady_clock::now();
+
+        std::vector<DirectStorageRestoreSlice> batch;
+        const auto status = core::DirectStorageEngine::instance().restore_segments(
+            journal_.pool_data_path(), path, segments, stream,
+            [&](const std::byte* staging, std::size_t first, std::span<const std::size_t> offsets) {
+                batch.clear();
+                for (std::size_t i = 0; i < offsets.size(); ++i) {
+                    DirectStorageRestoreSlice slice = slice_meta[first + i];
+                    slice.data = staging + offsets[i];
+                    batch.push_back(slice);
+                }
+                return consumer(std::span<const DirectStorageRestoreSlice>(batch.data(), batch.size()));
+            });
+        switch (status) {
+        case core::DirectStorageRestoreStatus::Ok:
+            break;
+        case core::DirectStorageRestoreStatus::Unavailable:
+            return fail(failure, LoadFault::Transient, "DirectStorage unavailable");
+        case core::DirectStorageRestoreStatus::OpenFailed:
+            // Both files were present a moment ago, so this is a sharing or access failure.
+            return fail(failure, LoadFault::Transient, "DirectStorage could not open a snapshot file");
+        case core::DirectStorageRestoreStatus::ReadFailed:
+            // The error record names only the first failed request, not which page or manifest
+            // range it covered, so every page of the snapshot is retired with the manifest.
+            failure.pages = page_hashes;
+            return fail(failure, LoadFault::Pages, "DirectStorage read failed");
+        case core::DirectStorageRestoreStatus::ConsumerRejected:
+            return fail(failure, LoadFault::Manifest, "restore slices disagree with the live layout");
+        }
+
+        const auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_load_0).count();
+        const std::size_t total_payload_bytes = header.text_page_count * header.text_page_bytes + manifest_payload_bytes;
+        const double raw_mb = static_cast<double>(total_payload_bytes) / (1024.0 * 1024.0);
+        std::cout << "[info] ninfer: [prompt-cache] directstorage restored " << header.token_count
+                  << " tokens into VRAM (" << std::fixed << std::setprecision(1) << raw_mb
+                  << "MB in " << load_ms << "ms)\n" << std::flush;
+
+        return true;
+    }
+#endif
+
+    // Without this, a bad snapshot stays in the index: enqueue_save_cow skips the fallback's
+    // save as a duplicate and has_page keeps reporting the unreadable pages as stored, so every
+    // matching request repeats the failed load and a full prefill.
+    void discard_after_failed_load(const std::filesystem::path& path, const LoadFailure& failure,
+                                   std::uint64_t journal_generation) {
+        if (failure.kind == LoadFault::None) { return; }
+        if (failure.kind == LoadFault::Transient) {
+            std::cerr << "[warn] ninfer: [prompt-cache] kept snapshot " << path.filename().string()
+                      << " after a transient load failure (" << failure.reason << ")\n" << std::flush;
+            return;
+        }
+
+        std::size_t retired_pages = 0;
+        if (failure.kind == LoadFault::Pages) {
+            const auto retired = journal_.drop_unreadable_pages(failure.pages, journal_generation);
+            if (!retired) {
+                std::cerr << "[warn] ninfer: [prompt-cache] kept snapshot " << path.filename().string()
+                          << " (" << failure.reason << "): the page pool was compacted during the load\n"
+                          << std::flush;
+                return;
+            }
+            retired_pages = *retired;
+        }
+
+        bool removed = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            removed = index_.erase(path) > 0;
+            std::error_code ec;
+            removed = std::filesystem::remove(path, ec) || removed;
+        }
+        if (removed || retired_pages > 0) {
+            std::cerr << "[warn] ninfer: [prompt-cache] dropped snapshot " << path.filename().string()
+                      << " (" << failure.reason << "), retired " << retired_pages
+                      << " pool page record(s)\n" << std::flush;
+        }
+    }
+
     void scan_cache_dir() {
         std::error_code ec;
         const auto manifest_dir = config_.cache_dir / "manifests";
@@ -954,8 +1653,14 @@ private:
             }
 
             // 1. Append missing Text KV pages to shared PageStoreJournal
-            if (!task.missing_page_hashes.empty()) {
-                journal_.append_missing_pages(task.missing_page_hashes, task.missing_pages_data, task.single_page_bytes);
+            if (!journal_.append_missing_pages(task.all_page_hashes, task.missing_page_hashes,
+                                               task.missing_pages_data, task.single_page_bytes)) {
+                std::cerr << "[warn] ninfer: [prompt-cache] skipped snapshot save tokens="
+                          << task.header.token_count << ": pool pages it reuses are no longer stored\n"
+                          << std::flush;
+                task.lease.release();
+                prune_lru();
+                continue;
             }
 
             // 2. Write snapshot manifest file
@@ -1022,6 +1727,9 @@ private:
                           << save_ms << "ms\n" << std::flush;
             }
 
+            // The manifest is indexed or abandoned, so the pages need no lease; holding it would
+            // make the compaction below keep them even when the manifest is evicted.
+            task.lease.release();
             prune_lru();
         }
     }
@@ -1043,8 +1751,38 @@ DiskStateCache::DiskStateCache(DiskStateCacheConfig config)
 
 DiskStateCache::~DiskStateCache() = default;
 
+DiskStateCache::PageLease::PageLease(PageLease&& other) noexcept
+    : owner_(std::exchange(other.owner_, nullptr)),
+      hashes_(std::move(other.hashes_)),
+      stored_(std::move(other.stored_)) {}
+
+DiskStateCache::PageLease& DiskStateCache::PageLease::operator=(PageLease&& other) noexcept {
+    if (this != &other) {
+        release();
+        owner_  = std::exchange(other.owner_, nullptr);
+        hashes_ = std::move(other.hashes_);
+        stored_ = std::move(other.stored_);
+    }
+    return *this;
+}
+
+DiskStateCache::PageLease::~PageLease() {
+    release();
+}
+
+void DiskStateCache::PageLease::release() noexcept {
+    if (owner_ != nullptr) {
+        owner_->unpin_pages(hashes_);
+        owner_ = nullptr;
+    }
+}
+
 bool DiskStateCache::has_page(std::uint64_t page_hash) const {
     return impl_->has_page(page_hash);
+}
+
+DiskStateCache::PageLease DiskStateCache::lease_pages(std::span<const std::uint64_t> page_hashes) {
+    return impl_->lease_pages(page_hashes);
 }
 
 std::optional<DiskStateMatch>
@@ -1068,11 +1806,16 @@ bool DiskStateCache::load_snapshot_direct_storage(const std::filesystem::path& p
                                                   DiskStateHeader& out_header,
                                                   std::vector<TokenId>& out_tokens,
                                                   cudaStream_t stream,
-                                                  void*& out_d_staging_ptr,
-                                                  std::size_t& out_text_bytes) {
-    return impl_->load_snapshot_direct_storage(path, out_header, out_tokens, stream, out_d_staging_ptr, out_text_bytes);
+                                                  std::span<const std::uint64_t> gdn_unit_bytes,
+                                                  const DirectStorageRestoreConsumer& consumer,
+                                                  std::uint32_t expected_text_page_bytes) {
+    return impl_->load_snapshot_direct_storage(path, out_header, out_tokens, stream, gdn_unit_bytes, consumer, expected_text_page_bytes);
 }
 #endif
+
+void DiskStateCache::discard_snapshot(const std::filesystem::path& path, const char* reason) {
+    impl_->discard_snapshot(path, reason);
+}
 
 void DiskStateCache::enqueue_save_cow(std::uint64_t model_hash,
                                       std::vector<TokenId> tokens,
@@ -1085,12 +1828,13 @@ void DiskStateCache::enqueue_save_cow(std::uint64_t model_hash,
                                       std::uint32_t single_page_bytes,
                                       std::vector<std::byte> mtp_kv_payload,
                                       std::uint32_t mtp_page_count,
-                                      std::vector<std::byte> tail_hidden) {
+                                      std::vector<std::byte> tail_hidden,
+                                      PageLease lease) {
     impl_->enqueue_save_cow(model_hash, std::move(tokens), turn_index, rope_delta,
                             std::move(gdn_state), std::move(all_page_hashes),
                             std::move(missing_page_hashes), std::move(missing_pages_data),
                             single_page_bytes, std::move(mtp_kv_payload),
-                            mtp_page_count, std::move(tail_hidden));
+                            mtp_page_count, std::move(tail_hidden), std::move(lease));
 }
 
 void DiskStateCache::enqueue_save(std::uint64_t model_hash,

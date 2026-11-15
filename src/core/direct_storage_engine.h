@@ -12,9 +12,11 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <span>
 #include <string>
@@ -23,13 +25,51 @@ namespace ninfer::core {
 
 using Microsoft::WRL::ComPtr;
 
-struct PageRestoreEntry {
-    std::uint64_t file_offset = 0;
-    std::uint32_t page_bytes  = 0;
+enum class DirectStorageSource : std::uint8_t {
+    Pool,
+    Manifest,
 };
+
+// One contiguous byte range of a source file. A segment is never split across
+// staging batches, so its bytes must not exceed kStagingCapacityBytes.
+struct DirectStorageSegment {
+    DirectStorageSource source      = DirectStorageSource::Pool;
+    std::uint64_t       file_offset = 0;
+    std::uint64_t       bytes       = 0;
+};
+
+// Called once per staging batch after the batch's read has been enqueued. The fence
+// wait is already queued on `stream`, so work the consumer enqueues on that stream sees
+// the batch's bytes. segment_offsets[i] is the staging offset of segment first_segment + i.
+// Return false to abort the restore.
+enum class DirectStorageRestoreStatus : std::uint8_t {
+    Ok,
+    // The engine or device cannot serve reads right now; the files are not implicated.
+    Unavailable,
+    // DirectStorage could not open a source file.
+    OpenFailed,
+    // At least one read request failed. DSTORAGE_ERROR_RECORD names only the first
+    // failure, so the failing segment is unknown.
+    ReadFailed,
+    // The consumer returned false.
+    ConsumerRejected,
+};
+
+using DirectStorageBatchConsumer =
+    std::function<bool(const std::byte* staging, std::size_t first_segment,
+                       std::span<const std::size_t> segment_offsets)>;
 
 class DirectStorageEngine {
 public:
+    // The staging resource is allocated once and kept for the life of the process.
+    // Releasing it right after a restore races the DirectStorage worker's own
+    // post-completion GPU work on the resource and ends in a GPU context reset
+    // (nvlddmkm 153, DXGI_ERROR_DEVICE_HUNG) followed by an access violation on the
+    // worker thread. A fixed capacity bounds VRAM and commit charge regardless of
+    // snapshot size. The capacity comes out of KV capacity auto's budget, so it is kept
+    // small: the largest segment the server hands over is one GDN layer or one KV page.
+    static constexpr std::size_t kStagingCapacityBytes = 64ULL * 1024 * 1024;
+
     static DirectStorageEngine& instance();
 
     DirectStorageEngine(const DirectStorageEngine&)            = delete;
@@ -39,32 +79,21 @@ public:
 
     [[nodiscard]] bool available() const noexcept { return initialized_; }
 
-    [[nodiscard]] void* staging_ptr() const noexcept { return d_staging_ptr_; }
+    // Allocates the staging buffer now instead of on the first restore. Call it before
+    // device memory is budgeted (KV capacity auto) so the budget accounts for the buffer;
+    // allocating it later on a nearly full device leaves D3D12 contending for residency.
+    bool prepare();
 
-    [[nodiscard]] std::size_t staging_capacity() const noexcept { return current_capacity_; }
-
-    // Restores snapshot payload into VRAM staging buffer via DirectStorage.
-    // file_offset_4k_aligned must be 4096-byte aligned.
-    bool restore_snapshot_payload(const std::filesystem::path& path,
-                                  std::uint64_t file_offset_4k_aligned,
-                                  std::uint64_t payload_bytes,
-                                  cudaStream_t stream,
-                                  void*& out_d_staging_ptr);
-
-    // Restores CoW paged KV snapshot payload:
-    // - text_pages are read from pool_path and placed in staging buffer at [0 .. total_text_bytes)
-    // - manifest payload (GDN state, MTP KV, tail hidden) is read from manifest_path and placed at [total_text_bytes .. total_staging_bytes)
-    bool restore_snapshot_cow(const std::filesystem::path& pool_path,
-                              std::span<const PageRestoreEntry> text_pages,
-                              const std::filesystem::path& manifest_path,
-                              std::uint64_t manifest_payload_offset,
-                              std::uint64_t manifest_payload_bytes,
-                              cudaStream_t stream,
-                              void*& out_d_staging_ptr,
-                              std::size_t& out_text_bytes);
-
-    // Releases the D3D12 staging buffer and unmaps CUDA external memory.
-    void release_staging() noexcept;
+    // Reads `segments` in order into the persistent staging buffer, packing consecutive
+    // segments into batches of at most kStagingCapacityBytes, and hands each batch to
+    // `consumer`. Before the next batch overwrites the staging buffer, the consumer's
+    // work on `stream` is synchronized. On false, part of the destination may already
+    // have been written; the caller must fall back to a path that rewrites all of it.
+    DirectStorageRestoreStatus restore_segments(const std::filesystem::path& pool_path,
+                          const std::filesystem::path& manifest_path,
+                          std::span<const DirectStorageSegment> segments,
+                          cudaStream_t stream,
+                          const DirectStorageBatchConsumer& consumer);
 
 private:
     DirectStorageEngine();
@@ -72,11 +101,15 @@ private:
 
     bool init_d3d12_and_fence();
     bool init_direct_storage();
-    void recreate_queue();
-    bool allocate_staging_vram(std::size_t required_bytes);
+    bool ensure_device_alive();
+    bool ensure_staging_vram();
+    void release_staging() noexcept;
     void cleanup();
+    void record_consumer(cudaStream_t stream) noexcept;
+    void sync_last_consumer() noexcept;
+    bool wait_fence_on_cpu() noexcept;
 
-    bool initialized_ = false;
+    std::atomic<bool> initialized_ = false;
     mutable std::recursive_mutex mutex_;
 
     // Direct3D 12 & DXGI
@@ -90,13 +123,15 @@ private:
     // DirectStorage
     ComPtr<IDStorageFactory> ds_factory_;
     ComPtr<IDStorageQueue> ds_queue_;
-    ComPtr<IDStorageFile> pool_file_;
-    ComPtr<IDStorageFile> manifest_file_;
 
     // CUDA Interop
     cudaExternalMemory_t cuda_ext_mem_ = nullptr;
     cudaExternalSemaphore_t cuda_fence_sem_ = nullptr;
     void* d_staging_ptr_ = nullptr;
+    // Marks the end of the last consumer's work. The caller's stream may be destroyed once
+    // restore_segments returns, so only this event (owned by the context) outlives the call.
+    cudaEvent_t consumer_event_ = nullptr;
+    bool consumer_pending_ = false;
 };
 
 } // namespace ninfer::core

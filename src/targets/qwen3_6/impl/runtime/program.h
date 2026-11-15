@@ -16,7 +16,9 @@
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
+#include "targets/qwen3_6/impl/runtime/yarn.h"
 
+#include <bit>
 #include <cstdint>
 #include <array>
 #include <memory>
@@ -245,8 +247,13 @@ public:
         h = combine(h, static_cast<std::uint64_t>(model.token_embedding.payload_bytes));
         h = combine(h, static_cast<std::uint64_t>(model.token_embedding.shape[0]));
         h = combine(h, static_cast<std::uint64_t>(model.token_embedding.shape[1]));
-        h = combine(h, static_cast<std::uint64_t>(capacity));
-        h = combine(h, static_cast<std::uint64_t>(kv_capacity));
+        // Only what changes snapshot bytes belongs here. kv_capacity (the resolved page pool
+        // size, which drifts with free VRAM under --kv-capacity auto) and max_context do not:
+        // page, GDN, MTP and tail sizes are per-page/per-slot and checked against the live
+        // layout on load. max_context reaches KV contents only through YaRN RoPE scaling,
+        // so the scale factor stands in for it.
+        h = combine(h, static_cast<std::uint64_t>(
+                           std::bit_cast<std::uint32_t>(compute_yarn_config(capacity).scale_factor)));
         h = combine(h, static_cast<std::uint64_t>(kv_dtype));
         h = combine(h, static_cast<std::uint64_t>(kv_quant_group));
 

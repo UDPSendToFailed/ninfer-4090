@@ -93,8 +93,12 @@ ninfer_add_test(ninfer_gdn_replay_records_test
   SOURCES test_gdn_replay_records.cpp
   LIBRARIES ninfer_core)
 ninfer_add_test(ninfer_disk_state_cache_test
-  SOURCES test_disk_state_cache.cpp
+  SOURCES test_disk_state_cache.cpp ${PROJECT_SOURCE_DIR}/src/core/disk_state_cache.cpp
   LIBRARIES ninfer_core ninfer_ops)
+# The test compiles its own copy of the cache with the load seams; ninfer_core never has them.
+# That copy and the one in ninfer_core.lib must share every compile definition except
+# NINFER_DISK_STATE_CACHE_TEST_SEAMS, or the two definitions of the same classes break the ODR.
+target_compile_definitions(ninfer_disk_state_cache_test PRIVATE NINFER_DISK_STATE_CACHE_TEST_SEAMS)
 ninfer_add_test(ninfer_chunked_kv_snapshot_restore_test
   SOURCES test_chunked_kv_snapshot_restore.cpp
   LIBRARIES ninfer_core ninfer_ops)
