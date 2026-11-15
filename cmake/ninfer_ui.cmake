@@ -1,7 +1,7 @@
 # WebUI asset downloading and C++ embedding for ninfer-serve
 
 option(NINFER_ENABLE_UI "Download and embed the WebUI into ninfer-serve" ON)
-set(NINFER_UI_DEFAULT_TAG "b10655")
+set(NINFER_UI_DEFAULT_TAG "b12413")
 
 # Automatically sync cached release tag if NINFER_UI_DEFAULT_TAG was updated in ninfer_ui.cmake
 if(NOT DEFINED NINFER_UI_RELEASE_TAG)
