@@ -23,6 +23,7 @@ struct ResolvedExecutionOptions {
     ResolvedSamplingParameters sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    ThinkingControlOptions thinking;
     std::vector<std::uint32_t> token_mask;
     bool disable_speculation = false;
 };
@@ -34,9 +35,15 @@ struct ResolvedRequestOptions {
     StructuredOutputOptions structured_output;
 };
 
+enum class ContinuationAction : std::uint8_t {
+    Decode,
+    ApplyTargetControl,
+};
+
 struct OutputDecision {
-    std::uint32_t accepted_tokens = 0;
-    FinishReason finish_reason    = FinishReason::None;
+    std::uint32_t accepted_tokens   = 0;
+    FinishReason finish_reason      = FinishReason::None;
+    ContinuationAction continuation = ContinuationAction::Decode;
 
     [[nodiscard]] bool finished() const noexcept { return finish_reason != FinishReason::None; }
 };

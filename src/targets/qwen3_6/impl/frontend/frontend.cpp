@@ -39,6 +39,9 @@ namespace fi = frontend_internal;
 
 constexpr std::size_t kPatchFeatures   = 1536;
 constexpr std::string_view kThinkClose = "</think>";
+constexpr std::string_view kThinkingControl =
+    "\n\n Considering the limited time by the user, I have to give the solution based on the "
+    "thinking directly now.\n</think>\n\n";
 constexpr std::string_view kUtf8Replacement = "\xef\xbf\xbd";
 constexpr double kRescaleFactor        = 1.0 / 255.0;
 constexpr double kVideoFps             = 2.0;
@@ -447,6 +450,29 @@ struct DecoderState {
     std::uint32_t reasoning_tokens = 0;
 };
 
+struct SemanticThinkingState {
+    std::optional<std::uint32_t> budget;
+    std::string close_pending;
+    std::uint32_t model_thinking_tokens = 0;
+    std::uint32_t injected_tokens       = 0;
+    bool in_reasoning                   = false;
+    bool control_pending                = false;
+    bool applied                        = false;
+};
+
+void feed_semantic_thinking(SemanticThinkingState& state, std::string_view bytes) {
+    if (!state.in_reasoning || bytes.empty()) { return; }
+    state.close_pending.append(bytes);
+    if (state.close_pending.find(kThinkClose) != std::string::npos) {
+        state.close_pending.clear();
+        state.in_reasoning    = false;
+        state.control_pending = false;
+        return;
+    }
+    const std::size_t hold = longest_suffix_prefix(state.close_pending, kThinkClose, true);
+    state.close_pending.erase(0, state.close_pending.size() - hold);
+}
+
 struct StopMatch {
     bool found                      = false;
     std::uint32_t committed_tokens  = 0;
@@ -638,12 +664,34 @@ public:
         grammar_compiler = std::make_shared<xgrammar::GrammarCompiler>(xgrammar::TokenizerInfo(
             decoded_vocab, xgrammar::VocabType::RAW, vocab_size, std::move(stop_tokens)));
         grammar_vocab_size = vocab_size;
+        std::vector<TokenId> encoded = tokenizer->encode(kThinkingControl);
+        if (encoded.empty()) {
+            throw std::invalid_argument(
+                "Qwen tokenizer cannot encode the canonical thinking control suffix");
+        }
+        const std::string exact =
+            tokenizer->decode(encoded, fi::DecodeOptions{.skip_special_tokens = false});
+        const std::string presented =
+            tokenizer->decode(encoded, fi::DecodeOptions{.skip_special_tokens = true});
+        if (exact != kThinkingControl || presented.find(kThinkClose) == std::string::npos) {
+            throw std::invalid_argument(
+                "Qwen tokenizer cannot present the canonical thinking control suffix");
+        }
+        for (const TokenId token : encoded) {
+            if (std::find(defaults.token_ids.begin(), defaults.token_ids.end(), token) !=
+                defaults.token_ids.end()) {
+                throw std::invalid_argument(
+                    "canonical thinking control suffix contains a default terminal token");
+            }
+        }
+        thinking_control_tokens = std::make_shared<const std::vector<TokenId>>(std::move(encoded));
     }
 
     fi::CompiledChatTemplate chat_template;
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     fi::ProcessorOptions processor;
     StopPolicy defaults;
+    std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
     std::shared_ptr<xgrammar::GrammarCompiler> grammar_compiler;
     int grammar_vocab_size = 0;
     bool vision_enabled = true;
@@ -653,12 +701,25 @@ class OutputSession::Impl {
 public:
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
          const StructuredOutputOptions& structured, bool starts_in_reasoning,
-         const std::shared_ptr<xgrammar::GrammarCompiler>& compiler, int vocab_size)
+         const std::shared_ptr<xgrammar::GrammarCompiler>& compiler, int vocab_size,
+         ThinkingControlOptions thinking,
+         std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens_)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
-          preserve_special(output.raw || output.preserve_special_tokens) {
+          thinking_control_tokens(std::move(thinking_control_tokens_)),
+          preserve_special(output.raw || output.preserve_special_tokens),
+          split_reasoning(starts_in_reasoning && !output.raw && !structured.enabled()) {
+        if (thinking.budget && *thinking.budget == 0) {
+            throw std::invalid_argument("thinking budget must be positive");
+        }
         // A structured response starts at the grammar root and is published as content even when
         // the model's normal mode would begin in a hidden reasoning channel.
-        state.in_reasoning = starts_in_reasoning && !output.raw && !structured.enabled();
+        state.in_reasoning = split_reasoning;
+        semantic.budget    = thinking.budget;
+        // The presentation decoder already tracks normal reasoning output. Keep the independent
+        // semantic tracker dormant unless a cap needs it, so the default unlimited path does not
+        // decode every model token twice.
+        semantic.in_reasoning =
+            starts_in_reasoning && thinking.budget.has_value() && !structured.enabled();
         if (structured.enabled()) {
             xgrammar::CompiledGrammar grammar =
                 structured.mode == StructuredOutputMode::JsonObject
@@ -674,9 +735,13 @@ public:
 
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     StopPolicy policy;
+    std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
     bool preserve_special = false;
+    bool split_reasoning  = false;
     DecoderState state;
     DecoderState preview_state;
+    SemanticThinkingState semantic;
+    SemanticThinkingState preview_semantic;
     PublishedOutput preview_output;
     bool preview_ready = false;
     std::optional<xgrammar::GrammarMatcher> matcher;
@@ -744,16 +809,19 @@ OutputSession& OutputSession::operator=(OutputSession&&) noexcept = default;
 
 OutputSession::OutputSession(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 
-runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
-                                               std::uint32_t budget_remaining,
-                                               FinishReason limit_reason) {
+runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> tokens,
+                                                     std::uint32_t total_budget_remaining,
+                                                     FinishReason limit_reason) {
     if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
     if (impl_->state.terminal) { throw std::logic_error("output session is already terminal"); }
     if (impl_->preview_ready) { throw std::logic_error("output session already has a preview"); }
+    if (impl_->semantic.control_pending) {
+        throw std::logic_error("model output cannot advance while thinking control is pending");
+    }
     if (tokens.empty()) {
         throw std::invalid_argument("cannot preview an empty generated-token round");
     }
-    if (tokens.size() > budget_remaining) {
+    if (tokens.size() > total_budget_remaining) {
         throw std::invalid_argument("generated-token round exceeds the remaining budget");
     }
     if (limit_reason != FinishReason::OutputLimit &&
@@ -761,12 +829,16 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
         throw std::invalid_argument("generated-token budget has an invalid limit reason");
     }
 
-    impl_->preview_state = impl_->state;
+    impl_->preview_state    = impl_->state;
+    impl_->preview_semantic = impl_->semantic;
     impl_->preview_output.clear();
     if (impl_->matcher) { impl_->preview_matcher = impl_->matcher->Fork(); }
     std::uint32_t grammar_tokens = 0;
 
-    const auto complete = [&](std::uint32_t count, FinishReason reason) {
+    const auto complete = [&](std::uint32_t count, FinishReason reason,
+                              runtime::ContinuationAction continuation =
+                                  runtime::ContinuationAction::Decode) {
+        if (reason != FinishReason::None) { impl_->preview_semantic.control_pending = false; }
         if (impl_->preview_matcher && grammar_tokens > count) {
             impl_->preview_matcher->Rollback(static_cast<int>(grammar_tokens - count));
         }
@@ -777,7 +849,8 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
             impl_->preview_output[1].tokens = std::max(1U, count - 1);
         }
         impl_->preview_ready = true;
-        return runtime::OutputDecision{.accepted_tokens = count, .finish_reason = reason};
+        return runtime::OutputDecision{
+            .accepted_tokens = count, .finish_reason = reason, .continuation = continuation};
     };
 
     for (std::size_t index = 0; index < tokens.size(); ++index) {
@@ -795,6 +868,15 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
         }
 
         if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
+        if (impl_->preview_semantic.in_reasoning) {
+            ++impl_->preview_semantic.model_thinking_tokens;
+            if (impl_->preview_semantic.budget &&
+                impl_->preview_semantic.model_thinking_tokens > *impl_->preview_semantic.budget) {
+                throw std::logic_error("model output exceeded the licensed thinking budget");
+            }
+            feed_semantic_thinking(impl_->preview_semantic,
+                                   impl_->tokenizer->decode_token_bytes(token, false));
+        }
 
         const bool stop_token =
             std::find(impl_->policy.token_ids.begin(), impl_->policy.token_ids.end(), token) !=
@@ -829,11 +911,97 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
     }
 
     const auto count = static_cast<std::uint32_t>(tokens.size());
-    if (tokens.size() == budget_remaining) {
+    if (tokens.size() == total_budget_remaining) {
         terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
         return complete(count, limit_reason);
     }
+    if (impl_->preview_semantic.in_reasoning && impl_->preview_semantic.budget &&
+        impl_->preview_semantic.model_thinking_tokens == *impl_->preview_semantic.budget) {
+        impl_->preview_semantic.control_pending = true;
+        return complete(count, FinishReason::None, runtime::ContinuationAction::ApplyTargetControl);
+    }
     return complete(count, FinishReason::None);
+}
+
+std::uint32_t
+OutputSession::model_token_budget_remaining(std::uint32_t total_budget_remaining) const noexcept {
+    if (impl_ == nullptr || !impl_->semantic.budget || !impl_->semantic.in_reasoning ||
+        impl_->semantic.applied) {
+        return total_budget_remaining;
+    }
+    if (impl_->semantic.control_pending ||
+        impl_->semantic.model_thinking_tokens >= *impl_->semantic.budget) {
+        return 0;
+    }
+    return std::min(total_budget_remaining,
+                    *impl_->semantic.budget - impl_->semantic.model_thinking_tokens);
+}
+
+std::span<const TokenId> OutputSession::pending_control_tokens() const noexcept {
+    if (impl_ == nullptr || !impl_->semantic.control_pending || !impl_->thinking_control_tokens) {
+        return {};
+    }
+    return *impl_->thinking_control_tokens;
+}
+
+runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> tokens,
+                                                       std::uint32_t total_budget_remaining) {
+    if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
+    if (impl_->state.terminal) { throw std::logic_error("output session is already terminal"); }
+    if (impl_->preview_ready) { throw std::logic_error("output session already has a preview"); }
+    const std::span<const TokenId> expected = pending_control_tokens();
+    if (expected.empty() || tokens.size() != expected.size() ||
+        !std::equal(tokens.begin(), tokens.end(), expected.begin())) {
+        throw std::invalid_argument("thinking control preview requires the exact pending span");
+    }
+    if (tokens.size() > total_budget_remaining) {
+        throw std::invalid_argument("thinking control span exceeds the remaining output budget");
+    }
+
+    impl_->preview_state    = impl_->state;
+    impl_->preview_semantic = impl_->semantic;
+    impl_->preview_output.clear();
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        const TokenId token = tokens[index];
+        if (!impl_->tokenizer->is_valid_token(token)) {
+            throw std::out_of_range("thinking control token is outside the checkpoint vocabulary");
+        }
+        if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
+        const std::string semantic_bytes = impl_->tokenizer->decode_token_bytes(token, false);
+        feed_semantic_thinking(impl_->preview_semantic, semantic_bytes);
+        const std::string presentation_bytes =
+            impl_->tokenizer->decode_token_bytes(token, !impl_->preserve_special);
+        feed_token_bytes(impl_->preview_state, presentation_bytes, impl_->policy,
+                         impl_->preview_output, static_cast<std::uint32_t>(index + 1), nullptr);
+    }
+    if (impl_->preview_semantic.in_reasoning) {
+        throw std::logic_error("canonical thinking control did not close the thinking phase");
+    }
+    if (impl_->split_reasoning && impl_->preview_state.in_reasoning) {
+        throw std::logic_error("canonical thinking control did not close the reasoning channel");
+    }
+    impl_->preview_semantic.control_pending = false;
+    impl_->preview_semantic.applied         = true;
+    impl_->preview_semantic.injected_tokens = static_cast<std::uint32_t>(tokens.size());
+    impl_->preview_ready                    = true;
+    return runtime::OutputDecision{.accepted_tokens = static_cast<std::uint32_t>(tokens.size())};
+}
+
+void OutputSession::validate_generation_capacity(std::uint32_t effective_output_tokens) const {
+    if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
+    if (!impl_->semantic.budget || !impl_->semantic.in_reasoning ||
+        effective_output_tokens <= *impl_->semantic.budget) {
+        return;
+    }
+    const std::uint64_t remaining =
+        static_cast<std::uint64_t>(effective_output_tokens) - *impl_->semantic.budget;
+    const std::uint64_t required =
+        static_cast<std::uint64_t>(impl_->thinking_control_tokens->size()) + 1U;
+    if (remaining < required) {
+        throw std::invalid_argument(
+            "effective output capacity after the thinking budget must fit the complete control "
+            "suffix and one post-close model token");
+    }
 }
 
 runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
@@ -844,7 +1012,9 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
         reason == FinishReason::StopToken) {
         throw std::invalid_argument("invalid between-round terminal decoder reason");
     }
-    impl_->preview_state = impl_->state;
+    impl_->preview_state                    = impl_->state;
+    impl_->preview_semantic                 = impl_->semantic;
+    impl_->preview_semantic.control_pending = false;
     if (impl_->matcher) { impl_->preview_matcher = impl_->matcher->Fork(); }
     impl_->preview_output.clear();
     terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
@@ -856,6 +1026,7 @@ PublishedOutput OutputSession::commit_preview() noexcept {
     if (impl_ == nullptr || !impl_->preview_ready) { std::terminate(); }
     using std::swap;
     swap(impl_->state, impl_->preview_state);
+    swap(impl_->semantic, impl_->preview_semantic);
     if (impl_->matcher) {
         swap(impl_->matcher, impl_->preview_matcher);
         impl_->preview_matcher.reset();
@@ -887,6 +1058,16 @@ std::span<const std::uint32_t> OutputSession::next_token_bitmask() {
 
 std::uint32_t OutputSession::reasoning_tokens() const noexcept {
     return impl_ != nullptr ? impl_->state.reasoning_tokens : 0;
+}
+
+ThinkingBudgetStats OutputSession::thinking_stats() const noexcept {
+    if (impl_ == nullptr) { return {}; }
+    return ThinkingBudgetStats{
+        .configured_budget     = impl_->semantic.budget,
+        .model_thinking_tokens = impl_->semantic.model_thinking_tokens,
+        .injected_tokens       = impl_->semantic.injected_tokens,
+        .applied               = impl_->semantic.applied,
+    };
 }
 
 Frontend::Frontend(std::shared_ptr<const Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -1031,13 +1212,15 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
                                             const OutputOptions& output,
-                                            const StructuredOutputOptions& structured) const {
+                                            const StructuredOutputOptions& structured,
+                                            const ThinkingControlOptions& thinking) const {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     if (output.raw) { policy.publish_stop_token = true; }
     return OutputSession(std::make_unique<OutputSession::Impl>(
         impl_->tokenizer, std::move(policy), output, structured, prompt.data_->starts_in_reasoning,
-        impl_->grammar_compiler, impl_->grammar_vocab_size));
+        impl_->grammar_compiler, impl_->grammar_vocab_size, thinking,
+        impl_->thinking_control_tokens));
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

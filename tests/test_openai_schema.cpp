@@ -80,6 +80,12 @@ ninfer::PromptInput translate(const GenerationRequest& req) {
                            fake_media);
 }
 
+ninfer::RequestOptions translate_options(const GenerationRequest& req) {
+    const ServeOptions server = default_server();
+    return to_request_options(req, server,
+                              resolve_prompt_semantics(req, server, effort_capabilities()));
+}
+
 std::string joined_text(const ninfer::ChatMessage& message) {
     std::string text;
     for (const ninfer::MessagePart& part : message.parts) {
@@ -388,7 +394,7 @@ int test_reject_unsupported() {
     failures += check(json_object_req.response_format.mode == ResponseFormatMode::JsonObject,
                       "json_object response_format parsed");
     failures +=
-        check(to_request_options(json_object_req, default_server()).structured_output.mode ==
+        check(translate_options(json_object_req).structured_output.mode ==
                   ninfer::StructuredOutputMode::JsonObject,
               "json_object response_format reaches Engine options");
 
@@ -413,7 +419,7 @@ int test_reject_unsupported() {
                           "object",
                       "json_schema body retained");
     const ninfer::StructuredOutputOptions structured =
-        to_request_options(json_schema_req, default_server()).structured_output;
+        translate_options(json_schema_req).structured_output;
     failures += check(structured.mode == ninfer::StructuredOutputMode::JsonSchema,
                       "json_schema response_format reaches Engine options");
     failures += check(structured.name == "translation_batch" && structured.strict,
@@ -478,7 +484,7 @@ int test_parse_function_tools_and_choices() {
                       "tool definition json carried");
     failures += check(req.tool_choice.mode == ToolChoiceMode::Auto, "default tool choice is auto");
     failures += check(req.uses_tools(), "tools enabled by default");
-    failures += check(to_request_options(req, default_server()).output.preserve_special_tokens,
+    failures += check(translate_options(req).output.preserve_special_tokens,
                       "active tools preserve special tokens in Engine output");
 
     Json none           = base;
@@ -486,7 +492,7 @@ int test_parse_function_tools_and_choices() {
     req                 = parse_chat_completion_request(none, default_limits());
     failures += check(req.tool_choice.mode == ToolChoiceMode::None, "tool_choice none parsed");
     failures += check(!req.uses_tools(), "tool_choice none disables tools");
-    failures += check(!to_request_options(req, default_server()).output.preserve_special_tokens,
+    failures += check(!translate_options(req).output.preserve_special_tokens,
                       "disabled tools do not preserve special tokens");
 
     Json required           = base;
@@ -535,7 +541,7 @@ int test_parse_tool_history_messages() {
     failures += check(req.messages[2].tool_call_id == "call_1", "tool_call_id parsed");
     failures +=
         check(req.messages[2].content.at(0).text == R"({"temp":20})", "tool content parsed");
-    failures += check(to_request_options(req, default_server()).output.preserve_special_tokens,
+    failures += check(translate_options(req).output.preserve_special_tokens,
                       "tool history preserves special tokens in Engine output");
 
     Json parts_body                      = body;
@@ -581,7 +587,7 @@ int test_parse_stop_and_max_tokens() {
     failures += check(req.stop_strings.size() == 2, "two stop strings");
     failures += check(req.stop_strings[0] == "</s>", "stop string 0");
     failures += check(req.max_tokens == 42 && req.max_tokens_set, "max_completion_tokens alias");
-    const ninfer::RequestOptions options = to_request_options(req, default_server());
+    const ninfer::RequestOptions options = translate_options(req);
     failures += check(options.execution.requested_output_tokens == 42,
                       "max_completion_tokens reaches Engine options");
     failures += check(options.stop.strings.size() == 2 && options.stop.strings[0].text == "</s>" &&
@@ -638,7 +644,7 @@ int test_parse_sampling_carried() {
     failures +=
         check(req.sampling.logit_bias.count(5) == 1 && req.sampling.logit_bias.at(5) == -1.5,
               "logit_bias carried");
-    const ninfer::RequestOptions options = to_request_options(req, default_server());
+    const ninfer::RequestOptions options = translate_options(req);
     failures += check(options.execution.sampling.temperature == 0.7F,
                       "temperature reaches Engine overrides");
     failures += check(options.execution.sampling.top_p == 0.9F, "top_p reaches Engine overrides");

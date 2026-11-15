@@ -45,9 +45,10 @@ struct GenerationOutcome {
     std::string text;
     std::string reasoning;
     std::vector<ToolCall> tool_calls;
-    int prompt_tokens                  = 0;
-    int completion_tokens              = 0;
-    int reasoning_tokens               = 0;
+    int prompt_tokens     = 0;
+    int completion_tokens = 0;
+    int reasoning_tokens  = 0;
+    ninfer::ThinkingBudgetStats thinking;
     std::size_t streamed_content_bytes = 0;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     GenerationMetrics metrics;
@@ -75,6 +76,7 @@ struct PreparedRequest {
     bool timings_per_token                 = false;
     std::size_t tool_name_max_length       = 64;
     bool enable_thinking                   = true;
+    std::optional<std::uint32_t> thinking_budget;
     std::optional<ninfer::ReasoningEffort> reasoning_effort;
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;

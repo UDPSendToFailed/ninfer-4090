@@ -2488,6 +2488,153 @@ ProgramImplCore::decode_batch(std::span<const std::uint32_t> lanes,
     return decode_dflash_batch(lanes, budgets);
 }
 
+void ProgramImplCore::append_forced_tokens_lanes(std::span<const std::uint32_t> lanes,
+                                                 std::span<const TokenId> row_major_tokens,
+                                                 std::uint32_t row_stride) {
+    if (lanes.empty() || lanes.size() > max_concurrency || row_stride == 0 ||
+        row_major_tokens.size() != static_cast<std::size_t>(row_stride) * lanes.size()) {
+        throw std::invalid_argument("forced-token membership is invalid");
+    }
+
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const std::uint32_t lane = lanes[row];
+        if (lane >= max_concurrency || requests[lane].lifecycle != Lifecycle::Active ||
+            std::find(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(row), lane) !=
+                lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
+            throw std::logic_error("forced-token membership is duplicate or not active");
+        }
+        const SequenceState& sequence = sequences[lane];
+        if (sequence.execution_frontier == std::numeric_limits<std::uint32_t>::max() ||
+            sequence.ledger_frontier != sequence.execution_frontier + 1U ||
+            sequence.ledger.size() != sequence.ledger_frontier ||
+            sequence.prefix_identity.size() != sequence.ledger_frontier ||
+            sequence.text_kv_valid != sequence.execution_frontier ||
+            (speculative_backend == SpeculativeBackend::Mtp &&
+             sequence.mtp_kv_valid != sequence.execution_frontier) ||
+            (speculative_backend == SpeculativeBackend::DFlash &&
+             sequence.dflash_context_frontier > sequence.execution_frontier) ||
+            static_cast<std::uint64_t>(sequence.execution_frontier) + row_stride > capacity) {
+            throw std::logic_error("forced-token sequence frontier is invalid");
+        }
+        validate_licensed_tokens(row_major_tokens.subspan(row * row_stride, row_stride));
+    }
+
+    try {
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const std::uint32_t lane = lanes[row];
+            SequenceState& sequence  = sequences[lane];
+            RequestControl& request  = requests[lane];
+            const std::span<const TokenId> forced =
+                row_major_tokens.subspan(row * row_stride, row_stride);
+            const std::uint32_t base = sequence.execution_frontier;
+            const std::uint32_t end  = base + row_stride;
+            const auto started       = Clock::now();
+
+            if (speculative_backend == SpeculativeBackend::DFlash &&
+                sequence.dflash_context_frontier < base) {
+                const std::array<std::uint32_t, 1> append_lanes{lane};
+                const std::array<std::uint32_t, 1> append_starts{sequence.dflash_context_frontier};
+                const std::array<std::uint32_t, 1> append_counts{base -
+                                                                 sequence.dflash_context_frontier};
+                enqueue_dflash_context_append(append_lanes, append_starts, append_counts);
+                device.synchronize();
+                sequence.dflash_context_frontier = base;
+                work.reset();
+            }
+
+            materialize_sequence_kv(sequence, end,
+                                    speculative_backend == SpeculativeBackend::None ? 0U : end);
+
+            std::vector<TokenId> continuation = sequence.ledger;
+            continuation.insert(continuation.end(), forced.begin(), forced.end());
+            if (continuation.size() != static_cast<std::size_t>(end) + 1U) {
+                throw std::logic_error("forced-token continuation ledger has an invalid shape");
+            }
+
+            if (speculative_backend == SpeculativeBackend::DFlash) {
+                if (!dflash || !io.dflash_decode || !sequence.kv || !sequence.kv->backend) {
+                    throw std::logic_error("DFlash forced continuation state is incomplete");
+                }
+                *dflash_host_ingress                         = {};
+                dflash_host_ingress->lanes[0]                = static_cast<std::int32_t>(lane);
+                dflash_host_ingress->dflash_kv_table_rows[0] = sequence.kv->backend->bound_row();
+                CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
+                                           sizeof(qwen3_6::DFlashDecodeIngress),
+                                           cudaMemcpyHostToDevice, device.stream));
+            }
+
+            std::uint32_t cursor = base;
+            while (cursor < end) {
+                const std::uint32_t count = std::min(prefill_chunk, end - cursor);
+                schedule::PrefillContext schedule_state{
+                    {device, model, work, decoder->linear_attention,
+                     replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+                     proposal_head, attn_scale},
+                    text_kv_view(sequence),
+                    mtp_kv_view(sequence),
+                    decoder->text_kv,
+                    decoder->mtp_cache(),
+                    dflash ? &*dflash : nullptr,
+                    cursor,
+                    nullptr,
+                    nullptr,
+                    LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                    LinearStateSlots::turn_checkpoint_state_slot(sequence.lane, max_concurrency),
+                    0,
+                    dflash_host_ingress};
+                mark_workspace_usage(speculative_backend == SpeculativeBackend::Mtp
+                                         ? workspace_plan.mtp_prefill
+                                         : workspace_plan.text_prefill);
+                if (speculative_backend == SpeculativeBackend::DFlash) {
+                    mark_workspace_usage(workspace_plan.dflash_context);
+                }
+                const schedule::PrefillChunkResult result = schedule::prefill_text_chunk(
+                    schedule_state, continuation, count, std::nullopt, false);
+                if (result.finalized || result.processed_tokens == 0 ||
+                    result.processed_tokens > count) {
+                    throw std::logic_error("forced-token prefill made invalid progress");
+                }
+                cursor += result.processed_tokens;
+                sequence.text_kv_valid = cursor;
+                if (speculative_backend == SpeculativeBackend::Mtp) {
+                    sequence.mtp_kv_valid = cursor;
+                } else if (speculative_backend == SpeculativeBackend::DFlash) {
+                    sequence.dflash_context_frontier = cursor;
+                }
+                copy_tail(sequence,
+                          prefill_hidden.slice(
+                              1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
+            }
+            device.synchronize();
+            work.reset();
+
+            sequence.ledger.insert(sequence.ledger.end(), forced.begin(), forced.end());
+            sequence.prefix_identity.append_generated(row_stride, sequence.rope_delta);
+            sequence.execution_frontier = end;
+            sequence.ledger_frontier    = end + 1U;
+            sequence.mtp_draft_count    = 0;
+            sequence.tail_hidden_valid  = true;
+            if (sequence.ledger.size() != sequence.ledger_frontier ||
+                sequence.prefix_identity.size() != sequence.ledger_frontier ||
+                sequence.ledger.back() != forced.back()) {
+                throw std::logic_error("forced-token commit did not establish a valid frontier");
+            }
+            trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+            request.timings.decode_seconds +=
+                std::chrono::duration<double>(Clock::now() - started).count();
+        }
+    } catch (...) {
+        try {
+            device.synchronize();
+        } catch (...) {}
+        work.reset();
+        for (const std::uint32_t lane : lanes) {
+            if (lane < max_concurrency) { abort_lane(lane); }
+        }
+        throw;
+    }
+}
+
 void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
                                                       RequestControl& request,
                                                       std::uint32_t accepted_tokens,

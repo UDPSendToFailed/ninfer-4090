@@ -16,11 +16,15 @@ namespace {
 
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
                                                         SamplingMode mode, RequestOptions options) {
+    if (options.execution.thinking.budget && *options.execution.thinking.budget == 0) {
+        throw std::invalid_argument("thinking budget must be positive");
+    }
     runtime::ResolvedRequestOptions resolved;
     resolved.execution.sampling =
         runtime::resolve_sampling(defaults, mode, options.execution.sampling);
     resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
+    resolved.execution.thinking                = options.execution.thinking;
     resolved.stop                              = std::move(options.stop);
     resolved.output                            = options.output;
     resolved.structured_output                 = std::move(options.structured_output);
@@ -268,10 +272,11 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             }
         } immediate;
 
-        immediate.result.prompt                  = prompt_summary;
-        immediate.result.finish_reason           = FinishReason::OutputLimit;
-        immediate.result.timings.prepare_seconds = prepare_seconds;
-        immediate.result.timings.total_seconds   = prepare_seconds;
+        immediate.result.prompt                     = prompt_summary;
+        immediate.result.finish_reason              = FinishReason::OutputLimit;
+        immediate.result.thinking.configured_budget = resolved_options.execution.thinking.budget;
+        immediate.result.timings.prepare_seconds    = prepare_seconds;
+        immediate.result.timings.total_seconds      = prepare_seconds;
         prompt.impl_.reset();
         host_input.reset();
         return GenerationHandle(std::make_unique<GenerationHandle::Impl>(

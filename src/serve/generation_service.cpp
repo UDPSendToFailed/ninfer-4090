@@ -199,6 +199,11 @@ ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point dead
         error.status = 400;
         error.code   = "context_length_exceeded";
         break;
+    case ninfer::RequestErrorKind::ThinkingBudgetCapacityInsufficient:
+        error.param.clear();
+        error.status = 400;
+        error.code   = "thinking_budget_capacity_insufficient";
+        break;
     case ninfer::RequestErrorKind::MediaBudgetExceeded:
         error.status = 413;
         error.code   = "media_budget_exceeded";
@@ -360,14 +365,15 @@ GenerationService::acquire_media_input(Clock::time_point deadline,
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled) const {
     PreparedRequest prepared;
-    ninfer::RequestOptions request_options = to_request_options(request, options_);
-    prepared.include_usage                 = request.include_usage;
-    prepared.tool_capable                  = request.uses_tools() || request.has_tool_history();
-    prepared.timings_per_token             = request.timings_per_token;
-    prepared.tool_name_max_length          = request.tool_name_max_length;
+    prepared.include_usage        = request.include_usage;
+    prepared.tool_capable         = request.uses_tools() || request.has_tool_history();
+    prepared.timings_per_token    = request.timings_per_token;
+    prepared.tool_name_max_length = request.tool_name_max_length;
     const ResolvedPromptSemantics semantics =
         resolve_prompt_semantics(request, options_, prompt_capabilities_);
+    ninfer::RequestOptions request_options     = to_request_options(request, options_, semantics);
     prepared.enable_thinking                   = semantics.enable_thinking;
+    prepared.thinking_budget                   = request_options.execution.thinking.budget;
     prepared.reasoning_effort                  = semantics.reasoning_effort;
     prepared.preserve_thinking                 = semantics.preserve_thinking;
     prepared.preserve_thinking_semantic_change = request.preserve_thinking_semantic_change;
@@ -467,6 +473,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.prompt_tokens     = static_cast<int>(result.prompt.prompt_tokens);
     outcome.completion_tokens = static_cast<int>(result.generated_token_ids.size());
     outcome.reasoning_tokens  = static_cast<int>(result.reasoning_tokens);
+    outcome.thinking          = result.thinking;
     outcome.finish_reason     = result.finish_reason;
 
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;

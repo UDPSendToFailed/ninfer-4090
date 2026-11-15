@@ -31,6 +31,12 @@ using PublishedOutput   = ninfer::targets::qwen3_6::PublishedOutput;
 namespace fi            = ninfer::targets::qwen3_6::frontend_internal;
 
 constexpr std::string_view kUtf8Replacement = "\xef\xbf\xbd";
+constexpr std::string_view kThinkingControlGuidance =
+    "\n\n Considering the limited time by the user, I have to give the solution based on the "
+    "thinking directly now.\n";
+constexpr std::string_view kThinkingControl =
+    "\n\n Considering the limited time by the user, I have to give the solution based on the "
+    "thinking directly now.\n</think>\n\n";
 constexpr ninfer::TokenId kByte80Token = 13;
 constexpr ninfer::TokenId kByteE0Token = 14;
 constexpr ninfer::TokenId kByteEDToken = 15;
@@ -123,6 +129,7 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
     const nlohmann::json tokens = nlohmann::json::array(
         {added(1, "helloST"), added(2, "OPtail"), added(3, "thought</thi"),
          added(4, "nk>\n\nanswer"), added(6, "<eos>", true), added(7, "<0.0 seconds>"),
+         added(8, std::string(kThinkingControlGuidance)),
          added(30, "user\n"), added(31, "assistant\n"), added(32, "\n"),
          added(248045, "<|im_start|>", true), added(248046, "<|im_end|>", true),
          added(248053, "<|vision_start|>", true), added(248054, "<|vision_end|>", true),
@@ -766,7 +773,7 @@ int test_cross_round_stop(const Frontend& frontend) {
     auto session = frontend.make_output_session(prompt, stop);
 
     const auto first_decision =
-        session.preview(std::array<ninfer::TokenId, 1>{1}, 2, ninfer::FinishReason::OutputLimit);
+        session.preview_model(std::array<ninfer::TokenId, 1>{1}, 2, ninfer::FinishReason::OutputLimit);
     int failures     = check(first_decision.accepted_tokens == 1 && !first_decision.finished(),
                              "cross-round stop ended before the stop string was complete");
     const auto first = session.commit_preview();
@@ -775,7 +782,7 @@ int test_cross_round_stop(const Frontend& frontend) {
     failures += check(first.size() == 1 && first[0].tokens == 1, "first delta tokens count should be 1");
 
     const auto second_decision =
-        session.preview(std::array<ninfer::TokenId, 1>{2}, 1, ninfer::FinishReason::OutputLimit);
+        session.preview_model(std::array<ninfer::TokenId, 1>{2}, 1, ninfer::FinishReason::OutputLimit);
     failures += check(second_decision.accepted_tokens == 1 &&
                           second_decision.finish_reason == ninfer::FinishReason::StopString,
                       "cross-round stop did not select the exact terminal token prefix");
@@ -794,7 +801,7 @@ int test_same_token_stop_priority(const Frontend& frontend) {
     };
     auto session = frontend.make_output_session(prompt, stop);
     const auto decision =
-        session.preview(std::array<ninfer::TokenId, 1>{2}, 2, ninfer::FinishReason::OutputLimit);
+        session.preview_model(std::array<ninfer::TokenId, 1>{2}, 2, ninfer::FinishReason::OutputLimit);
     int failures      = check(decision.accepted_tokens == 1 &&
                                   decision.finish_reason == ninfer::FinishReason::StopString,
                               "same-token stop strings did not select a terminal prefix");
@@ -811,7 +818,7 @@ int test_terminal_flush(const Frontend& frontend) {
     auto session = frontend.make_output_session(prompt, stop);
 
     const auto first_decision =
-        session.preview(std::array<ninfer::TokenId, 1>{1}, 2, ninfer::FinishReason::OutputLimit);
+        session.preview_model(std::array<ninfer::TokenId, 1>{1}, 2, ninfer::FinishReason::OutputLimit);
     int failures     = check(first_decision.accepted_tokens == 1 && !first_decision.finished(),
                              "terminal flush setup unexpectedly finished");
     const auto first = session.commit_preview();
@@ -840,7 +847,7 @@ int test_reasoning_split(const Frontend& frontend) {
     auto prompt                         = frontend.prepare(std::move(input));
     auto session                        = frontend.make_output_session(prompt, {});
     const std::array<ninfer::TokenId, 2> tokens{3, 4};
-    const auto decision = session.preview(tokens, 2, ninfer::FinishReason::OutputLimit);
+    const auto decision = session.preview_model(tokens, 2, ninfer::FinishReason::OutputLimit);
     int failures        = check(decision.accepted_tokens == 2 &&
                                     decision.finish_reason == ninfer::FinishReason::OutputLimit,
                                 "reasoning output did not finish at the requested token limit");
@@ -854,22 +861,144 @@ int test_reasoning_split(const Frontend& frontend) {
     return failures;
 }
 
+ninfer::targets::qwen3_6::PreparedPrompt thinking_prompt(const Frontend& frontend) {
+    ninfer::ChatMessage message;
+    message.role = "user";
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.add_generation_prompt = true;
+    input.options.enable_thinking       = true;
+    return frontend.prepare(std::move(input));
+}
+
+int test_thinking_budget_control(const Frontend& frontend) {
+    auto prompt = thinking_prompt(frontend);
+    ninfer::StopPolicy stop;
+    stop.strings.push_back(
+        ninfer::StopString{.text = "limited", .channel = ninfer::OutputChannel::Reasoning});
+    auto session = frontend.make_output_session(
+        prompt, stop, {}, {}, ninfer::ThinkingControlOptions{.budget = 2});
+    int failures = check(session.model_token_budget_remaining(20) == 2,
+                         "thinking budget did not clamp the model round license");
+
+    const std::array<ninfer::TokenId, 2> model_tokens{0, 0};
+    const auto boundary =
+        session.preview_model(model_tokens, 20, ninfer::FinishReason::OutputLimit);
+    failures +=
+        check(boundary.accepted_tokens == model_tokens.size() && !boundary.finished() &&
+                  boundary.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+              "thinking boundary did not request target control");
+    const auto model_output = session.commit_preview();
+    failures += check(channel_text(model_output, ninfer::OutputChannel::Reasoning) == "xx",
+                      "model-origin thinking output was not published before control");
+
+    const std::span<const ninfer::TokenId> pending = session.pending_control_tokens();
+    failures += check(pending.size() > 1,
+                      "thinking boundary did not expose a multi-token canonical control span");
+    const std::vector<ninfer::TokenId> control(pending.begin(), pending.end());
+    failures += check(
+        throws_invalid_argument([&] {
+            session.validate_generation_capacity(static_cast<std::uint32_t>(2 + control.size()));
+        }),
+        "planning accepted a capacity that cannot fit control plus a post-close model token");
+    session.validate_generation_capacity(static_cast<std::uint32_t>(3 + control.size()));
+
+    const auto control_decision = session.preview_control(control, 18);
+    failures +=
+        check(control_decision.accepted_tokens == control.size() && !control_decision.finished(),
+              "canonical thinking control was not accepted atomically");
+    const auto control_output = session.commit_preview();
+    failures += check(channel_text(control_output, ninfer::OutputChannel::Reasoning) ==
+                              kThinkingControlGuidance &&
+                          channel_text(control_output, ninfer::OutputChannel::Content).empty(),
+                      "thinking control was truncated by caller stops or published to content");
+    const ninfer::ThinkingBudgetStats stats = session.thinking_stats();
+    failures += check(stats.configured_budget == 2 && stats.model_thinking_tokens == 2 &&
+                          stats.injected_tokens == control.size() && stats.applied &&
+                          session.pending_control_tokens().empty() &&
+                          session.model_token_budget_remaining(17) == 17,
+                      "thinking control accounting or post-close license is incorrect");
+
+    const auto content_decision = session.preview_model(std::array<ninfer::TokenId, 1>{0}, 17,
+                                                        ninfer::FinishReason::OutputLimit);
+    failures +=
+        check(!content_decision.finished(), "post-control model token unexpectedly terminated");
+    const auto content_output = session.commit_preview();
+    failures += check(channel_text(content_output, ninfer::OutputChannel::Content) == "x",
+                      "post-control model output did not enter the content channel");
+
+    auto natural_prompt  = thinking_prompt(frontend);
+    auto natural_session = frontend.make_output_session(
+        natural_prompt, {}, {}, {}, ninfer::ThinkingControlOptions{.budget = 2});
+    const auto natural = natural_session.preview_model(std::array<ninfer::TokenId, 2>{3, 4}, 20,
+                                                       ninfer::FinishReason::OutputLimit);
+    failures += check(!natural.finished() &&
+                          natural.continuation == ninfer::runtime::ContinuationAction::Decode,
+                      "natural thinking close at the budget boundary requested control");
+    (void)natural_session.commit_preview();
+    failures += check(natural_session.pending_control_tokens().empty() &&
+                          !natural_session.thinking_stats().applied,
+                      "natural thinking close left control armed");
+
+    auto terminal_prompt  = thinking_prompt(frontend);
+    auto terminal_session = frontend.make_output_session(
+        terminal_prompt, {}, {}, {}, ninfer::ThinkingControlOptions{.budget = 1});
+    const auto terminal = terminal_session.preview_model(std::array<ninfer::TokenId, 1>{6}, 10,
+                                                         ninfer::FinishReason::OutputLimit);
+    failures += check(terminal.finish_reason == ninfer::FinishReason::StopToken &&
+                          terminal.continuation == ninfer::runtime::ContinuationAction::Decode,
+                      "terminal token at the thinking boundary did not take priority");
+    (void)terminal_session.commit_preview();
+    failures += check(terminal_session.pending_control_tokens().empty(),
+                      "terminal thinking boundary left control pending");
+
+    auto limit_prompt  = thinking_prompt(frontend);
+    auto limit_session = frontend.make_output_session(
+        limit_prompt, {}, {}, {}, ninfer::ThinkingControlOptions{.budget = 1});
+    const auto limited = limit_session.preview_model(std::array<ninfer::TokenId, 1>{0}, 1,
+                                                     ninfer::FinishReason::ContextCapacity);
+    failures += check(limited.finish_reason == ninfer::FinishReason::ContextCapacity &&
+                          limited.continuation == ninfer::runtime::ContinuationAction::Decode,
+                      "total capacity did not take priority at the thinking boundary");
+    (void)limit_session.commit_preview();
+
+    auto raw_prompt  = thinking_prompt(frontend);
+    auto raw_session = frontend.make_output_session(
+        raw_prompt, {}, ninfer::OutputOptions{.raw = true}, {},
+        ninfer::ThinkingControlOptions{.budget = 1});
+    const auto raw_boundary = raw_session.preview_model(std::array<ninfer::TokenId, 1>{0}, 10,
+                                                        ninfer::FinishReason::OutputLimit);
+    failures +=
+        check(raw_boundary.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+              "raw presentation disabled semantic thinking control");
+    (void)raw_session.commit_preview();
+    const std::vector<ninfer::TokenId> raw_tokens(raw_session.pending_control_tokens().begin(),
+                                                  raw_session.pending_control_tokens().end());
+    (void)raw_session.preview_control(raw_tokens, 9);
+    const auto raw_output = raw_session.commit_preview();
+    failures += check(channel_text(raw_output, ninfer::OutputChannel::Content) == kThinkingControl,
+                      "raw output did not preserve the inserted control representation");
+    return failures;
+}
+
 int test_utf8_and_hidden_eos(const Frontend& frontend) {
     auto prompt             = frontend.prepare_tokens({0});
     auto session            = frontend.make_output_session(prompt, {});
     int failures            = 0;
     std::uint32_t remaining = 4;
     for (const ninfer::TokenId token : {10, 11}) {
-        const auto decision = session.preview(std::array<ninfer::TokenId, 1>{token}, remaining,
-                                              ninfer::FinishReason::OutputLimit);
+        const auto decision = session.preview_model(std::array<ninfer::TokenId, 1>{token}, remaining,
+                                                    ninfer::FinishReason::OutputLimit);
         failures += check(decision.accepted_tokens == 1 && !decision.finished(),
                           "partial UTF-8 token unexpectedly ended generation");
         const auto output = session.commit_preview();
         remaining -= decision.accepted_tokens;
         failures += check(output.empty(), "partial UTF-8 codepoint was published");
     }
-    const auto complete_decision = session.preview(std::array<ninfer::TokenId, 1>{12}, remaining,
-                                                   ninfer::FinishReason::OutputLimit);
+    const auto complete_decision = session.preview_model(std::array<ninfer::TokenId, 1>{12}, remaining,
+                                                         ninfer::FinishReason::OutputLimit);
     failures += check(complete_decision.accepted_tokens == 1 && !complete_decision.finished(),
                       "complete UTF-8 token unexpectedly ended generation");
     const auto complete = session.commit_preview();
@@ -885,14 +1014,14 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
         if (one_token_per_round) {
             for (const ninfer::TokenId token : tokens) {
                 const auto decision =
-                    generated_session.preview(std::array<ninfer::TokenId, 1>{token}, budget,
-                                              ninfer::FinishReason::OutputLimit);
+                    generated_session.preview_model(std::array<ninfer::TokenId, 1>{token}, budget,
+                                                    ninfer::FinishReason::OutputLimit);
                 budget -= decision.accepted_tokens;
                 text += channel_text(generated_session.commit_preview(),
                                      ninfer::OutputChannel::Content);
             }
         } else {
-            (void)generated_session.preview(tokens, budget, ninfer::FinishReason::OutputLimit);
+            (void)generated_session.preview_model(tokens, budget, ninfer::FinishReason::OutputLimit);
             text = channel_text(generated_session.commit_preview(), ninfer::OutputChannel::Content);
         }
         return text;
@@ -938,7 +1067,7 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
     ninfer::StopPolicy repaired_stop;
     repaired_stop.strings.push_back(ninfer::StopString{.text = "STOP"});
     auto repaired_stop_session = frontend.make_output_session(repaired_stop_prompt, repaired_stop);
-    const auto repaired_stop_decision = repaired_stop_session.preview(
+    const auto repaired_stop_decision = repaired_stop_session.preview_model(
         std::array<ninfer::TokenId, 3>{10, 1, 2}, 3, ninfer::FinishReason::OutputLimit);
     failures += check(repaired_stop_decision.finish_reason == ninfer::FinishReason::StopString,
                       "UTF-8 recovery hid a following stop string");
@@ -958,7 +1087,7 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
     auto repaired_reasoning_prompt             = frontend.prepare(std::move(thinking_inp));
     auto repaired_reasoning_session =
         frontend.make_output_session(repaired_reasoning_prompt, {});
-    const auto repaired_reasoning_decision = repaired_reasoning_session.preview(
+    const auto repaired_reasoning_decision = repaired_reasoning_session.preview_model(
         std::array<ninfer::TokenId, 3>{10, 3, 4}, 3, ninfer::FinishReason::OutputLimit);
     failures +=
         check(repaired_reasoning_decision.finish_reason == ninfer::FinishReason::OutputLimit,
@@ -972,8 +1101,8 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
 
     auto eos_prompt         = frontend.prepare_tokens({0});
     auto eos_session        = frontend.make_output_session(eos_prompt, {});
-    const auto eos_decision = eos_session.preview(std::array<ninfer::TokenId, 1>{6}, 2,
-                                                  ninfer::FinishReason::OutputLimit);
+    const auto eos_decision = eos_session.preview_model(std::array<ninfer::TokenId, 1>{6}, 2,
+                                                        ninfer::FinishReason::OutputLimit);
     failures += check(eos_decision.accepted_tokens == 1 &&
                           eos_decision.finish_reason == ninfer::FinishReason::StopToken,
                       "default EOS token did not end generation");
@@ -983,8 +1112,8 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
     auto raw_prompt  = frontend.prepare_tokens({0});
     auto raw_session = frontend.make_output_session(
         raw_prompt, {}, ninfer::OutputOptions{.raw = true, .preserve_special_tokens = false});
-    const auto raw_eos_decision = raw_session.preview(std::array<ninfer::TokenId, 1>{6}, 2,
-                                                      ninfer::FinishReason::OutputLimit);
+    const auto raw_eos_decision = raw_session.preview_model(std::array<ninfer::TokenId, 1>{6}, 2,
+                                                            ninfer::FinishReason::OutputLimit);
     failures += check(raw_eos_decision.accepted_tokens == 1 &&
                           raw_eos_decision.finish_reason == ninfer::FinishReason::StopToken,
                       "raw EOS token did not end generation");
@@ -1018,7 +1147,7 @@ int test_speculative_output_token_count(const Frontend& frontend) {
     auto session = frontend.make_output_session(prompt, stop);
 
     const auto decision =
-        session.preview(std::array<ninfer::TokenId, 2>{1, 1}, 4, ninfer::FinishReason::OutputLimit);
+        session.preview_model(std::array<ninfer::TokenId, 2>{1, 1}, 4, ninfer::FinishReason::OutputLimit);
     int failures = check(decision.accepted_tokens == 2, "accepted 2 speculative tokens");
     const auto output = session.commit_preview();
     failures += check(output.size() == 1, "emitted one merged delta");
@@ -1113,6 +1242,7 @@ int main() {
         failures += test_same_token_stop_priority(frontend);
         failures += test_terminal_flush(frontend);
         failures += test_reasoning_split(frontend);
+        failures += test_thinking_budget_control(frontend);
         failures += test_utf8_and_hidden_eos(frontend);
         failures += test_disabled_vision();
         failures += test_speculative_output_token_count(frontend);

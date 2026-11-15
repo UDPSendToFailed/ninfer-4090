@@ -81,6 +81,12 @@ ninfer::PromptInput translate(const GenerationRequest& req) {
                            fake_media);
 }
 
+ninfer::RequestOptions translate_options(const GenerationRequest& req) {
+    const ServeOptions server = default_server();
+    return to_request_options(req, server,
+                              resolve_prompt_semantics(req, server, effort_capabilities()));
+}
+
 std::string joined_text(const ninfer::ChatMessage& message) {
     std::string text;
     for (const ninfer::MessagePart& part : message.parts) {
@@ -288,7 +294,7 @@ int test_tools_and_choice() {
     failures += check(req.tools[0].name == "get_weather", "tool name parsed");
     failures += check(req.tool_choice.mode == ToolChoiceMode::Auto, "auto -> Auto");
     failures += check(req.uses_tools(), "uses_tools true");
-    failures += check(to_request_options(req, default_server()).output.preserve_special_tokens,
+    failures += check(translate_options(req).output.preserve_special_tokens,
                       "active tools preserve special tokens in Engine output");
     // definition_json must be a normalized OpenAI function-tool object for the
     // Qwen <tools> renderer.
@@ -420,9 +426,11 @@ int test_thinking_and_sampling() {
     failures += check(req.enable_thinking.has_value() && *req.enable_thinking, "thinking enabled");
     failures += check(!req.preserve_thinking.has_value(),
                       "Anthropic thinking.type unexpectedly enabled history preservation");
-    const ninfer::RequestOptions options = to_request_options(req, default_server());
+    const ninfer::RequestOptions options = translate_options(req);
     failures +=
         check(options.execution.requested_output_tokens == 8, "max_tokens reaches Engine options");
+    failures += check(!options.execution.thinking.budget,
+                      "Anthropic budget_tokens unexpectedly became a request-level thinking cap");
     failures += check(options.execution.sampling.temperature == 0.3F &&
                           options.execution.sampling.top_p == 0.8F &&
                           options.execution.sampling.top_k == 40 &&

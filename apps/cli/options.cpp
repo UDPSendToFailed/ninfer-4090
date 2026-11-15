@@ -118,6 +118,8 @@ std::string usage_text(const char* argv0) {
            "  --vision-max-tokens <N>     Vision scratchpad token capacity (default: 8192)\n\n"
            "Reasoning & Output Control:\n"
            "  --no-thinking               Disable deep reasoning/thinking mode (applies non-thinking defaults)\n"
+           "  --thinking-budget <N>       Cap model-origin thinking tokens; inserted control tokens count\n"
+           "                              toward --max-new\n"
            "  --reasoning-effort <effort> Set thinking depth budget preset (low | medium | xhigh)\n"
            "  --raw-output                Stream raw tokens directly without stripping reasoning tags\n"
            "  --print-token-ids           Print emitted token IDs alongside output to stderr\n"
@@ -181,6 +183,8 @@ Options parse_options(int argc, char** argv) {
             options.print_token_ids = true;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
+        } else if (arg == "--thinking-budget") {
+            options.thinking_budget = parse_u32(value(arg), "thinking-budget");
         } else if (arg == "--reasoning-effort") {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
         } else if (arg == "--vision") {
@@ -256,6 +260,9 @@ Options parse_options(int argc, char** argv) {
     }
     if (!options.enable_thinking && options.reasoning_effort) {
         throw std::invalid_argument("--reasoning-effort cannot be combined with --no-thinking");
+    }
+    if (!options.enable_thinking && options.thinking_budget) {
+        throw std::invalid_argument("--thinking-budget cannot be combined with --no-thinking");
     }
     if (options.greedy) { options.sampling.temperature = 0.0F; }
     return options;

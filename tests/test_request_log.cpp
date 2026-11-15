@@ -59,6 +59,7 @@ int main() {
     options.enable_vision                  = false;
     options.allow_prefix_reuse             = false;
     options.preserve_thinking              = true;
+    options.default_thinking_budget        = 512;
     options.sampling_overrides.temperature = 0.6F;
     options.startup_argv = {"ninfer-serve", options.artifact_path, "--api-key", "<redacted>"};
 
@@ -145,6 +146,8 @@ int main() {
         check(server.at("engine").at("prefix_reuse") == false, "prefix-reuse state missing");
     failures += check(server.at("server").at("default_preserve_thinking") == true,
                       "server preserve-thinking default missing");
+    failures += check(server.at("server").at("default_thinking_budget") == 512,
+                      "server thinking budget missing");
     failures +=
         check(server.at("sampling_defaults").at("thinking").at("temperature") == 1.0 &&
                   server.at("sampling_defaults").at("non_thinking").at("presence_penalty") == 1.5,
@@ -181,7 +184,8 @@ int main() {
     request.messages.resize(2);
 
     PreparedRequest prepared;
-    prepared.enable_thinking                   = false;
+    prepared.enable_thinking                   = true;
+    prepared.thinking_budget                   = 256;
     prepared.preserve_thinking                 = true;
     prepared.preserve_thinking_semantic_change = true;
     prepared.sampling.temperature              = 0.6F;
@@ -199,8 +203,10 @@ int main() {
         check(started.at("request").at("request_id") == 7, "request id missing from start record");
     failures += check(started.at("request").at("requested_output_tokens") == 4096,
                       "request output budget missing");
-    failures += check(started.at("request").at("enable_thinking") == false,
+    failures += check(started.at("request").at("enable_thinking") == true,
                       "resolved thinking mode missing");
+    failures += check(started.at("request").at("thinking_budget") == 256,
+                      "resolved thinking budget missing");
     failures += check(started.at("request").at("preserve_thinking") == true &&
                           started.at("request").at("preserve_thinking_semantic_change") == true,
                       "resolved preserve-thinking metadata missing");
@@ -226,6 +232,10 @@ int main() {
     outcome.metrics.speculative_accepted_tokens = 720;
     outcome.metrics.speculative_fallback_steps  = 2;
     outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
+    outcome.thinking = ninfer::ThinkingBudgetStats{.configured_budget     = 256,
+                                                   .model_thinking_tokens = 256,
+                                                   .injected_tokens       = 19,
+                                                   .applied               = true};
 
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
     failures +=
@@ -235,6 +245,11 @@ int main() {
                       "computed prefill tokens missing");
     failures += check(done.at("result").at("prefix_reuse_path") == "restore_turn_checkpoint",
                       "prefix reuse path missing");
+    failures += check(done.at("result").at("thinking_budget") == 256 &&
+                          done.at("result").at("model_thinking_tokens") == 256 &&
+                          done.at("result").at("thinking_control_tokens") == 19 &&
+                          done.at("result").at("thinking_control_applied") == true,
+                      "thinking-control result accounting missing");
     failures += check(done.at("timings_seconds").at("decode").get<double>() ==
                           outcome.metrics.decode_seconds,
                       "decode time lost precision");
@@ -256,8 +271,10 @@ int main() {
     failures += check(error.at("error").at("message") == "generation failed",
                       "request error message missing");
 
-    failures += check(format_request_start(context).find("thinking=off") != std::string::npos,
-                      "human request log omits resolved thinking mode");
+    failures +=
+        check(format_request_start(context).find("thinking=on") != std::string::npos &&
+                  format_request_start(context).find("thinking_budget=256") != std::string::npos,
+              "human request log omits resolved thinking control");
     failures +=
         check(format_request_start(context).find("preserve_thinking=on") != std::string::npos,
               "human request log omits preserve-thinking mode");

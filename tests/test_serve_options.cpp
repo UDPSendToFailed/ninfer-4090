@@ -49,6 +49,8 @@ int main() {
                       "model id override is unexpectedly configured by default");
     failures += check(!defaults.default_reasoning_effort.has_value(),
                       "reasoning effort is unexpectedly configured by default");
+    failures += check(!defaults.default_thinking_budget,
+                      "thinking budget is unexpectedly limited by default");
     failures += check(
         !defaults.sampling_overrides.temperature && !defaults.sampling_overrides.top_p &&
             !defaults.sampling_overrides.top_k && !defaults.sampling_overrides.presence_penalty &&
@@ -169,22 +171,46 @@ int main() {
                           sampling.sampling_overrides.seed == 0,
                       "server sampling flags did not preserve explicit values and zeros");
 
+    const ServeOptions thinking_budget =
+        parse({"ninfer-serve", "model.ninfer", "--default-thinking-budget", "37"});
+    failures += check(thinking_budget.default_thinking_budget == 37,
+                      "--default-thinking-budget did not preserve its positive value");
+    bool zero_thinking_budget_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--default-thinking-budget", "0"});
+    } catch (const std::invalid_argument&) { zero_thinking_budget_rejected = true; }
+    failures += check(zero_thinking_budget_rejected, "zero --default-thinking-budget was accepted");
+
     GenerationRequest request;
     request.max_tokens = 1;
     ninfer::PromptCapabilities prompt_capabilities;
     prompt_capabilities.enable_thinking = true;
-    failures += check(to_request_options(request, defaults).execution.allow_prefix_reuse,
+    const auto semantics = resolve_prompt_semantics(request, defaults, prompt_capabilities);
+    failures += check(to_request_options(request, defaults, semantics).execution.allow_prefix_reuse,
                       "default server policy did not reach Engine options");
-    failures += check(!to_request_options(request, configured).execution.allow_prefix_reuse,
-                      "disabled server policy did not reach Engine options");
-    const ninfer::RequestOptions inherited_sampling = to_request_options(request, sampling);
+    failures +=
+        check(!to_request_options(request, configured, semantics).execution.allow_prefix_reuse,
+              "disabled server policy did not reach Engine options");
+    const ninfer::RequestOptions inherited_sampling =
+        to_request_options(request, sampling, semantics);
     failures += check(inherited_sampling.execution.sampling.temperature == 0.0F &&
                           inherited_sampling.execution.sampling.top_p == 0.9F &&
                           inherited_sampling.execution.sampling.seed == 0,
                       "server sampling overrides did not reach Engine options");
     request.sampling.temperature = 1.1;
-    failures += check(to_request_options(request, sampling).execution.sampling.temperature == 1.1F,
-                      "request sampling override did not win over the server override");
+    failures += check(
+        to_request_options(request, sampling, semantics).execution.sampling.temperature == 1.1F,
+        "request sampling override did not win over the server override");
+    failures += check(
+        to_request_options(request, thinking_budget, semantics).execution.thinking.budget == 37,
+        "thinking-enabled request did not inherit the server budget");
+    request.enable_thinking = false;
+    const auto non_thinking =
+        resolve_prompt_semantics(request, thinking_budget, prompt_capabilities);
+    failures +=
+        check(!to_request_options(request, thinking_budget, non_thinking).execution.thinking.budget,
+              "non-thinking request inherited the server thinking budget");
+    request.enable_thinking.reset();
     failures +=
         check(resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
               "server preserve-thinking default was not resolved");
@@ -255,6 +281,9 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--preserve-thinking") != std::string::npos,
               "serve help omits --preserve-thinking");
+    failures += check(serve_usage_text("ninfer-serve").find("--default-thinking-budget") !=
+                          std::string::npos,
+                      "serve help omits --default-thinking-budget");
     failures +=
         check(serve_usage_text("ninfer-serve").find("--reasoning-effort") != std::string::npos,
               "serve help omits --reasoning-effort");

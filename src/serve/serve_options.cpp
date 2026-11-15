@@ -126,6 +126,8 @@ std::string serve_usage_text(const char* argv0) {
            "  --vision-max-tokens <N>     Vision scratchpad token capacity (default: 8192)\n\n"
            "Reasoning & Generation Defaults:\n"
            "  --default-max-tokens <N>    Default maximum output tokens when omitted in client request (default: " + default_max_toks + ")\n"
+           "  --default-thinking-budget <N>  Cap model-origin thinking for enabled requests; control tokens count\n"
+           "                                 toward the request output limit\n"
            "  --no-thinking               Disable reasoning/thinking mode globally by default\n"
            "  --preserve-thinking         Retain closed-turn assistant reasoning in multi-turn conversation history\n"
            "  --reasoning-effort <effort> Default thinking depth preset (low | medium | xhigh) when omitted by client\n\n"
@@ -269,6 +271,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
+        } else if (arg == "--default-thinking-budget") {
+            const std::uint64_t budget =
+                parse_u64(require_value("--default-thinking-budget"), "default-thinking-budget");
+            if (budget == 0 || budget > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::invalid_argument("--default-thinking-budget is out of range");
+            }
+            options.default_thinking_budget = static_cast<std::uint32_t>(budget);
         } else if (arg == "--preserve-thinking") {
             options.preserve_thinking = true;
         } else if (arg == "--reasoning-effort" || arg == "--thinking-effort") {

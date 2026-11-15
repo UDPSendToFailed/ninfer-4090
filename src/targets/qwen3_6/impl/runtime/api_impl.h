@@ -186,6 +186,13 @@ Program<Variant>::decode_batch(std::span<const std::uint32_t> lanes,
 }
 
 template <>
+void Program<Variant>::append_forced_tokens_lanes(std::span<const std::uint32_t> lanes,
+                                                  std::span<const TokenId> row_major_tokens,
+                                                  std::uint32_t row_stride) {
+    impl_->append_forced_tokens_lanes(lanes, row_major_tokens, row_stride);
+}
+
+template <>
 void Program<Variant>::set_token_mask_lane(std::uint32_t lane,
                                            std::span<const std::uint32_t> mask) {
     impl_->set_token_mask_lane(lane, mask);
