@@ -24,84 +24,92 @@ inline constexpr std::size_t kGdnLayers           = 30;
 inline constexpr std::size_t kDFlashLayers        = 6;
 
 struct MoePlan {
-    artifact::ObjectHandle router_shared_gate;
-    artifact::ObjectHandle routed_gate_up;
-    artifact::ObjectHandle routed_down;
-    artifact::ObjectHandle shared_gate_up;
-    artifact::ObjectHandle shared_down;
+    artifact::ParameterReference router_shared_gate;
+    artifact::ParameterReference routed_gate_up;
+    artifact::ParameterReference routed_down;
+    artifact::ParameterReference shared_gate_up;
+    artifact::ParameterReference shared_down;
 };
 
 struct FullAttentionPlan {
-    artifact::ObjectHandle query_key_gate_value;
-    artifact::ObjectHandle query_norm;
-    artifact::ObjectHandle key_norm;
-    artifact::ObjectHandle output;
+    artifact::ParameterReference query_key_gate_value;
+    artifact::ParameterReference query_norm;
+    artifact::ParameterReference key_norm;
+    artifact::ParameterReference output;
 };
 
 struct GdnPlan {
-    artifact::ObjectHandle a_log;
-    artifact::ObjectHandle dt_bias;
-    artifact::ObjectHandle convolution;
-    artifact::ObjectHandle a_b_projection;
-    artifact::ObjectHandle query_key_value_z;
-    artifact::ObjectHandle norm;
-    artifact::ObjectHandle output;
+    artifact::ParameterReference a_log;
+    artifact::ParameterReference dt_bias;
+    artifact::ParameterReference convolution;
+    artifact::ParameterReference a_b_projection;
+    artifact::ParameterReference query_key_value_z;
+    artifact::ParameterReference norm;
+    artifact::ParameterReference output;
 };
 
 struct TextLayerPlan {
-    artifact::ObjectHandle input_norm;
+    artifact::ParameterReference input_norm;
     FullAttentionPlan attention{};
     GdnPlan gdn{};
     bool is_full_attention = false;
-    artifact::ObjectHandle post_attention_norm;
+    artifact::ParameterReference post_attention_norm;
     MoePlan moe;
 };
 
 struct MtpPlan {
-    artifact::ObjectHandle input_projection;
-    artifact::ObjectHandle embedding_norm;
-    artifact::ObjectHandle hidden_norm;
-    artifact::ObjectHandle input_norm;
+    artifact::ParameterReference input_projection;
+    artifact::ParameterReference embedding_norm;
+    artifact::ParameterReference hidden_norm;
+    artifact::ParameterReference input_norm;
     FullAttentionPlan attention;
-    artifact::ObjectHandle post_attention_norm;
+    artifact::ParameterReference post_attention_norm;
     MoePlan moe;
-    artifact::ObjectHandle final_norm;
+    artifact::ParameterReference final_norm;
 };
 
 struct DFlashLayerPlan {
-    artifact::ObjectHandle input_norm;
-    artifact::ObjectHandle query_key_value;
-    artifact::ObjectHandle query_norm;
-    artifact::ObjectHandle key_norm;
-    artifact::ObjectHandle attention_output;
-    artifact::ObjectHandle post_attention_norm;
-    artifact::ObjectHandle gate_up;
-    artifact::ObjectHandle down;
+    artifact::ParameterReference input_norm;
+    artifact::ParameterReference query_key_value;
+    artifact::ParameterReference query_norm;
+    artifact::ParameterReference key_norm;
+    artifact::ParameterReference attention_output;
+    artifact::ParameterReference post_attention_norm;
+    artifact::ParameterReference gate_up;
+    artifact::ParameterReference down;
 };
 
 struct DFlashPlan {
-    artifact::ObjectHandle feature_projection;
-    artifact::ObjectHandle context_norm;
+    artifact::ParameterReference feature_projection;
+    artifact::ParameterReference context_norm;
     std::array<DFlashLayerPlan, kDFlashLayers> layers;
-    artifact::ObjectHandle final_norm;
+    artifact::ParameterReference final_norm;
+};
+
+struct VisionPlan {
+    qwen3_6::VisionBackbonePlan backbone;
+    qwen3_6::VisionMergerInputPlan merger_input;
+    artifact::ParameterReference merger_fc2;
+    artifact::ParameterReference merger_fc2_bias;
+    qwen3_6::VisionMergerNormPlan merger_norm;
+};
+
+struct ProposalPlan {
+    artifact::ParameterReference head;
+    artifact::ParameterReference token_ids;
 };
 
 struct BindingPlan {
     qwen3_6::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
-    artifact::ObjectHandle token_embedding;
+    artifact::ParameterReference token_embedding;
     std::array<TextLayerPlan, kTextLayers> text_layers;
-    artifact::ObjectHandle final_norm;
-    artifact::ObjectHandle output_head;
-    artifact::ObjectHandle draft_head;
-    artifact::ObjectHandle draft_head_token_ids;
-    MtpPlan mtp;
-    qwen3_6::VisionBackbonePlan vision_backbone;
-    qwen3_6::VisionMergerInputPlan vision_merger_input;
-    artifact::ObjectHandle vision_merger_fc2;
-    artifact::ObjectHandle vision_merger_fc2_bias;
-    qwen3_6::VisionMergerNormPlan vision_merger_norm;
-    DFlashPlan dflash;
+    artifact::ParameterReference final_norm;
+    artifact::ParameterReference output_head;
+    std::optional<ProposalPlan> proposal;
+    std::optional<MtpPlan> mtp;
+    std::optional<VisionPlan> vision;
+    std::optional<DFlashPlan> dflash;
 };
 
 struct ArtifactLoadPlan {
@@ -152,11 +160,10 @@ public:
 
 class LoadedModel::Impl {
 public:
-    Impl(WeightsProfile weights_profile_in, BindingPlan plan,
-         artifact::MaterializedArtifact materialized)
-        : weights_profile(weights_profile_in), data(std::move(plan), std::move(materialized)) {}
+    Impl(WeightsProfile weights_profile, BindingPlan plan, artifact::MaterializedArtifact materialized)
+        : weights_profile(weights_profile), data(std::move(plan), std::move(materialized)) {}
 
-    WeightsProfile weights_profile;
+    WeightsProfile weights_profile = WeightsProfile::GroupwiseInt;
     LoadedModelData data;
 };
 

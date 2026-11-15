@@ -29,35 +29,39 @@ struct VisionBackboneConfig {
 };
 
 struct VisionLayerPlan {
-    artifact::ObjectHandle qkv;
-    artifact::ObjectHandle qkv_bias;
-    artifact::ObjectHandle output;
-    artifact::ObjectHandle output_bias;
-    artifact::ObjectHandle fc1;
-    artifact::ObjectHandle fc1_bias;
-    artifact::ObjectHandle fc2;
-    artifact::ObjectHandle fc2_bias;
-    artifact::ObjectHandle norm1_weight;
-    artifact::ObjectHandle norm1_bias;
-    artifact::ObjectHandle norm2_weight;
-    artifact::ObjectHandle norm2_bias;
+    artifact::ParameterReference query;
+    artifact::ParameterReference key;
+    artifact::ParameterReference value;
+    artifact::ParameterReference query_bias;
+    artifact::ParameterReference key_bias;
+    artifact::ParameterReference value_bias;
+    artifact::ParameterReference output;
+    artifact::ParameterReference output_bias;
+    artifact::ParameterReference fc1;
+    artifact::ParameterReference fc1_bias;
+    artifact::ParameterReference fc2;
+    artifact::ParameterReference fc2_bias;
+    artifact::ParameterReference norm1_weight;
+    artifact::ParameterReference norm1_bias;
+    artifact::ParameterReference norm2_weight;
+    artifact::ParameterReference norm2_bias;
 };
 
 struct VisionBackbonePlan {
-    artifact::ObjectHandle patch_embedding;
-    artifact::ObjectHandle patch_embedding_bias;
-    artifact::ObjectHandle position_embedding;
+    artifact::ParameterReference patch_embedding;
+    artifact::ParameterReference patch_embedding_bias;
+    artifact::ParameterReference position_embedding;
     std::array<VisionLayerPlan, VisionBackboneConfig::layers> layers;
 };
 
 struct VisionMergerInputPlan {
-    artifact::ObjectHandle fc1;
-    artifact::ObjectHandle fc1_bias;
+    artifact::ParameterReference fc1;
+    artifact::ParameterReference fc1_bias;
 };
 
 struct VisionMergerNormPlan {
-    artifact::ObjectHandle weight;
-    artifact::ObjectHandle bias;
+    artifact::ParameterReference weight;
+    artifact::ParameterReference bias;
 };
 
 struct VisionLayerWeights {
@@ -92,15 +96,14 @@ struct VisionWeights {
     Tensor merger_fc2_bias;
 };
 
-[[nodiscard]] VisionBackbonePlan bind_vision_backbone(artifact::Binder& binder,
-                                                      artifact::TensorPlacement placement);
-[[nodiscard]] VisionMergerInputPlan bind_vision_merger_input(artifact::Binder& binder,
-                                                             artifact::TensorPlacement placement);
-[[nodiscard]] VisionMergerNormPlan bind_vision_merger_norm(artifact::Binder& binder,
-                                                           artifact::TensorPlacement placement);
+[[nodiscard]] VisionBackbonePlan bind_vision_backbone(artifact::Binder& binder);
+[[nodiscard]] VisionMergerInputPlan bind_vision_merger_input(artifact::Binder& binder);
+[[nodiscard]] VisionMergerNormPlan bind_vision_merger_norm(artifact::Binder& binder);
 
-[[nodiscard]] VisionCommonWeights materialize_vision_common(
-    const artifact::MaterializedArtifact& materialized, const VisionBackbonePlan& backbone,
-    const VisionMergerInputPlan& merger_input, const VisionMergerNormPlan& merger_norm);
+[[nodiscard]] VisionCommonWeights
+materialize_vision_common(const artifact::MaterializedArtifact& materialized,
+                          const VisionBackbonePlan& backbone,
+                          const VisionMergerInputPlan& merger_input,
+                          const VisionMergerNormPlan& merger_norm);
 
 } // namespace ninfer::targets::qwen3_6

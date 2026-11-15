@@ -13,6 +13,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <utility>
 #include <variant>
 
@@ -22,92 +23,86 @@ inline constexpr std::size_t kTextLayers          = 64;
 inline constexpr std::size_t kFullAttentionLayers = 16;
 inline constexpr std::size_t kGdnLayers           = 48;
 
-struct WeightPlan {
-    artifact::ObjectHandle object;
-    artifact::NumericFormat format = artifact::NumericFormat::BF16;
-};
-
 struct MlpPlan {
-    WeightPlan gate_up;
-    WeightPlan down;
-};
-
-struct SplitAttentionProjectionPlan {
-    WeightPlan query_key;
-    WeightPlan gate_value;
-};
-
-struct FusedAttentionProjectionPlan {
-    WeightPlan query_key_gate_value;
+    artifact::ParameterReference gate;
+    artifact::ParameterReference up;
+    artifact::ParameterReference down;
 };
 
 struct FullAttentionPlan {
-    std::variant<SplitAttentionProjectionPlan, FusedAttentionProjectionPlan> projection;
-    artifact::ObjectHandle query_norm;
-    artifact::ObjectHandle key_norm;
-    WeightPlan output;
-};
-
-struct SplitGdnInputProjectionPlan {
-    WeightPlan query_key;
-    WeightPlan value_z;
-};
-
-struct FusedGdnInputProjectionPlan {
-    WeightPlan query_key_value_z;
+    artifact::ParameterReference query;
+    artifact::ParameterReference key;
+    artifact::ParameterReference gate;
+    artifact::ParameterReference value;
+    artifact::ParameterReference query_norm;
+    artifact::ParameterReference key_norm;
+    artifact::ParameterReference output;
 };
 
 struct GdnPlan {
-    artifact::ObjectHandle a_log;
-    artifact::ObjectHandle dt_bias;
-    artifact::ObjectHandle convolution;
-    artifact::ObjectHandle a_projection;
-    artifact::ObjectHandle b_projection;
-    std::variant<SplitGdnInputProjectionPlan, FusedGdnInputProjectionPlan> input_projection;
-    artifact::ObjectHandle norm;
-    WeightPlan output;
+    artifact::ParameterReference a_log;
+    artifact::ParameterReference dt_bias;
+    artifact::ParameterReference convolution;
+    artifact::ParameterReference a_projection;
+    artifact::ParameterReference b_projection;
+    artifact::ParameterReference query;
+    artifact::ParameterReference key;
+    artifact::ParameterReference value;
+    artifact::ParameterReference z;
+    artifact::ParameterReference norm;
+    artifact::ParameterReference output;
 };
 
 struct TextLayerPlan {
-    artifact::ObjectHandle input_norm;
+    artifact::ParameterReference input_norm;
     FullAttentionPlan attention{};
     GdnPlan gdn{};
     bool is_full_attention = false;
-    artifact::ObjectHandle post_attention_norm;
+    artifact::ParameterReference post_attention_norm;
     MlpPlan mlp;
 };
 
 struct MtpPlan {
-    artifact::ObjectHandle input_projection;
-    artifact::ObjectHandle embedding_norm;
-    artifact::ObjectHandle hidden_norm;
-    artifact::ObjectHandle input_norm;
-    artifact::ObjectHandle query_key_gate_value;
-    artifact::ObjectHandle query_norm;
-    artifact::ObjectHandle key_norm;
-    artifact::ObjectHandle output;
-    artifact::ObjectHandle post_attention_norm;
+    artifact::ParameterReference input_projection;
+    artifact::ParameterReference embedding_norm;
+    artifact::ParameterReference hidden_norm;
+    artifact::ParameterReference input_norm;
+    artifact::ParameterReference query;
+    artifact::ParameterReference key;
+    artifact::ParameterReference gate;
+    artifact::ParameterReference value;
+    artifact::ParameterReference query_norm;
+    artifact::ParameterReference key_norm;
+    artifact::ParameterReference output;
+    artifact::ParameterReference post_attention_norm;
     MlpPlan mlp;
-    artifact::ObjectHandle final_norm;
+    artifact::ParameterReference final_norm;
+};
+
+struct VisionPlan {
+    qwen3_6::VisionBackbonePlan backbone;
+    qwen3_6::VisionMergerInputPlan merger_input;
+    artifact::ParameterReference merger_fc2;
+    artifact::ParameterReference merger_fc2_bias;
+    qwen3_6::VisionMergerNormPlan merger_norm;
+};
+
+struct ProposalPlan {
+    artifact::ParameterReference head;
+    artifact::ParameterReference token_ids;
 };
 
 struct BindingPlan {
     qwen3_6::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
 
-    WeightPlan token_embedding;
+    artifact::ParameterReference token_embedding;
     std::array<TextLayerPlan, kTextLayers> text_layers;
-    artifact::ObjectHandle final_norm;
-    WeightPlan output_head;
-    artifact::ObjectHandle draft_head;
-    artifact::ObjectHandle draft_head_token_ids;
-    MtpPlan mtp;
-
-    qwen3_6::VisionBackbonePlan vision_backbone;
-    qwen3_6::VisionMergerInputPlan vision_merger_input;
-    artifact::ObjectHandle vision_merger_fc2;
-    artifact::ObjectHandle vision_merger_fc2_bias;
-    qwen3_6::VisionMergerNormPlan vision_merger_norm;
+    artifact::ParameterReference final_norm;
+    artifact::ParameterReference output_head;
+    std::optional<ProposalPlan> proposal;
+    std::optional<MtpPlan> mtp;
+    std::optional<VisionPlan> vision;
 };
 
 struct ArtifactLoadPlan {
@@ -117,10 +112,6 @@ struct ArtifactLoadPlan {
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                qwen3_6::StartupFeatures features);
-
-// Stub binding for optional DFlash2 weights to ensure compatibility with
-// new Qwen3.8 artifact releases without materializing them on device.
-void bind_dflash2_stub(artifact::Binder& binder);
 
 struct DensePostMixerPayload {
     Weight gate_up;

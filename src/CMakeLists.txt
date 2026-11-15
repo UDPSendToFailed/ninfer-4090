@@ -33,6 +33,7 @@ add_library(ninfer_core STATIC
   core/linear_attention_state.cpp
   core/layout.cpp
   core/tensor.cpp
+  core/weight_view.cpp
   core/decode_graph.cpp
   runtime/engine/admission_policy.cpp
   runtime/engine/kv_capacity.cpp
@@ -47,11 +48,14 @@ endif()
 
 # Generic .ninfer framing, binding, and direct final materialization.
 add_library(ninfer_artifact STATIC
-  artifact/reader.cpp
-  artifact/storage_layouts.cpp
   artifact/binder.cpp
+  artifact/file_io.cpp
+  artifact/formats.cpp
+  artifact/layouts.cpp
   artifact/materializer.cpp
-  artifact/typed_binding.cpp)
+  artifact/reader.cpp
+  artifact/schema.cpp
+  artifact/views.cpp)
 ninfer_internal_includes(ninfer_artifact)
 target_link_libraries(ninfer_artifact PUBLIC ninfer_core)
 

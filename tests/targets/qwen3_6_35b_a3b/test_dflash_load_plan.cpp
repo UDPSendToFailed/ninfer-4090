@@ -43,8 +43,7 @@ int main() {
             plan.materialization.device_objects.size() != 883 ||
             plan.materialization.host_objects.size() != 6 ||
             plan.materialization.device_capacity_bytes != 22'360'207'360ULL ||
-            plan.bindings.dflash.feature_projection.index != 889 ||
-            plan.bindings.dflash.final_norm.index != 939) {
+            plan.bindings.dflash.has_value()) {
             std::cerr << "DFlash-disabled materialization plan changed resident weights\n";
             return 1;
         }

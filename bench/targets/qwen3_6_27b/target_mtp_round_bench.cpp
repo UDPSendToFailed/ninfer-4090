@@ -141,7 +141,9 @@ int run(const Options& options) {
 
     ninfer::DeviceContext device(options.device);
     ninfer::artifact::Reader reader(options.artifact);
-    const auto weights_profile = target::Package::resolve_weights(reader.identity());
+    const ninfer::artifact::ArtifactIdentity identity{
+        reader.directory().metadata.value("name", std::string{}), "groupwise-int"};
+    const auto weights_profile = target::Package::resolve_weights(identity);
     ninfer::artifact::Binder binder(reader);
     auto load_plan = target::Package::plan_load(binder, engine, weights_profile);
     auto materialized =

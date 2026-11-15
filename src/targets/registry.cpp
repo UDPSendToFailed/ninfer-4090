@@ -20,6 +20,25 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+artifact::ArtifactIdentity resolve_identity(const artifact::Reader& reader) {
+    const auto& dir      = reader.directory();
+    std::string model_id;
+    if (dir.metadata.contains("name") && dir.metadata.at("name").is_string()) {
+        model_id = dir.metadata.at("name").get<std::string>();
+    }
+    if (model_id.empty()) {
+        const auto& cfg = dir.component("text").config;
+        const auto h    = cfg.value("hidden_size", 0);
+        const auto l    = cfg.value("num_hidden_layers", 0);
+        if (h == 5120 && l == 64) {
+            model_id = "qwen3.8-27b";
+        } else if (h == 2048 && l == 40) {
+            model_id = "qwen3.6-35b-a3b";
+        }
+    }
+    return artifact::ArtifactIdentity{.model_id = std::move(model_id), .weights_id = "groupwise-int"};
+}
+
 void validate_options(const EngineOptions& options) {
     if (options.artifact_path.empty()) {
         throw std::invalid_argument("Engine artifact_path must not be empty");
@@ -109,12 +128,13 @@ std::size_t current_free_device_bytes(std::size_t weights_bytes = 0,
 
 template <class Target, class Loaded, class Instance>
 ConstructedTarget construct_registered(const EngineOptions& options, DeviceContext& device,
-                                       artifact::Reader& reader, Clock::time_point load_start,
+                                       artifact::Reader& reader,
+                                       const artifact::ArtifactIdentity& identity,
+                                       Clock::time_point load_start,
                                        std::string_view target_key) {
 #if defined(_WIN32)
     core::set_wddm_residency_lock_enabled(options.wddm_evictable_budget);
 #endif
-    const auto& identity                          = reader.identity();
     const auto weights_profile                    = Target::resolve_weights(identity);
     const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(identity.model_id);
 
@@ -128,8 +148,8 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     (void)runtime::resolve_kv_capacity(options.kv_capacity, curve, preflight_runtime_bytes);
 
     auto progress     = artifact_progress(options.load_progress);
-    auto materialized = artifact::materialize(reader, load_plan.materialization(), device,
-                                              progress.callback ? &progress : nullptr);
+    auto materialized = artifact::materialize(reader, artifact::MaterializationPlan(load_plan.materialization()),
+                                              device, progress.callback ? &progress : nullptr);
     const artifact::MaterializationStats stats = materialized.stats();
 
     auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
@@ -159,8 +179,8 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     summary.artifact_bytes_read  = stats.file_bytes;
     summary.host_to_device_bytes = stats.h2d_bytes;
     summary.peak_staging_bytes   = stats.peak_staging_bytes;
-    summary.tensor_count         = stats.tensor_count;
-    summary.resource_count       = stats.resource_count;
+    summary.tensor_count         = stats.device_object_count;
+    summary.resource_count       = stats.host_object_count;
     return ConstructedTarget{.active            = ActiveTarget(std::move(instance)),
                              .load              = std::move(summary),
                              .sampling_defaults = sampling_defaults};
@@ -206,18 +226,18 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
     const auto load_start = Clock::now();
 
     artifact::Reader reader(options.artifact_path);
-    const auto& identity = reader.identity();
+    const auto identity = resolve_identity(reader);
     if (identity.model_id == Qwen3_6_27B::model_id) {
         return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
-            options, device, reader, load_start, Qwen3_6_27B::target_key);
+            options, device, reader, identity, load_start, Qwen3_6_27B::target_key);
     }
     if (identity.model_id == Qwen3_6_27B::qwen3_8_model_id) {
         return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
-            options, device, reader, load_start, Qwen3_6_27B::qwen3_8_target_key);
+            options, device, reader, identity, load_start, Qwen3_6_27B::qwen3_8_target_key);
     }
     if (identity.model_id == Qwen3_6_35BA3B::model_id) {
         return construct_registered<Qwen3_6_35BA3B, LoadedQwen3_6_35BA3B, Qwen3_6_35BA3BInstance>(
-            options, device, reader, load_start, Qwen3_6_35BA3B::target_key);
+            options, device, reader, identity, load_start, Qwen3_6_35BA3B::target_key);
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' has no registered target for this device");

@@ -4,6 +4,7 @@
 
 #include <ninfer/targets/qwen3_6/frontend.h>
 
+#include <optional>
 #include <string>
 
 namespace ninfer::artifact {
@@ -17,8 +18,8 @@ struct FrontendResourcePlan {
     artifact::ObjectHandle tokenizer_config_json;
     artifact::ObjectHandle chat_template_jinja;
     artifact::ObjectHandle generation_config_json;
-    artifact::ObjectHandle preprocessor_config_json;
-    artifact::ObjectHandle video_preprocessor_config_json;
+    std::optional<artifact::ObjectHandle> preprocessor_config_json;
+    std::optional<artifact::ObjectHandle> video_preprocessor_config_json;
 };
 
 struct FrontendResources {

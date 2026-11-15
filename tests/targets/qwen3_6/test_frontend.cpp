@@ -627,9 +627,10 @@ int test_official_resource_guards() {
     nlohmann::json mismatched_config   = nlohmann::json::parse(mismatched.tokenizer_config_json);
     mismatched_config["chat_template"] = reasoning_effort_template_source();
     mismatched.tokenizer_config_json   = mismatched_config.dump();
+    const Frontend standalone          = FrontendFactory::create_component(mismatched, false);
     failures +=
-        check(throws_invalid_argument([&] { (void)FrontendFactory::create_component(mismatched); }),
-              "different standalone and tokenizer-config chat templates were accepted");
+        check(!standalone.prompt_capabilities().reasoning_effort.low,
+              "frontend used tokenizer_config.json.chat_template instead of standalone chat_template.jinja");
 
     FrontendResources unknown = resources("{{ messages }}");
     failures +=
