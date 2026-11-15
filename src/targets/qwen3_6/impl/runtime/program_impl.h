@@ -451,10 +451,22 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                           request_plan.reuse_base))) {
         throw std::logic_error("planned resident prefix is no longer reusable");
     }
-    if (!is_disk_restore && request_plan.reuse == ReusePath::RestoreTurnCheckpoint &&
-        (!sequence.turn_checkpoint.valid ||
-         sequence.turn_checkpoint.frontier != request_plan.reuse_base)) {
-        throw std::logic_error("planned turn checkpoint is unavailable");
+    if (!is_disk_restore && request_plan.reuse == ReusePath::RestoreTurnCheckpoint) {
+        if (request_plan.rolling_checkpoint_frontier) {
+            const auto it = std::find_if(
+                sequence.rolling_checkpoints.begin(), sequence.rolling_checkpoints.end(),
+                [&](const RollingCheckpoint& cp) {
+                    return cp.frontier == *request_plan.rolling_checkpoint_frontier;
+                });
+            if (it == sequence.rolling_checkpoints.end() ||
+                *request_plan.rolling_checkpoint_frontier != request_plan.reuse_base ||
+                !it->gdn_state) {
+                throw std::logic_error("planned rolling checkpoint is unavailable");
+            }
+        } else if (!sequence.turn_checkpoint.valid ||
+                   sequence.turn_checkpoint.frontier != request_plan.reuse_base) {
+            throw std::logic_error("planned turn checkpoint is unavailable");
+        }
     }
     if (request_plan.turn_checkpoint_action == TurnCheckpointAction::KeepExisting &&
         (!prompt.identity.turn_rewrite_boundary || !sequence.turn_checkpoint.valid ||
@@ -488,6 +500,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             sequence.kv.reset();
             ordered_reset(sequence);
             sequence.ledger.clear();
+            trim_rolling_checkpoints(sequence, 0);
             sequence.last_disk_snapshot_tokens = 0;
             sequence.text_kv_valid = 0;
             sequence.mtp_kv_valid  = 0;
@@ -497,6 +510,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             sequence.kv.reset();
             ordered_reset(sequence);
             sequence.ledger.clear();
+            trim_rolling_checkpoints(sequence, 0);
             // The ledger is replaced, so the growth throttle of snapshot_lane_to_disk starts over.
             sequence.last_disk_snapshot_tokens = 0;
             sequence.text_kv_valid = 0;
@@ -801,6 +815,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                            request_plan.backend_kv_page_entitlement);
             sequence.text_kv_valid = base;
             sequence.ledger.resize(base);
+            trim_rolling_checkpoints(sequence, base);
         } else {
             if (!sequence.kv || sequence.text_kv_valid < base) {
                 throw std::logic_error("resident turn checkpoint has no complete KV allocation");
@@ -824,11 +839,16 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
             resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
                                            request_plan.backend_kv_page_entitlement);
-            decoder->linear_attention.copy_slot(
-                LinearStateSlots::turn_checkpoint_state_slot(sequence.lane, max_concurrency),
-                LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-                device.stream);
+            if (request_plan.rolling_checkpoint_frontier) {
+                restore_rolling_checkpoint(sequence, base);
+            } else {
+                decoder->linear_attention.copy_slot(
+                    LinearStateSlots::turn_checkpoint_state_slot(sequence.lane, max_concurrency),
+                    LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                    device.stream);
+            }
             sequence.ledger.resize(base);
+            trim_rolling_checkpoints(sequence, base);
         }
 
         trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
@@ -1173,7 +1193,115 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.tail_hidden_valid       = false;
     sequence.retained                = false;
     sequence.turn_checkpoint         = {};
+    trim_rolling_checkpoints(sequence, 0);
     request.pending                  = {};
+}
+
+std::size_t ProgramImplCore::gdn_linear_slot_bytes() const noexcept {
+    std::size_t total = 0;
+    for (const auto& t : decoder->linear_attention.recurrent) { total += t.slice(3, 0, 1).bytes(); }
+    for (const auto& t : decoder->linear_attention.conv) { total += t.slice(2, 0, 1).bytes(); }
+    return total;
+}
+
+void ProgramImplCore::trim_rolling_checkpoints(SequenceState& sequence,
+                                               std::uint32_t max_frontier) noexcept {
+    auto it = sequence.rolling_checkpoints.begin();
+    while (it != sequence.rolling_checkpoints.end()) {
+        if (it->frontier > max_frontier) {
+            if (it->gdn_state &&
+                sequence.rolling_checkpoint_free_pool.size() < kMaxRollingCheckpoints) {
+                sequence.rolling_checkpoint_free_pool.push_back(std::move(*it->gdn_state));
+            }
+            it = sequence.rolling_checkpoints.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void ProgramImplCore::capture_rolling_checkpoint(SequenceState& sequence, std::uint32_t frontier) {
+    if (speculative_backend == SpeculativeBackend::DFlash || frontier == 0) { return; }
+    for (const auto& cp : sequence.rolling_checkpoints) {
+        if (cp.frontier == frontier) { return; }
+    }
+    const std::size_t bytes = gdn_linear_slot_bytes();
+    if (bytes == 0) { return; }
+
+    sequence.rolling_checkpoint_free_pool.reserve(kMaxRollingCheckpoints);
+    sequence.rolling_checkpoints.reserve(kMaxRollingCheckpoints);
+
+    std::optional<PinnedHostBuffer> buf;
+    while (!sequence.rolling_checkpoint_free_pool.empty()) {
+        PinnedHostBuffer candidate = std::move(sequence.rolling_checkpoint_free_pool.back());
+        sequence.rolling_checkpoint_free_pool.pop_back();
+        if (candidate.size() == bytes) {
+            buf = std::move(candidate);
+            break;
+        }
+    }
+    if (!buf && sequence.rolling_checkpoints.size() >= kMaxRollingCheckpoints) {
+        if (sequence.rolling_checkpoints.front().gdn_state &&
+            sequence.rolling_checkpoints.front().gdn_state->size() == bytes) {
+            buf = std::move(*sequence.rolling_checkpoints.front().gdn_state);
+        }
+        sequence.rolling_checkpoints.erase(sequence.rolling_checkpoints.begin());
+    }
+    if (!buf) { buf.emplace(bytes); }
+
+    const std::int32_t slot =
+        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
+    auto* dst = static_cast<std::byte*>(buf->data());
+    std::size_t offset = 0;
+    for (const auto& t : decoder->linear_attention.recurrent) {
+        Tensor slot_t = t.slice(3, slot, 1);
+        CUDA_CHECK(cudaMemcpyAsync(dst + offset, slot_t.data, slot_t.bytes(),
+                                   cudaMemcpyDeviceToHost, device.stream));
+        offset += slot_t.bytes();
+    }
+    for (const auto& t : decoder->linear_attention.conv) {
+        Tensor slot_t = t.slice(2, slot, 1);
+        CUDA_CHECK(cudaMemcpyAsync(dst + offset, slot_t.data, slot_t.bytes(),
+                                   cudaMemcpyDeviceToHost, device.stream));
+        offset += slot_t.bytes();
+    }
+
+    const auto pos = std::lower_bound(
+        sequence.rolling_checkpoints.begin(), sequence.rolling_checkpoints.end(), frontier,
+        [](const RollingCheckpoint& cp, std::uint32_t f) { return cp.frontier < f; });
+    sequence.rolling_checkpoints.insert(
+        pos, RollingCheckpoint{.frontier = frontier, .gdn_state = std::move(buf)});
+}
+
+void ProgramImplCore::restore_rolling_checkpoint(SequenceState& sequence, std::uint32_t frontier) {
+    const auto it = std::find_if(
+        sequence.rolling_checkpoints.begin(), sequence.rolling_checkpoints.end(),
+        [&](const RollingCheckpoint& cp) { return cp.frontier == frontier; });
+    if (it == sequence.rolling_checkpoints.end() || !it->gdn_state) {
+        throw std::logic_error("planned rolling checkpoint is unavailable");
+    }
+    const std::int32_t slot =
+        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
+    const auto* src = static_cast<const std::byte*>(it->gdn_state->data());
+    std::size_t offset = 0;
+    for (const auto& t : decoder->linear_attention.recurrent) {
+        Tensor slot_t = t.slice(3, slot, 1);
+        if (offset + slot_t.bytes() > it->gdn_state->size()) {
+            throw std::logic_error("rolling checkpoint payload truncated");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(slot_t.data, src + offset, slot_t.bytes(),
+                                   cudaMemcpyHostToDevice, device.stream));
+        offset += slot_t.bytes();
+    }
+    for (const auto& t : decoder->linear_attention.conv) {
+        Tensor slot_t = t.slice(2, slot, 1);
+        if (offset + slot_t.bytes() > it->gdn_state->size()) {
+            throw std::logic_error("rolling checkpoint payload truncated");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(slot_t.data, src + offset, slot_t.bytes(),
+                                   cudaMemcpyHostToDevice, device.stream));
+        offset += slot_t.bytes();
+    }
 }
 
 qwen3_6::PagedKVCache* ProgramImplCore::backend_kv_cache() noexcept {
@@ -2006,6 +2134,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             }
             sequence.turn_checkpoint = TurnCheckpoint{.valid = true, .frontier = frontier};
         }
+        capture_rolling_checkpoint(sequence, prompt_tokens);
 
         if (!staged.prompt.patches.empty()) {
             staged.prompt.release_media_payload();

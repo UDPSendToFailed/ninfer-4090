@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
+#include "targets/qwen3_6/impl/runtime/rolling_checkpoint_plan.h"
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
@@ -193,13 +194,30 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                                                 sequence.execution_frontier)) {
                 plan->reuse      = ReusePath::AppendAtFrontier;
                 plan->reuse_base = sequence.execution_frontier;
-            } else if (sequence.turn_checkpoint.valid && sequence.turn_checkpoint.frontier != 0 &&
-                       sequence.turn_checkpoint.frontier < prompt.token_ids.size() &&
-                       qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
-                                                       sequence.prefix_identity,
-                                                       sequence.turn_checkpoint.frontier)) {
-                plan->reuse      = ReusePath::RestoreTurnCheckpoint;
-                plan->reuse_base = sequence.turn_checkpoint.frontier;
+            } else {
+                std::array<std::uint32_t, kMaxRollingCheckpoints> rolling_frontiers{};
+                std::size_t rolling_count = 0;
+                for (const auto& cp : sequence.rolling_checkpoints) {
+                    if (rolling_count < rolling_frontiers.size()) {
+                        rolling_frontiers[rolling_count++] = cp.frontier;
+                    }
+                }
+                const auto best = qwen3_6::detail::select_best_turn_checkpoint(
+                    sequence.turn_checkpoint.valid, sequence.turn_checkpoint.frontier,
+                    std::span<const std::uint32_t>(rolling_frontiers.data(), rolling_count),
+                    static_cast<std::uint32_t>(prompt.token_ids.size()), sequence.text_kv_valid,
+                    speculative_backend == SpeculativeBackend::Mtp,
+                    decoder->mtp_cache() != nullptr, sequence.mtp_kv_valid,
+                    speculative_backend != SpeculativeBackend::DFlash,
+                    [&](std::uint32_t frontier) {
+                        return qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
+                                                               sequence.prefix_identity, frontier);
+                    });
+                if (best) {
+                    plan->reuse      = ReusePath::RestoreTurnCheckpoint;
+                    plan->reuse_base = best->frontier;
+                    if (best->is_rolling) { plan->rolling_checkpoint_frontier = best->frontier; }
+                }
             }
         }
         if (plan->reuse == ReusePath::FullReset && disk_state_cache && disk_state_cache->enabled()) {
@@ -227,6 +245,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready) {
             plan->reuse              = ReusePath::FullReset;
             plan->reuse_base         = 0;
+            plan->rolling_checkpoint_frontier.reset();
             plan->disk_snapshot_path.clear();
         }
     }
@@ -256,6 +275,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         if (*desired <= plan->reuse_base) {
             plan->reuse      = ReusePath::FullReset;
             plan->reuse_base = 0;
+            plan->rolling_checkpoint_frontier.reset();
         }
         plan->turn_checkpoint_action           = TurnCheckpointAction::CaptureNew;
         plan->turn_checkpoint_capture_frontier = desired;

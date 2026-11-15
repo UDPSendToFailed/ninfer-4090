@@ -6,6 +6,7 @@
 #include <ninfer/targets/qwen3_6/vision_control.h>
 
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
+#include "targets/qwen3_6/impl/runtime/rolling_checkpoint_plan.h"
 #include "targets/qwen3_6/impl/runtime/yarn.h"
 
 #include <algorithm>
@@ -312,6 +313,65 @@ void test_yarn_scaling() {
            "low frequency dimension must scale by 1/F");
 }
 
+void test_rolling_checkpoint_selection() {
+    const std::vector<std::uint32_t> rolling{22791U, 67707U, 78655U, 82511U};
+
+    // 1. Client strips thinking from the latest turn (diverges after 82,511): picks 82,511.
+    {
+        const auto match = q36::detail::select_best_turn_checkpoint(
+            true, 13737U, rolling, 83248U, 83129U, true, true, 83129U, true,
+            [](std::uint32_t f) { return f <= 82511U; });
+        expect(match.has_value() && match->frontier == 82511U && match->is_rolling,
+               "should pick longest matching rolling checkpoint (82,511) over 13,737");
+    }
+
+    // 2. Client inserts/mutates message 2 turns back (diverges at 75,000): falls back to 67,707.
+    {
+        const auto match = q36::detail::select_best_turn_checkpoint(
+            true, 13737U, rolling, 80790U, 80517U, true, true, 80517U, true,
+            [](std::uint32_t f) { return f <= 75000U; });
+        expect(match.has_value() && match->frontier == 67707U && match->is_rolling,
+               "should fall back to earlier rolling checkpoint (67,707) on mid-history edit");
+    }
+
+    // 3. New user turn strips all thinking back to 13,737: selects VRAM turn_checkpoint.
+    {
+        const auto match = q36::detail::select_best_turn_checkpoint(
+            true, 13737U, rolling, 86000U, 85438U, true, true, 85438U, true,
+            [](std::uint32_t f) { return f <= 13737U; });
+        expect(match.has_value() && match->frontier == 13737U && !match->is_rolling,
+               "should fall back to VRAM turn_checkpoint when all rolling checkpoints diverge");
+    }
+
+    // 4. Exact frontier tie prefers VRAM turn_checkpoint over rolling host copy.
+    {
+        const std::vector<std::uint32_t> tied{13737U};
+        const auto match = q36::detail::select_best_turn_checkpoint(
+            true, 13737U, tied, 20000U, 20000U, true, true, 20000U, true,
+            [](std::uint32_t) { return true; });
+        expect(match.has_value() && match->frontier == 13737U && !match->is_rolling,
+               "exact frontier tie must prefer VRAM turn_checkpoint");
+    }
+
+    // 5. Rejects checkpoints >= prompt_tokens or exceeding valid text/MTP KV.
+    {
+        const std::vector<std::uint32_t> bounded{500U, 1000U, 1200U};
+        const auto match = q36::detail::select_best_turn_checkpoint(
+            false, 0U, bounded, 1200U, 1000U, true, true, 998U, true,
+            [](std::uint32_t) { return true; });
+        expect(match.has_value() && match->frontier == 500U && match->is_rolling,
+               "must skip checkpoints >= prompt_tokens or beyond valid text/MTP KV");
+    }
+
+    // 6. Disabling rolling (e.g. DFlash backend) ignores rolling frontiers.
+    {
+        const auto match = q36::detail::select_best_turn_checkpoint(
+            true, 13737U, rolling, 83248U, 83129U, false, false, 0U, false,
+            [](std::uint32_t) { return true; });
+        expect(match.has_value() && match->frontier == 13737U && !match->is_rolling,
+               "allow_rolling=false must ignore rolling checkpoints");
+    }
+}
 
 } // namespace
 
@@ -323,6 +383,7 @@ int main() {
     test_vision_control();
     test_prefix_identity();
     test_yarn_scaling();
+    test_rolling_checkpoint_selection();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;

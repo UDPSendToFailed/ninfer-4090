@@ -74,6 +74,7 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     NINFER_QWEN36_RUNTIME_NS::TurnCheckpointAction turn_checkpoint_action =
         NINFER_QWEN36_RUNTIME_NS::TurnCheckpointAction::Drop;
     std::optional<std::uint32_t> turn_checkpoint_capture_frontier;
+    std::optional<std::uint32_t> rolling_checkpoint_frontier;
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
@@ -115,6 +116,13 @@ enum class Lifecycle : std::uint8_t {
 struct TurnCheckpoint {
     bool valid             = false;
     std::uint32_t frontier = 0;
+};
+
+inline constexpr std::size_t kMaxRollingCheckpoints = 6;
+
+struct RollingCheckpoint {
+    std::uint32_t frontier = 0;
+    std::optional<PinnedHostBuffer> gdn_state;
 };
 
 struct SequenceKVBundle {
@@ -163,6 +171,8 @@ struct SequenceState {
     bool tail_hidden_valid        = false;
     bool retained                 = false;
     TurnCheckpoint turn_checkpoint;
+    std::vector<RollingCheckpoint> rolling_checkpoints;
+    std::vector<PinnedHostBuffer> rolling_checkpoint_free_pool;
     std::uint32_t last_disk_snapshot_tokens = 0;
 };
 
@@ -327,6 +337,11 @@ public:
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
     void reset_memory_peaks() noexcept;
+
+    [[nodiscard]] std::size_t gdn_linear_slot_bytes() const noexcept;
+    void capture_rolling_checkpoint(SequenceState& sequence, std::uint32_t frontier);
+    void restore_rolling_checkpoint(SequenceState& sequence, std::uint32_t frontier);
+    void trim_rolling_checkpoints(SequenceState& sequence, std::uint32_t max_frontier) noexcept;
 
     const LoadedModelData& model;
     DeviceContext& device;
