@@ -221,6 +221,16 @@ int main() {
                 .execution.thinking.force_end_requested == nullptr,
         "non-thinking request forwarded force_end_reasoning");
     request.force_end_reasoning.reset();
+    request.thinking_budget_set = true;
+    request.thinking_budget     = 512;
+    failures += check(
+        to_request_options(request, thinking_budget, semantics).execution.thinking.budget == 512U,
+        "per-request thinking_budget did not override the server budget");
+    request.thinking_budget.reset();
+    failures += check(
+        !to_request_options(request, thinking_budget, semantics).execution.thinking.budget,
+        "explicit unlimited thinking_budget did not clear the server budget");
+    request.thinking_budget_set = false;
     request.enable_thinking.reset();
     failures +=
         check(resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,

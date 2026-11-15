@@ -429,8 +429,8 @@ int test_thinking_and_sampling() {
     const ninfer::RequestOptions options = translate_options(req);
     failures +=
         check(options.execution.requested_output_tokens == 8, "max_tokens reaches Engine options");
-    failures += check(!options.execution.thinking.budget,
-                      "Anthropic budget_tokens unexpectedly became a request-level thinking cap");
+    failures += check(options.execution.thinking.budget == 1024U,
+                      "Anthropic budget_tokens did not reach Engine thinking budget");
     failures += check(options.execution.sampling.temperature == 0.3F &&
                           options.execution.sampling.top_p == 0.8F &&
                           options.execution.sampling.top_k == 40 &&

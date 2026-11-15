@@ -698,6 +698,37 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     out.preserve_thinking = template_options.preserve_thinking ? template_options.preserve_thinking
                                                                : top_level_preserve_thinking;
 
+    const char* budget_param =
+        body.contains("thinking_budget_tokens") && !body.at("thinking_budget_tokens").is_null()
+            ? "thinking_budget_tokens"
+            : (body.contains("thinking_budget") && !body.at("thinking_budget").is_null()
+                   ? "thinking_budget"
+                   : nullptr);
+    if (budget_param != nullptr) {
+        const Json& val = body.at(budget_param);
+        if (!val.is_number_integer()) {
+            bad_request(std::string(budget_param) + " must be an integer or null", budget_param);
+        }
+        const std::int64_t budget = val.get<std::int64_t>();
+        if (budget < -1 ||
+            budget > static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
+            bad_request(std::string(budget_param) + " is out of range", budget_param);
+        }
+        if (budget == 0) {
+            if (out.enable_thinking && *out.enable_thinking) {
+                bad_request("thinking budget 0 conflicts with enable_thinking=true", budget_param,
+                            "conflicting_template_option");
+            }
+            out.enable_thinking = false;
+        } else if (budget == -1) {
+            out.thinking_budget_set = true;
+            out.thinking_budget.reset();
+        } else {
+            out.thinking_budget_set = true;
+            out.thinking_budget     = static_cast<std::uint32_t>(budget);
+        }
+    }
+
     std::optional<int> max_tokens = get_int(body, "max_completion_tokens");
     if (!max_tokens) { max_tokens = get_int(body, "max_tokens"); }
     if (!max_tokens) { max_tokens = get_int(body, "n_predict"); }

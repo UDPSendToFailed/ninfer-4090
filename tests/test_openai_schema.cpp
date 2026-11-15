@@ -259,6 +259,36 @@ int test_chat_template_thinking_aliases() {
     failures += check(
         throws_api([&] { (void)parse_chat_completion_request(bad_enable, default_limits()); }),
         "non-boolean nested enable_thinking was accepted");
+
+    Json webui_low                    = base;
+    webui_low["chat_template_kwargs"] = Json{{"enable_thinking", true}};
+    webui_low["thinking_budget_tokens"] = 512;
+    const GenerationRequest low_budget_req =
+        parse_chat_completion_request(webui_low, default_limits());
+    failures += check(low_budget_req.enable_thinking == true &&
+                          low_budget_req.thinking_budget_set &&
+                          low_budget_req.thinking_budget == 512U,
+                      "thinking_budget_tokens=512 was not parsed");
+
+    Json unlimited_budget                    = base;
+    unlimited_budget["thinking_budget_tokens"] = -1;
+    const GenerationRequest unlimited_req =
+        parse_chat_completion_request(unlimited_budget, default_limits());
+    failures += check(unlimited_req.thinking_budget_set && !unlimited_req.thinking_budget,
+                      "thinking_budget_tokens=-1 did not clear budget");
+
+    Json zero_budget                    = base;
+    zero_budget["thinking_budget_tokens"] = 0;
+    const GenerationRequest zero_req =
+        parse_chat_completion_request(zero_budget, default_limits());
+    failures += check(zero_req.enable_thinking == false,
+                      "thinking_budget_tokens=0 did not disable thinking");
+
+    Json bad_budget                    = base;
+    bad_budget["thinking_budget_tokens"] = -2;
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(bad_budget, default_limits()); }),
+        "out-of-range thinking_budget_tokens was accepted");
     return failures;
 }
 

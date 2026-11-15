@@ -431,6 +431,22 @@ void parse_thinking(const Json& body, GenerationRequest& out) {
     // adapter tolerates Claude Code's evolving thinking vocabulary.
     const std::string type = thinking.at("type").get<std::string>();
     out.enable_thinking    = (type != "disabled");
+    if (*out.enable_thinking && thinking.contains("budget_tokens") &&
+        !thinking.at("budget_tokens").is_null()) {
+        const Json& budget_val = thinking.at("budget_tokens");
+        if (!budget_val.is_number_integer()) {
+            bad_request("thinking.budget_tokens must be a positive integer",
+                        "thinking.budget_tokens");
+        }
+        const std::int64_t budget = budget_val.get<std::int64_t>();
+        if (budget <= 0 ||
+            budget > static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
+            bad_request("thinking.budget_tokens must be a positive integer",
+                        "thinking.budget_tokens");
+        }
+        out.thinking_budget_set = true;
+        out.thinking_budget     = static_cast<std::uint32_t>(budget);
+    }
 }
 
 void parse_output_config(const Json& body, GenerationRequest& out) {
