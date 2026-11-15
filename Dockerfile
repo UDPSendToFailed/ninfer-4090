@@ -6,6 +6,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         cmake \
+        git \
         libavcodec-dev \
         libavformat-dev \
         libavutil-dev \
