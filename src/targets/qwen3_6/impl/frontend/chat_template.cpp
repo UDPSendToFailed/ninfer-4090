@@ -406,7 +406,8 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         const bool preserve_thinking = options.preserve_thinking.value_or(effort_template);
         const bool keep_thinking = preserve_thinking || (static_cast<long>(i) > last_query_index);
         rendered += "<|im_start|>assistant\n";
-        if (!turn_rewrite_byte_offset && static_cast<long>(i) > last_query_index) {
+        if (!preserve_thinking && !turn_rewrite_byte_offset &&
+            static_cast<long>(i) > last_query_index) {
             turn_rewrite_byte_offset = rendered.size();
         }
         if (keep_thinking) {

@@ -584,8 +584,12 @@ int test_turn_rewrite_trace() {
     fi::ChatRenderOptions preserve;
     preserve.preserve_thinking       = true;
     const fi::RenderedChat preserved = render_chat(tool_loop, preserve);
-    failures += check(preserved.turn_rewrite_byte_offset == open.turn_rewrite_byte_offset,
-                      "preserve_thinking changed the turn rewrite boundary");
+    const std::size_t preserved_gen  = preserved.text.rfind(assistant_header);
+    failures += check(preserved_gen != std::string::npos && preserved.turn_rewrite_byte_offset &&
+                          *preserved.turn_rewrite_byte_offset ==
+                              preserved_gen + assistant_header.size() &&
+                          preserved.turn_rewrite_byte_offset > open.turn_rewrite_byte_offset,
+                      "preserve_thinking did not advance turn rewrite boundary to generation opener");
 
     std::vector<fi::ChatMessage> next_turn = tool_loop;
     next_turn.push_back(chat_message("user", "next question"));
