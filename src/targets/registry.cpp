@@ -155,9 +155,14 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
                                             options.wddm_evictable_budget);
     (void)runtime::resolve_kv_capacity(options.kv_capacity, curve, preflight_runtime_bytes);
 
-    auto progress     = artifact_progress(options.load_progress);
-    auto materialized = artifact::materialize(reader, artifact::MaterializationPlan(load_plan.materialization()),
-                                              device, progress.callback ? &progress : nullptr);
+    auto progress = artifact_progress(options.load_progress);
+    artifact::MaterializationPlan materialization_plan(load_plan.materialization());
+    materialization_plan.device_residency = options.residency_locked
+                                                ? ResidencyRequirement::Required
+                                                : ResidencyRequirement::None;
+    auto materialized =
+        artifact::materialize(reader, std::move(materialization_plan), device,
+                              progress.callback ? &progress : nullptr);
     const artifact::MaterializationStats stats = materialized.stats();
 
     auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
@@ -176,7 +181,30 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     auto instance = std::make_unique<Instance>(std::move(loaded), capacity_resolution,
                                                std::move(sequence_plan), device);
     device.synchronize();
-    instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
+
+    // Every long-lived arena is now residency-enforced, so what matters is whether the process can
+    // still allocate inside its OS video-memory budget: that is the condition under which WDDM
+    // starts paging, which is the throughput collapse this contract exists to prevent. The budget
+    // figure is used rather than cudaMemGetInfo because a D3D12-interop allocation (for example the
+    // --disk-cache staging buffer) is charged more than once against the device-wide free counter,
+    // which would reject configurations that in fact fit. The margin covers driver bookkeeping and
+    // CUDA graph upload that is not part of any arena.
+    constexpr std::size_t kRequiredStartupHeadroomBytes = 128ULL * 1024 * 1024;
+    std::size_t available_after_startup = current_free_device_bytes();
+    std::size_t budget_headroom        = 0;
+    if (core::device_budget_headroom_bytes(budget_headroom)) {
+        available_after_startup = std::max(available_after_startup, budget_headroom);
+    }
+    if (options.residency_locked && available_after_startup < kRequiredStartupHeadroomBytes) {
+        throw std::runtime_error(
+            "resolved configuration leaves only " + std::to_string(available_after_startup) +
+            " bytes of device-memory headroom within the process budget, but " +
+            std::to_string(kRequiredStartupHeadroomBytes) +
+            " bytes are required for driver bookkeeping and CUDA graph upload; reduce "
+            "--max-context or the KV capacity so weights, KV/state, and workspace all fit in "
+            "dedicated VRAM");
+    }
+    instance->kv_capacity_resolution.available_after_startup_bytes = available_after_startup;
 
     LoadSummary summary;
     summary.target               = std::string(target_key);
@@ -206,7 +234,8 @@ Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stab
                                          Qwen3_6_27B::SequencePlan sequence_plan,
                                          DeviceContext& device)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
-      request_memory(device, sequence_plan.request_transient_capacity_bytes()),
+      request_memory(device, sequence_plan.request_transient_capacity_bytes(),
+                     sequence_plan.residency_locked()),
       capacity(sequence_plan.capacity()),
       program(Qwen3_6_27B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
 

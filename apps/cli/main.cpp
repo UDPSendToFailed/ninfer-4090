@@ -206,6 +206,8 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("KV page groups", std::to_string(memory.kv_capacity_page_groups) + " / " +
                                        std::to_string(memory.kv_capacity_max_page_groups));
     print_metric("gpu weights used", format_arena_used(memory.weights));
+    print_metric("vram residency",
+                 memory.device_residency_enforced ? "locked" : "best-effort");
     print_metric("gpu sequence used", format_arena_used(memory.sequence));
     print_metric("kv cache dtype", format_kv_cache(memory.kv_cache));
     print_metric("kv cache payload (total)", format_bytes(memory.kv_payload_bytes));
@@ -302,6 +304,7 @@ int main(int argc, char** argv) {
         engine_options.vision_max_tokens      = cli.vision_max_tokens;
         engine_options.use_cuda_graph         = cli.use_cuda_graph;
         engine_options.wddm_evictable_budget  = cli.wddm_evictable_budget;
+        engine_options.residency_locked       = cli.residency_locked;
         engine_options.load_progress          = load_progress.callback();
 
         const auto load_started = Clock::now();

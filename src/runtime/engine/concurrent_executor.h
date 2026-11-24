@@ -2,6 +2,7 @@
 
 // Small fixed-capacity request scheduling and batched decode execution for every backend.
 
+#include "core/arena.h"
 #include "core/disk_state_cache.h"
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
@@ -17,6 +18,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <cstdio>
 #include <exception>
@@ -1343,6 +1345,10 @@ private:
             }
 
             try {
+                // The engine never evicts its own arenas; this is the one place where external
+                // WDDM paging pressure is turned back into resident VRAM. It runs outside
+                // execution_mutex_ because a reclaim wait must not stall memory_summary().
+                instance_.program->ensure_device_residency();
                 std::scoped_lock execution_lock(execution_mutex_);
                 const bool have_pending          = expire_pending_requests();
                 const auto cancelled_at_boundary = snapshot_cancellations();
@@ -1382,6 +1388,16 @@ private:
                     previous_unit_was_decode = true;
                     continue;
                 }
+            } catch (const ResidencyError& e) {
+                // Pinned arenas cannot be reclaimed by the engine and the watchdog has already
+                // retried for a sustained window. Serving on would mean every step reads weights
+                // over PCIe, so terminate instead of latching. Only fatal exit in the worker loop.
+                fprintf(stderr,
+                        "ninfer-serve: FATAL device memory residency could not be restored: %s "
+                        "(terminating)\n",
+                        e.what());
+                std::fflush(stderr);
+                std::_Exit(EXIT_FAILURE);
             } catch (const std::exception& e) {
                 // A worker-loop escape permanently latches the executor (failed_ is never
                 // cleared). Log the reason before latching — the 2026-10-02 incident on the

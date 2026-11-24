@@ -18,7 +18,8 @@ class RequestMemory {
 public:
     static constexpr std::size_t kDeviceAllocationAlignment = 256;
 
-    RequestMemory(DeviceContext& device, std::size_t frozen_capacity_bytes);
+    RequestMemory(DeviceContext& device, std::size_t frozen_capacity_bytes,
+                  bool residency_locked = false);
     ~RequestMemory();
 
     RequestMemory(const RequestMemory&)            = delete;

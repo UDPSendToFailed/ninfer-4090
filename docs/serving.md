@@ -38,6 +38,17 @@ server must accept image or video input. Speculative residency is likewise froze
 `--lm-head-draft` additionally loads the optimized proposal head. DFlash is 35B-A3B text-only and
 cannot be combined with `--vision`. A later request cannot enable a capability omitted at startup.
 
+`--residency-locked` opts in to the strict VRAM contract. With it, the weights, KV/state (including
+the per-pool page-descriptor arrays), workspace, and request-transient arenas are pinned
+device-memory allocations whose device residency is verified at startup; they are never lazily
+loaded, host-streamed, or intentionally paged. A model that does not fit in dedicated VRAM, or
+whose configuration leaves less than 128 MiB of headroom inside the process video-memory budget for
+driver bookkeeping and CUDA graph upload, makes the server refuse to start. At runtime, sustained
+unrecoverable video-memory pressure logs a fatal error and exits non-zero; transient desktop VRAM
+spikes produce a warning instead. Without the flag the server keeps the original best-effort
+behavior. The startup log reports `vram-residency=locked` when the guarantee is active and
+`vram-residency=best-effort` otherwise.
+
 ## Endpoints
 
 | Method and path | Behavior |

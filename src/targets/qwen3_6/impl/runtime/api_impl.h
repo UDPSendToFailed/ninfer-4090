@@ -59,6 +59,11 @@ std::size_t SequencePlan<Variant>::request_transient_capacity_bytes() const noex
 }
 
 template <>
+bool SequencePlan<Variant>::residency_locked() const noexcept {
+    return impl_ != nullptr && impl_->residency_locked;
+}
+
+template <>
 SequencePlanner<Variant>::SequencePlanner(
     std::unique_ptr<detail::SequencePlannerImpl<Variant>> impl) noexcept
     : impl_(std::move(impl)) {}
@@ -264,6 +269,11 @@ std::string Program<Variant>::config_signature_slug() const {
 template <>
 MemorySummary Program<Variant>::memory_summary() const noexcept {
     return impl_->memory_summary();
+}
+
+template <>
+void Program<Variant>::ensure_device_residency() {
+    impl_->ensure_device_residency();
 }
 
 template <>

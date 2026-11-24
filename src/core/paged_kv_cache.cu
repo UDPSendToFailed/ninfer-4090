@@ -87,7 +87,8 @@ std::size_t PagedKVPoolLayout::payload_bytes() const noexcept {
 
 std::size_t PagedKVPoolLayout::metadata_bytes() const noexcept { return block_tables.region.bytes; }
 
-PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout)
+PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout,
+                         ResidencyRequirement descriptor_residency)
     : spec_(layout.spec), block_tables_(layout.block_tables.bind(backing)),
       row_in_use_(static_cast<std::size_t>(layout.spec.table_rows), false) {
     if (layout.planes.size() != spec_.planes.size() || layout.planes.empty()) {
@@ -140,8 +141,14 @@ PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout)
         desc.single_page_uint4s = running_page_offset_uint4s;
     }
     if (!h_planes.empty()) {
-        CUDA_CHECK(cudaMalloc(&d_planes_, h_planes.size() * sizeof(ops::PagedKVPlaneDescriptor)));
-        CUDA_CHECK(cudaMemcpy(d_planes_, h_planes.data(), h_planes.size() * sizeof(ops::PagedKVPlaneDescriptor), cudaMemcpyHostToDevice));
+        const std::size_t descriptor_bytes =
+            h_planes.size() * sizeof(ops::PagedKVPlaneDescriptor);
+        // Every attention kernel reads this descriptor array, so under residency locking it gets
+        // the same dedicated-VRAM contract as the KV planes themselves.
+        descriptor_arena_ = std::make_unique<DeviceArena>(descriptor_bytes, descriptor_residency);
+        d_planes_ = descriptor_arena_->alloc_bytes(descriptor_bytes, 256).data;
+        CUDA_CHECK(cudaMemcpy(d_planes_, h_planes.data(), descriptor_bytes,
+                              cudaMemcpyHostToDevice));
     }
 
     free_page_ids_.reserve(spec_.page_group_count);
@@ -151,10 +158,8 @@ PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout)
 }
 
 PagedKVPool::~PagedKVPool() {
-    if (d_planes_) {
-        cudaFree(d_planes_);
-        d_planes_ = nullptr;
-    }
+    d_planes_ = nullptr;
+    descriptor_arena_.reset();
 }
 
 std::uint32_t PagedKVPool::page_group_count() const noexcept { return spec_.page_group_count; }

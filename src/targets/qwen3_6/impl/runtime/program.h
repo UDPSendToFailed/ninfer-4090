@@ -338,6 +338,8 @@ public:
 
     void reset_memory_peaks() noexcept;
 
+    void ensure_device_residency();
+
     [[nodiscard]] std::size_t gdn_linear_slot_bytes() const noexcept;
     void capture_rolling_checkpoint(SequenceState& sequence, std::uint32_t frontier);
     void restore_rolling_checkpoint(SequenceState& sequence, std::uint32_t frontier);
@@ -371,6 +373,7 @@ public:
     const std::size_t dflash_kv_bytes;
     const std::size_t replay_records_bytes;
     const std::size_t graph_allowance_bytes;
+    const bool residency_locked;
     std::size_t graph_observed_bytes = 0;
     const WorkspacePlan workspace_plan;
 

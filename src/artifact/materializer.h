@@ -41,6 +41,9 @@ struct MaterializationPlan {
     std::uint64_t device_capacity_bytes = 0;
     std::uint64_t prior_read_bytes      = 0;
     std::uint64_t owned_value_bytes     = 0;
+    // Device weights are the one allocation that must never leave dedicated VRAM when the engine
+    // asks for residency locking; the default keeps the original best-effort allocation.
+    ResidencyRequirement device_residency = ResidencyRequirement::None;
     std::vector<DevicePlacement> device_objects;
     std::vector<HostPlacement> host_objects;
 };

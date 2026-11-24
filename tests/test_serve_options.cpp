@@ -58,6 +58,8 @@ int main() {
         "server defaults unexpectedly override registered model sampling");
     failures += check(!defaults.wddm_evictable_budget,
                       "wddm_evictable_budget is unexpectedly enabled by default");
+    failures += check(!defaults.residency_locked,
+                      "residency locking is unexpectedly enabled by default");
     failures += check(resolve_public_model_id(defaults, "artifact-model") == "artifact-model",
                       "artifact model id was not selected by default");
 
@@ -65,6 +67,14 @@ int main() {
         parse({"ninfer-serve", "model.ninfer", "--wddm-evictable-budget"});
     failures += check(wddm_opt_in.wddm_evictable_budget,
                       "--wddm-evictable-budget was not parsed correctly");
+
+    const ServeOptions residency_locked =
+        parse({"ninfer-serve", "model.ninfer", "--residency-locked"});
+    failures += check(residency_locked.residency_locked,
+                      "--residency-locked was not parsed correctly");
+    failures += check(serve_usage_text("ninfer-serve").find("--residency-locked") !=
+                          std::string::npos,
+                      "serve help omits --residency-locked");
 
     const ServeOptions ui_disabled =
         parse({"ninfer-serve", "model.ninfer", "--no-ui"});

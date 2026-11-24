@@ -78,6 +78,7 @@ struct SequencePlanningInputs {
     StartupFeatures features;
     bool use_cuda_graph      = true;
     bool enable_prompt_cache = false;
+    bool residency_locked    = false;
     int device               = 0;
 };
 
@@ -107,6 +108,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     StartupFeatures features;
     bool use_cuda_graph      = true;
     bool enable_prompt_cache = false;
+    bool residency_locked    = false;
     int device               = 0;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;

@@ -140,8 +140,11 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan plan,
         throw ArtifactError("device backing exceeds size_t");
     }
     if (plan.device_capacity_bytes) {
-        out.arena_ =
-            std::make_unique<DeviceArena>(static_cast<std::size_t>(plan.device_capacity_bytes));
+        // When the engine asks for residency locking, model weights are the allocation that must
+        // never leave dedicated VRAM: paging them out collapses decode throughput, and a partial
+        // fallback is silent. Materialization then fails instead of falling back.
+        out.arena_ = std::make_unique<DeviceArena>(
+            static_cast<std::size_t>(plan.device_capacity_bytes), plan.device_residency);
     }
     for (auto& placement : plan.host_objects) {
         reader.validate_object(placement.object);

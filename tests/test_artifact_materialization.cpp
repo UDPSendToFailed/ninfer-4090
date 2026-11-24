@@ -111,8 +111,11 @@ int main() {
         const auto resource_handle = binder.resource("text", "test.json");
         const auto second_ref =
             binder.parameter("param/second", {4}, ninfer::artifact::Residency::Device);
-        auto plan         = std::move(binder).finish();
+        auto plan                                 = std::move(binder).finish();
+        plan.device_residency                     = ninfer::ResidencyRequirement::Required;
         auto materialized = ninfer::artifact::materialize(reader, std::move(plan), device);
+        require(materialized.device_arena().residency_enforced(),
+                "residency-required weights arena is not residency-enforced");
 
         const auto host_res = materialized.host_bytes(resource_handle);
         require(host_res.size() == kResource.size() &&
@@ -127,6 +130,15 @@ int main() {
                 "materialized device tensor bytes mismatch");
         require(materialized.stats().h2d_bytes == kSecondTensor.size(),
                 "unexpected h2d_bytes count");
+
+        // The default plan keeps the original best-effort allocation.
+        ninfer::artifact::Binder default_binder(reader);
+        (void)default_binder.parameter("param/second", {4}, ninfer::artifact::Residency::Device);
+        auto default_plan = std::move(default_binder).finish();
+        auto default_materialized =
+            ninfer::artifact::materialize(reader, std::move(default_plan), device);
+        require(!default_materialized.device_arena().residency_enforced(),
+                "default materialization unexpectedly enforces residency");
 
         std::cout << "test_artifact_materialization: PASS\n";
         return 0;

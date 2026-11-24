@@ -3,9 +3,12 @@
 #include "core/dtype.h"
 #include "core/tensor.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <memory>
+#include <stdexcept>
 
 namespace ninfer {
 
@@ -13,6 +16,36 @@ struct DeviceSpan {
     void* data        = nullptr;
     std::size_t bytes = 0;
 };
+
+// Raised when a residency-required allocation cannot be established (startup) or has left
+// dedicated VRAM and cannot be reclaimed (runtime).
+class ResidencyError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+// The host has no usable D3D12/WDDM residency mechanism, so dedicated-VRAM residency cannot be
+// guaranteed at all. Distinct from a capacity failure so callers can tell the two apart.
+class ResidencyUnavailableError : public ResidencyError {
+public:
+    using ResidencyError::ResidencyError;
+};
+
+enum class ResidencyRequirement : std::uint8_t {
+    // Best effort: a D3D12 residency-locked heap when the process opted in, otherwise cudaMalloc.
+    None,
+    // Dedicated VRAM is mandatory. The arena is a pinned CUDA device-memory allocation; startup
+    // verifies that the allocation actually became VRAM-resident and fails otherwise. There is no
+    // cudaMalloc or system-memory fallback.
+    Required,
+};
+
+namespace detail {
+// Owns the D3D12 device/heap/fence/import lifetime of one residency-locked arena.
+struct D3D12Residency;
+// Owns one pinned device-memory pool used by a residency-required arena.
+struct PinnedPool;
+} // namespace detail
 
 // Owning device allocation for long-lived buffers. DeviceArena remains the
 // suballocation primitive for workspaces; this type owns exactly one cudaMalloc.
@@ -61,7 +94,8 @@ public:
         std::size_t saved_offset_ = 0;
     };
 
-    explicit DeviceArena(std::size_t capacity_bytes);
+    explicit DeviceArena(std::size_t capacity_bytes,
+                         ResidencyRequirement requirement = ResidencyRequirement::None);
     // Non-owning arena over an already allocated device region.
     explicit DeviceArena(DeviceSpan storage);
     ~DeviceArena();
@@ -82,12 +116,28 @@ public:
     std::size_t peak_used() const noexcept;
     void reset_peak() noexcept;
 
+    // True when the backing storage is guaranteed to stay in dedicated VRAM: a pinned CUDA
+    // device-memory allocation for residency-required arenas, or a D3D12 residency-locked heap
+    // for opt-in best-effort arenas.
+    [[nodiscard]] bool residency_enforced() const noexcept;
+
+    // Re-asserts dedicated-VRAM residency. Returns false when the storage was evicted and could
+    // not be made resident again within `timeout`. Rate-limited to one re-assert per second, so it
+    // is safe to call at request-step frequency.
+    [[nodiscard]] bool ensure_resident(std::chrono::milliseconds timeout);
+
 private:
+    void release_storage() noexcept;
+
     void* base_       = nullptr;
     std::size_t cap_  = 0;
     std::size_t off_  = 0;
     std::size_t peak_ = 0;
     bool owns_        = true;
+    int device_       = 0;
+    std::shared_ptr<detail::D3D12Residency> residency_;
+    std::shared_ptr<detail::PinnedPool> pinned_pool_;
+    std::chrono::steady_clock::time_point last_residency_check_{};
 };
 
 class PinnedHostBuffer {
@@ -115,6 +165,12 @@ namespace core {
 void set_wddm_residency_lock_enabled(bool enabled) noexcept;
 [[nodiscard]] bool wddm_residency_lock_enabled() noexcept;
 #endif
+
+// Bytes this process may still allocate before the OS starts paging its device memory. This is the
+// figure that decides whether paging happens, and it is not distorted by D3D12/CUDA interop the way
+// cudaMemGetInfo is (an imported allocation is charged more than once against the device-wide free
+// counter). Returns false on hosts without a WDDM budget, where callers fall back to free memory.
+[[nodiscard]] bool device_budget_headroom_bytes(std::size_t& out) noexcept;
 } // namespace core
 
 } // namespace ninfer

@@ -29,6 +29,7 @@ struct Options {
     std::uint32_t vision_max_tokens = 8192;
     bool use_cuda_graph             = true;
     bool wddm_evictable_budget      = false;
+    bool residency_locked           = false;
 
     bool raw_output      = false;
     bool print_token_ids = false;

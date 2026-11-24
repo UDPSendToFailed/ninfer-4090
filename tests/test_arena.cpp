@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -196,6 +197,54 @@ int main() {
     }
     failures += expect_size(pinned.size(), 128, "pinned.size");
     std::memset(pinned.data(), 0x5a, pinned.size());
+
+    // =========================================================================
+    // Strict dedicated-VRAM residency
+    // =========================================================================
+    {
+        constexpr std::size_t kResidentBytes = 1 * 1024 * 1024;
+        bool residency_mechanism_unavailable = false;
+        try {
+            ninfer::DeviceArena resident(kResidentBytes, ninfer::ResidencyRequirement::Required);
+            failures += expect(resident.residency_enforced(),
+                               "required arena should report residency enforcement");
+
+            // A strict arena must not starve ordinary cudaMalloc backing (KV/workspace).
+            void* followup                   = nullptr;
+            const cudaError_t followup_error = cudaMalloc(&followup, 64ULL * 1024 * 1024);
+            failures += expect(followup_error == cudaSuccess,
+                               "strict arena should leave ordinary cudaMalloc capacity available");
+            if (followup_error == cudaSuccess) { CUDA_CHECK(cudaFree(followup)); }
+
+            const ninfer::Tensor probe = resident.alloc(ninfer::DType::U8, {64}, 64);
+            CUDA_CHECK(cudaMemset(probe.data, 0x5c, 64));
+            CUDA_CHECK(cudaDeviceSynchronize());
+            failures += expect(resident.ensure_resident(std::chrono::milliseconds(2000)),
+                               "required arena should re-assert residency");
+
+            std::uint8_t value = 0;
+            CUDA_CHECK(cudaMemcpy(&value, probe.data, 1, cudaMemcpyDeviceToHost));
+            failures += expect(value == 0x5c, "required arena pattern survived residency re-assert");
+
+            std::size_t free_b  = 0;
+            std::size_t total_b = 0;
+            CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+            const std::size_t impossible_bytes = (total_b > 0 ? total_b : (24ULL << 30)) * 2ULL;
+            failures += expect_throws<std::runtime_error>(
+                [&] {
+                    ninfer::DeviceArena impossible(impossible_bytes,
+                                                   ninfer::ResidencyRequirement::Required);
+                },
+                "required arena above total VRAM should fail with std::runtime_error");
+            failures += expect(cudaGetLastError() == cudaSuccess,
+                               "CUDA context has lingering error after required over-capacity "
+                               "rejection");
+        } catch (const ninfer::ResidencyUnavailableError& error) {
+            residency_mechanism_unavailable = true;
+            std::cout << "SKIP: " << error.what() << '\n';
+        }
+        if (residency_mechanism_unavailable) { return 77; }
+    }
 
 #if defined(_WIN32)
     const bool initial_residency = ninfer::core::wddm_residency_lock_enabled();
