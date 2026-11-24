@@ -62,6 +62,7 @@ public:
     [[nodiscard]] std::size_t device_reservation_bytes() const noexcept;
     [[nodiscard]] std::size_t workspace_capacity_bytes() const noexcept;
     [[nodiscard]] std::size_t request_transient_capacity_bytes() const noexcept;
+    [[nodiscard]] bool residency_locked() const noexcept;
 
 public:
     // Family-private construction/storage seam; exact packages expose only the completed alias.
@@ -188,6 +189,10 @@ public:
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
+
+    // Re-asserts that the weights, KV/state, and workspace arenas are resident in dedicated VRAM.
+    // Throws ResidencyError when any of them left VRAM and cannot be reclaimed.
+    void ensure_device_residency();
 
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept;

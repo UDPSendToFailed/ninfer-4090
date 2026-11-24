@@ -46,6 +46,32 @@ The complete `.ninfer` inventory is still validated. These choices are not lazy 
 text-only Engine rejects media and cannot enable Vision later. DFlash and Vision are mutually
 exclusive. The default speculative and Vision settings produce the smallest resident profile.
 
+`--residency-locked` is the opt-in switch for the strict contract described below. Without it the
+Engine keeps the original best-effort allocation behavior: weights, KV/state, workspace, and the
+request transient are ordinary CUDA allocations, nothing fails when the set does not fit, and no
+runtime watchdog runs.
+
+With `--residency-locked`, every long-lived Engine arena — model weights, KV/state (including the
+per-pool page-descriptor arrays that attention kernels read every step), workspace, and the frozen
+request transient — is allocated from a pinned CUDA device-memory pool. At load NInfer verifies
+that each allocation actually became device-resident by comparing this process's device-memory
+usage before and after the commit (a per-process figure on Windows, so unrelated applications
+cannot perturb it); if the driver backs a meaningful part with system memory, or the set does not
+fit, startup fails instead of running with paged memory. Startup additionally requires 128 MiB of
+headroom within the process video-memory budget for driver bookkeeping and CUDA graph upload. That
+check reads the OS budget rather than `cudaMemGetInfo`, because a D3D12-interop allocation (such as
+the `--disk-cache` staging buffer) is charged more than once against the device-wide free counter
+and would otherwise reject configurations that in fact fit. There is no `cudaMalloc`, lazy-load, or
+host-streaming fallback for these arenas.
+
+While the Engine runs, a once-per-second watchdog compares the process against its video-memory
+budget. When over budget it asks the OS to keep the working set and reads every arena page back in,
+logging a warning if the pressure persists; only sustained unrecoverable pressure (30 consecutive
+seconds) or a hard CUDA failure terminates the process with a `FATAL` line and non-zero exit.
+Transient desktop VRAM spikes are reported, not fatal. `--wddm-evictable-budget` does not decide
+residency: it only lets KV-capacity planning assume background applications can be evicted, and
+enables a legacy D3D12 best-effort path for non-residency-required auxiliary allocations.
+
 ## Structured messages
 
 `--messages` accepts either a non-empty JSON message array or an object containing `messages`

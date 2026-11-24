@@ -19,10 +19,15 @@ bool is_power_of_two(std::size_t value) noexcept {
 
 class RequestMemory::Impl {
 public:
-    Impl(DeviceContext& context, std::size_t capacity) : device(context.device) {
+    Impl(DeviceContext& context, std::size_t capacity, bool residency_locked) : device(context.device) {
         if (capacity != 0) {
             CUDA_CHECK(cudaSetDevice(device));
-            arena = std::make_unique<DeviceArena>(capacity);
+            // The frozen request transient is touched by every prefill and decode step. Under
+            // residency locking it gets the same dedicated-VRAM contract as the weights: fail at
+            // startup rather than page.
+            arena = std::make_unique<DeviceArena>(
+                capacity, residency_locked ? ResidencyRequirement::Required
+                                           : ResidencyRequirement::None);
         }
     }
 
@@ -40,8 +45,9 @@ public:
     std::size_t peak_bytes       = 0;
 };
 
-RequestMemory::RequestMemory(DeviceContext& device, std::size_t frozen_capacity_bytes)
-    : impl_(std::make_unique<Impl>(device, frozen_capacity_bytes)) {}
+RequestMemory::RequestMemory(DeviceContext& device, std::size_t frozen_capacity_bytes,
+                             bool residency_locked)
+    : impl_(std::make_unique<Impl>(device, frozen_capacity_bytes, residency_locked)) {}
 
 RequestMemory::~RequestMemory() = default;
 

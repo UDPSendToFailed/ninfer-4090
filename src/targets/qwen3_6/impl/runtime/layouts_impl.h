@@ -632,6 +632,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->proposal_head       = inputs.proposal_head;
     impl->features            = inputs.features;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
+    impl->residency_locked    = inputs.residency_locked;
     impl->device              = inputs.device;
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
@@ -730,6 +731,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .features            = qwen3_6::startup_features(options),
         .use_cuda_graph      = options.use_cuda_graph,
         .enable_prompt_cache = options.enable_prompt_cache,
+        .residency_locked    = options.residency_locked,
         .device              = options.device,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);

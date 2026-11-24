@@ -38,6 +38,11 @@ std::int32_t checked_i32(std::uint32_t value, const char* label) {
     return static_cast<std::int32_t>(value);
 }
 
+// Long-lived arenas follow the engine's residency policy: locked on request, best effort otherwise.
+constexpr ResidencyRequirement residency_requirement(bool residency_locked) noexcept {
+    return residency_locked ? ResidencyRequirement::Required : ResidencyRequirement::None;
+}
+
 std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& prompt,
                                                  std::uint32_t token) {
     const std::size_t tokens = prompt.token_ids.size();
@@ -206,8 +211,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       replay_records_bytes(plan.persistent.replay_records
                                ? plan.persistent.replay_records->payload_bytes()
                                : 0),
-      graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
-      persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
+      graph_allowance_bytes(plan.graph_allowance_bytes), residency_locked(plan.residency_locked),
+      workspace_plan(plan.workspace),
+      persistent(plan.persistent.bytes, residency_requirement(plan.residency_locked)),
+      workspace_storage(plan.workspace.capacity, residency_requirement(plan.residency_locked)),
       work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}),
       round_host(sizeof(TokenId)),
       ordinary_host(
@@ -240,7 +247,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         throw std::invalid_argument("DFlash and Vision model views are mutually exclusive");
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
-    decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
+    decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder,
+                                                      residency_requirement(residency_locked));
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
     }
@@ -2823,6 +2831,9 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
                                                            : KvCacheStorage::Int8Group64))));
     DeviceArena& weights = *model.weights_arena;
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
+    out.device_residency_enforced = residency_locked && weights.residency_enforced() &&
+                                    persistent.residency_enforced() &&
+                                    workspace_storage.residency_enforced();
     out.sequence =
         ArenaMemorySummary{persistent.capacity(), persistent.used(), persistent.peak_used()};
     out.workspace = ArenaMemorySummary{workspace_storage.capacity(), work.used(), work.peak_used()};
@@ -2843,6 +2854,20 @@ void ProgramImplCore::reset_memory_peaks() noexcept {
     persistent.reset_peak();
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
+}
+
+void ProgramImplCore::ensure_device_residency() {
+    if (!residency_locked) { return; }
+    constexpr std::chrono::milliseconds kReclaimTimeout{5000};
+    auto require_resident = [&](DeviceArena& arena, const char* label) {
+        if (arena.ensure_resident(kReclaimTimeout)) { return; }
+        throw ResidencyError(std::string(label) + " (" + std::to_string(arena.capacity()) +
+                             " bytes) could not be kept device-resident under sustained "
+                             "video-memory budget pressure");
+    };
+    if (model.weights_arena != nullptr) { require_resident(*model.weights_arena, "model weights"); }
+    require_resident(persistent, "KV/state arena");
+    require_resident(workspace_storage, "workspace arena");
 }
 
 void ProgramImplCore::snapshot_lane_to_disk(std::uint32_t lane, DiskStateCache& disk_cache) {

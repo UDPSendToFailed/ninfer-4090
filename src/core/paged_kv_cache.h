@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/arena.h"
 #include "core/layout.h"
 #include "core/tensor.h"
 
@@ -7,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -106,7 +108,8 @@ struct PagedKVResize;
 
 class PagedKVPool {
 public:
-    PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout);
+    PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout,
+                ResidencyRequirement descriptor_residency = ResidencyRequirement::None);
     ~PagedKVPool();
 
     PagedKVPool(const PagedKVPool&)            = delete;
@@ -169,6 +172,9 @@ private:
     std::vector<bool> row_in_use_;
     std::uint32_t entitled_pages_ = 0;
     std::uint32_t mapped_pages_   = 0;
+    // Every attention kernel reads this descriptor array, so it holds the same dedicated-VRAM
+    // contract as the KV planes themselves.
+    std::unique_ptr<DeviceArena> descriptor_arena_;
     void* d_planes_               = nullptr;
     std::uint32_t max_page_head_uint4s_ = 0;
     std::uint32_t max_num_heads_        = 0;

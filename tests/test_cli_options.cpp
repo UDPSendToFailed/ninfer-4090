@@ -54,5 +54,14 @@ int main() {
                "--reasoning-effort", "medium"});
     failures += check(with_effort.thinking_budget == 8 && with_effort.reasoning_effort,
                       "thinking budget did not coexist with reasoning effort");
+
+    failures += check(!configured.residency_locked,
+                      "residency locking is unexpectedly enabled by default");
+    const ninfer::cli::Options locked =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--residency-locked"});
+    failures += check(locked.residency_locked, "--residency-locked was not parsed correctly");
+    failures +=
+        check(ninfer::cli::usage_text("ninfer-cli").find("--residency-locked") != std::string::npos,
+              "CLI help omits --residency-locked");
     return failures == 0 ? 0 : 1;
 }

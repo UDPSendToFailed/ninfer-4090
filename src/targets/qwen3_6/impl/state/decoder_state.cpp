@@ -94,12 +94,13 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
     return layout;
 }
 
-PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
-    : pool_(backing, layout.pool), layers_(layout.layers), max_context_(layout.max_context),
-      kv_heads_(layout.kv_heads), head_dim_(layout.head_dim), dtype_(layout.dtype),
-      quant_group_(layout.quant_group), packed_v_(layout.packed_v), rotate_k_(layout.rotate_k),
-      rotate_v_(layout.rotate_v), packed_k_(layout.packed_k), e8_lattice_(layout.e8_lattice),
-      e8_root_(layout.e8_root) {}
+PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout,
+                           ResidencyRequirement descriptor_residency)
+    : pool_(backing, layout.pool, descriptor_residency), layers_(layout.layers),
+      max_context_(layout.max_context), kv_heads_(layout.kv_heads), head_dim_(layout.head_dim),
+      dtype_(layout.dtype), quant_group_(layout.quant_group), packed_v_(layout.packed_v),
+      rotate_k_(layout.rotate_k), rotate_v_(layout.rotate_v), packed_k_(layout.packed_k),
+      e8_lattice_(layout.e8_lattice), e8_root_(layout.e8_root) {}
 
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept
     : cache_(&cache), block_table_(block_table) {}
@@ -172,9 +173,11 @@ std::size_t DecoderStateLayout::kv_payload_bytes() const noexcept {
     return text_kv.payload_bytes() + (mtp_kv ? mtp_kv->payload_bytes() : 0);
 }
 
-DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout)
-    : text_kv(backing, layout.text_kv), linear_attention(backing, layout.linear_attention) {
-    if (layout.mtp_kv) { mtp_kv.emplace(backing, *layout.mtp_kv); }
+DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout,
+                           ResidencyRequirement descriptor_residency)
+    : text_kv(backing, layout.text_kv, descriptor_residency),
+      linear_attention(backing, layout.linear_attention) {
+    if (layout.mtp_kv) { mtp_kv.emplace(backing, *layout.mtp_kv, descriptor_residency); }
 }
 
 PagedKVCache* DecoderState::mtp_cache() noexcept { return mtp_kv ? &*mtp_kv : nullptr; }

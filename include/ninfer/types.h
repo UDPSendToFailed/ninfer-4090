@@ -90,6 +90,10 @@ struct EngineOptions {
     std::filesystem::path prompt_cache_dir = "";          // empty resolves to default user cache dir
     std::size_t prompt_cache_max_bytes     = 30ULL << 30; // 30 GiB LRU ceiling
     bool wddm_evictable_budget             = false;       // Opt-in aggressive WDDM memory budgeting against total VRAM
+    // Keep every long-lived arena in dedicated VRAM: startup fails instead of paging, a runtime
+    // watchdog reclaims or terminates, and a headroom floor is enforced. Off by default, which
+    // keeps the original best-effort allocation behavior.
+    bool residency_locked                  = false;
     LoadProgress load_progress;
 };
 
@@ -430,6 +434,7 @@ struct MemorySummary {
     std::uint32_t kv_capacity_max_page_groups = 0;
     KvCacheStorage kv_cache                   = KvCacheStorage::BFloat16;
     ArenaMemorySummary weights;
+    bool device_residency_enforced = false; // Weights, KV/state, and workspace stay in VRAM.
     ArenaMemorySummary sequence;
     ArenaMemorySummary workspace;
     ArenaMemorySummary request_transient;

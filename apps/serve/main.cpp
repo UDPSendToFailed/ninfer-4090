@@ -98,7 +98,10 @@ int main(int argc, char** argv) {
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, capacity.str());
 
         std::ostringstream pools;
-        pools << "state pools: text-kv=" << format_bytes(memory.text_kv_bytes);
+        pools << "weights=" << format_bytes(memory.weights.capacity_bytes)
+              << " vram-residency="
+              << (memory.device_residency_enforced ? "locked" : "best-effort")
+              << " state pools: text-kv=" << format_bytes(memory.text_kv_bytes);
         if (memory.mtp_kv_bytes > 0) {
             pools << " mtp-kv=" << format_bytes(memory.mtp_kv_bytes);
         }

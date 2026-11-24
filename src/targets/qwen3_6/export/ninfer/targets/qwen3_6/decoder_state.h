@@ -72,7 +72,8 @@ private:
 
 class PagedKVCache {
 public:
-    PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout);
+    PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout,
+                 ResidencyRequirement descriptor_residency = ResidencyRequirement::None);
 
     PagedKVCache(const PagedKVCache&)            = delete;
     PagedKVCache& operator=(const PagedKVCache&) = delete;
@@ -126,7 +127,8 @@ struct DecoderState {
     std::optional<PagedKVCache> mtp_kv;
     LinearAttentionStatePool linear_attention;
 
-    DecoderState(DeviceSpan backing, const DecoderStateLayout& layout);
+    DecoderState(DeviceSpan backing, const DecoderStateLayout& layout,
+                 ResidencyRequirement descriptor_residency = ResidencyRequirement::None);
 
     [[nodiscard]] PagedKVCache* mtp_cache() noexcept;
     [[nodiscard]] const PagedKVCache* mtp_cache() const noexcept;
